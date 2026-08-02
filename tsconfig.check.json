@@ -1,0 +1,22 @@
+// 类型检查专用配置（`npm run typecheck` 走这个）
+//
+// 为什么不直接用 tsconfig.json：主配置 references 了 tsconfig.node.json，
+// 而后者 composite:true + noEmit:true 冲突，vue-tsc 直接报 TS6310
+// （'Referenced project may not disable emit'）——这是 Vite 脚手架的已知问题。
+// 改主配置有影响构建的风险，故另开一份剥掉 references 只查 src/。
+//
+// 注意：本文件不参与构建，vite build 只做 esbuild 转译、不做类型检查。
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    // 本项目在 Mac 与 Windows 两台机器上开发，路径大小写不一致会在其中一边静默失败
+    "forceConsistentCasingInFileNames": true,
+    // 主配置只引了 vite-plugin-monkey/client（它仅声明 module "$"），
+    // GM_setValue/GM_xmlhttpRequest 等全局函数在 /global 里，缺它会报一堆
+    // TS2304 "Cannot find name 'GM_*'"，把真实类型错误淹没。
+    "types": ["vite/client", "vite-plugin-monkey/client", "vite-plugin-monkey/global"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue"],
+  "references": []
+}
