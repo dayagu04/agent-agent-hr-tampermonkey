@@ -34,6 +34,7 @@ import { storage } from './platform-bridge'
 import { collectAndLogDom } from './dom-collector'
 import { applyFilterOption, captureCurrentFilterQuery, readFilterOptions } from './search-filter'
 import { VERSION_LABEL } from './version'
+import OnboardingPanel from './onboarding-panel.vue'
 
 const platform = detectPlatform()
 const config = reactive<PluginConfig>(loadConfig())
@@ -153,6 +154,7 @@ const activeTab = ref<TabKey>('apply')
 const tabs: TabItem[] = [
   { key: 'apply', label: '投递' },
   { key: 'chat', label: '会话' },
+  { key: 'profile', label: '画像' },
   { key: 'settings', label: '设置' },
   { key: 'logs', label: '日志' },
 ]
@@ -1594,6 +1596,14 @@ watch(activeTab, (tab) => {
               </div>
             </template>
           </div>
+
+          <!-- ===== Tab: 画像（Onboarding 采集 + 我的画像） ===== -->
+          <OnboardingPanel
+            v-else-if="activeTab === 'profile'"
+            key="profile"
+            :config="config"
+            :logged-in="loggedIn"
+          />
 
           <!-- ===== Tab: 日志 ===== -->
           <div v-else-if="activeTab === 'logs'" key="logs" class="aah-tab-pane">

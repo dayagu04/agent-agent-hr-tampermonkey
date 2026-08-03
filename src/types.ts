@@ -85,7 +85,7 @@ export interface PluginConfig {
 }
 
 /** 面板 Tab 键 */
-export type TabKey = 'apply' | 'chat' | 'settings' | 'logs'
+export type TabKey = 'apply' | 'chat' | 'profile' | 'settings' | 'logs'
 
 /**
  * 会话 Tab 展示用的 HR 消息摘要。
@@ -135,4 +135,69 @@ export interface ApplyProgress {
   logs: string[] // 操作日志
   /** 当前正在投递的岗位（实时显示用） */
   currentJob?: { title: string; company: string; score: number } | null
+}
+
+// ==================== 画像采集（Onboarding） ====================
+
+/** 画像采集问题（来自 /api/onboarding） */
+export interface OnboardingQuestion {
+  id: string
+  tier: string
+  question: string
+  kind: 'single' | 'multi' | 'text' | 'custom'
+  options: string[]
+  fields: string[]
+  skippable: boolean
+}
+
+/** 画像字段元信息（服务端问题库为唯一事实来源，插件仅渲染） */
+export interface OnboardingFieldMeta {
+  name: string
+  tier: string
+  label: string
+  value_type: 'str' | 'int' | 'list'
+  options: string[]
+  critical: boolean
+}
+
+/** 画像完整度（按层级） */
+export interface OnboardingCompleteness {
+  core: { filled: number; total: number; ratio: number }
+  important: { filled: number; total: number; ratio: number }
+  optional: { filled: number; total: number; ratio: number }
+  [tier: string]: { filled: number; total: number; ratio: number }
+}
+
+/** GET /api/onboarding/status 返回 */
+export interface OnboardingStatus {
+  data: Record<string, unknown>
+  fields: OnboardingFieldMeta[]
+  completeness: OnboardingCompleteness
+  onboarding: {
+    status?: string
+    tier?: string
+    current?: string | null
+    asked?: string[]
+    completed_tiers?: string[]
+  }
+  next_question: OnboardingQuestion | null
+}
+
+/** POST /api/onboarding/chat 返回 */
+export interface OnboardingChatResult {
+  reply: string
+  extracted: Record<string, unknown>
+  question: OnboardingQuestion | null
+  tier: string | null
+  tier_complete: boolean
+  completeness: OnboardingCompleteness
+  done: boolean
+}
+
+/** 画像面板本地对话气泡 */
+export interface OnboardingChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  question?: OnboardingQuestion | null
+  kind?: 'text' | 'question' | 'done' | 'error'
 }
