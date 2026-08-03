@@ -35,6 +35,8 @@ import { collectAndLogDom } from './dom-collector'
 import { applyFilterOption, captureCurrentFilterQuery, readFilterOptions } from './search-filter'
 import { VERSION_LABEL } from './version'
 import OnboardingPanel from './onboarding-panel.vue'
+import MissionsPanel from './missions-panel.vue'
+import { resumeMissionApply } from './missions-apply'
 
 const platform = detectPlatform()
 const config = reactive<PluginConfig>(loadConfig())
@@ -96,6 +98,8 @@ onMounted(async () => {
     ballPosition.value = clampBallPosition(saved)
   }
   window.addEventListener('resize', onWindowResize)
+  // 跨页投递会话恢复：即使不在「任务」Tab 也继续执行
+  void resumeMissionApply()
 })
 
 onUnmounted(() => {
@@ -155,6 +159,7 @@ const tabs: TabItem[] = [
   { key: 'apply', label: '投递' },
   { key: 'chat', label: '会话' },
   { key: 'profile', label: '画像' },
+  { key: 'missions', label: '任务' },
   { key: 'settings', label: '设置' },
   { key: 'logs', label: '日志' },
 ]
@@ -1601,6 +1606,14 @@ watch(activeTab, (tab) => {
           <OnboardingPanel
             v-else-if="activeTab === 'profile'"
             key="profile"
+            :config="config"
+            :logged-in="loggedIn"
+          />
+
+          <!-- ===== Tab: 任务（/Submit） ===== -->
+          <MissionsPanel
+            v-else-if="activeTab === 'missions'"
+            key="missions"
             :config="config"
             :logged-in="loggedIn"
           />

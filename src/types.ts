@@ -85,7 +85,7 @@ export interface PluginConfig {
 }
 
 /** 面板 Tab 键 */
-export type TabKey = 'apply' | 'chat' | 'profile' | 'settings' | 'logs'
+export type TabKey = 'apply' | 'chat' | 'profile' | 'missions' | 'settings' | 'logs'
 
 /**
  * 会话 Tab 展示用的 HR 消息摘要。
@@ -200,4 +200,74 @@ export interface OnboardingChatMessage {
   content: string
   question?: OnboardingQuestion | null
   kind?: 'text' | 'question' | 'done' | 'error'
+}
+
+// ==================== Agent 任务（/Submit） ====================
+
+/** 任务计划步骤（无配额，只编排方向） */
+export interface MissionPlanStep {
+  platform: string
+  keyword: string
+  city: string
+  reason?: string
+}
+
+export interface MissionPlan {
+  reasoning: string
+  steps: MissionPlanStep[]
+}
+
+/** 候选岗位（服务端 DB job_id 为准） */
+export interface MissionCandidate {
+  job_id: number
+  platform: string
+  title: string
+  company: string
+  city: string
+  salary_min: number
+  salary_max: number
+  score: number
+  reason: string
+  url: string
+}
+
+/** Agent 任务快照 */
+export interface AgentMission {
+  id: number
+  user_id: number
+  objective: string
+  status: string
+  plan: MissionPlan | null
+  checkpoint: Record<string, unknown>
+  context_summary: string | null
+  candidates: MissionCandidate[]
+  result: {
+    objective?: string
+    recommended?: number
+    applied?: number
+    platforms?: string[]
+  } | null
+  error: string | null
+  created_at: string
+  updated_at: string
+  finished_at: string | null
+}
+
+/** 插件回报单条投递结果 */
+export interface ApplyResultReport {
+  application_id: number
+  success: boolean
+  platform_application_id?: string
+  error?: string
+}
+
+/** 跨页投递会话里的待投岗位 */
+export interface MissionApplyJob {
+  application_id: number
+  platform: string
+  title: string
+  company: string
+  city: string
+  salary: string
+  url: string
 }
