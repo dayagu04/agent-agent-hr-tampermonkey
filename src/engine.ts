@@ -233,17 +233,23 @@ export class ApplyEngine {
           continue
         }
 
-        // 公司投递频率：该公司近期已达投递上限（后端 match 结果标记）
+        // 公司级拦截（后端 match 结果标记）：黑名单 / 冷静期 / 频率上限 / 已投
         const blockedReason = blockedReasonMap.get(job.platformJobId)
-        if (blockedReason === 'company_apply_limit') {
+        if (blockedReason) {
           progress.skipped++
           this.platform.markCard(job, '#d1d5db')
+          const reasonText: Record<string, string> = {
+            company_blacklisted: '公司已被拉黑',
+            company_cooldown: '该公司处于冷静期',
+            company_apply_limit: '该公司近期投递已达上限',
+            already_applied: '该岗位已投递过',
+          }
           void logDecision(this.config, {
             run_id: this.runId,
             platform: this.platform.code,
             platform_job_id: job.platformJobId,
-            decision: 'blocked_company_apply_limit',
-            reason: '该公司近期投递已达上限（防重复投递）',
+            decision: 'blocked_' + blockedReason,
+            reason: reasonText[blockedReason] || blockedReason,
             match_score: r?.score,
             details: { title: job.title, company: job.company },
           })

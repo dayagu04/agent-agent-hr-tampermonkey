@@ -1909,6 +1909,14 @@ async function runChatRoundInner(
 
     if (!res.reply) {
       log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
+      // 低质量公司：不回复但要求删除会话（delete_after_send 且无回复）
+      if (res.delete_after_send) {
+        log(`  ↳ 低质量公司：删除会话`)
+        if (await deleteCurrentThread()) {
+          cleaned++
+          afterConversationDeleted(company || t.company, jobTitle, 'low_quality')
+        }
+      }
       return 'ok'
     }
 
