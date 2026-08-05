@@ -1521,9 +1521,14 @@ async function deleteCurrentThread(): Promise<boolean> {
 
 /**
  * 清理「已读且超时未回」的会话：
- * - 无未读标记（我方已读）且最后一条是 HR 消息（我方未回）；
+ * - 无未读标记（我方已读）；
+ * - 最后一条消息是**我方发送**（我方已回应/已打招呼），HR 之后再没回过；
  * - 最后消息时间超过 cleanReadAfterHours；
  * 满足则删除会话，判定该岗位流程已结束。
+ *
+ * 注意（2026-08-05 修正）：不能删「最后一条是 HR」的会话 —— 那是我方还没回复的
+ * 待办机会，删掉等于丢掉潜在回复；只有「我方最后发言、HR 长时间未回」才说明
+ * 流程已冷，可以清理。
  */
 async function cleanupAgedReadThreads(
   cfg: PluginConfig,
@@ -1541,14 +1546,15 @@ async function cleanupAgedReadThreads(
     const age = parseThreadTimeMs((timeEl.textContent || '').trim(), Date.now())
     if (age === null || Date.now() - age < agedMs) return 'ok'
 
-    // 打开确认最后一条是 HR（避免删掉我方最后回复的会话）
+    // 打开确认最后一条是「我方发送」：HR 长时间未回 → 流程结束可删；
+    // 最后一条是 HR = 我方还没回，属于待办，绝不删。
     await openThread(t.company, t.jobTitle)
     await delay(500, 900)
     const messages = await readMessages()
     // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
     logChatHistory(t, messages)
     const last = messages[messages.length - 1]
-    if (!last || last.sender !== 'hr') return 'ok'
+    if (!last || last.sender !== 'me') return 'ok'
 
     diag('CHAT', `清理已读超时未回会话`, {
       company: t.company,

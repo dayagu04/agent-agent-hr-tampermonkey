@@ -10,9 +10,10 @@ import { loadConfig, isConfigReady } from './config'
 const FLUSH_THRESHOLD = 50
 /** 距上次上报超过该时长则强制上报（毫秒） */
 const FLUSH_INTERVAL_MS = 60_000
-/** 内存缓冲上限（避免插件长时间运行无后端时无限膨胀；同时给批量扫描留足余量，
- *  防止「跳过已处理会话」这类高频日志把发送失败等关键诊断行挤出缓冲） */
-const MAX_BUFFER = 500
+/** 内存缓冲上限：完整记录全部日志，不再因高频扫描挤掉关键诊断行。
+ * 设大后只影响内存占用（单行 ≤4000 字符，5000 条上限可接受）；
+ * 无后端时也不应无限膨胀，故仍保留上限。 */
+const MAX_BUFFER = 5000
 
 interface LogEntry {
   tag: string
