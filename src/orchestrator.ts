@@ -590,6 +590,11 @@ export class Orchestrator {
           (this.state.stats.sendResumeTotal || 0) + (result.resumes_sent || 0)
         this.state.stats.cleanedTotal =
           (this.state.stats.cleanedTotal || 0) + (result.cleaned || 0)
+        // 已处理的会话数（synced）从待回复数中扣减，保证网页端「待回复」跟随真实进度
+        this.state.stats.pendingHrMessages = Math.max(
+          0,
+          (this.state.stats.pendingHrMessages || 0) - (result.synced || 0),
+        )
         await this.reportEvent('chat_round_done', {
           handled: result.handled,
           replied: result.replied,
@@ -746,6 +751,7 @@ export async function getOrchestratorSnapshot(): Promise<{
   runId: string
   keyword: string
   page: number
+  pendingHrMessages: number
   startedAt: number | null
   lastError: string | null
 } | null> {
@@ -763,6 +769,7 @@ export async function getOrchestratorSnapshot(): Promise<{
     runId: state.runId || '',
     keyword: state.keywords[state.currentKeywordIndex] || '',
     page: state.currentPage || 1,
+    pendingHrMessages: state.stats.pendingHrMessages || 0,
     startedAt: state.startedAt || null,
     lastError: state.errors.length ? state.errors[state.errors.length - 1].message : null,
   }
