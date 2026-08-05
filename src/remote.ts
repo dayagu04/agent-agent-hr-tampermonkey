@@ -60,6 +60,7 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     running,
     applied_total: live?.stats.appliedTotal ?? snap?.appliedTotal ?? 0,
     replied_total: live?.stats.hrRepliesTotal ?? snap?.hrRepliesTotal ?? 0,
+    send_resume_total: live?.stats.sendResumeTotal ?? snap?.sendResumeTotal ?? 0,
     skipped_total: live?.stats.skippedTotal ?? snap?.skippedTotal ?? 0,
     failed_total: live?.stats.failedTotal ?? snap?.failedTotal ?? 0,
     goal_target: snap?.goalTarget ?? live?.goal?.target ?? null,

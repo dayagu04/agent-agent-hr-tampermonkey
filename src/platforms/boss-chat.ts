@@ -1688,8 +1688,12 @@ async function runChatRoundInner(
         const resumeOk = await sendResume()
         if (!resumeOk) log('  ↳ 简历未发出，需手动处理')
         else resumesSent++
-      }
-      if (res.action_id) {
+        // 简历未发出时不得标记 sent：否则后端统计会把「文本已发、简历没发」
+        // 的动作也计成已发简历（历史计数虚高根因之一）。
+        if (res.action_id) {
+          await markChatSent(cfg, res.action_id, resumeOk, resumeOk ? '' : '简历未发出')
+        }
+      } else if (res.action_id) {
         await markChatSent(cfg, res.action_id, true, '')
       }
     } else {

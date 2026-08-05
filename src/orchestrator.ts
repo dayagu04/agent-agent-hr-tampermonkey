@@ -739,6 +739,7 @@ export async function getOrchestratorSnapshot(): Promise<{
   running: boolean
   appliedTotal: number
   hrRepliesTotal: number
+  sendResumeTotal: number
   skippedTotal: number
   failedTotal: number
   goalTarget: number | null
@@ -755,6 +756,7 @@ export async function getOrchestratorSnapshot(): Promise<{
     running: !(state.phase === 'idle' || state.phase === 'stopped' || state.phase === 'paused'),
     appliedTotal: state.stats.appliedTotal,
     hrRepliesTotal: state.stats.hrRepliesTotal,
+    sendResumeTotal: state.stats.sendResumeTotal || 0,
     skippedTotal: state.stats.skippedTotal || 0,
     failedTotal: state.stats.failedTotal || 0,
     goalTarget: state.goal?.target ?? null,
