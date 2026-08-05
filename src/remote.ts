@@ -8,7 +8,8 @@
 import { VERSION } from './version'
 import { loadConfig, saveConfig, isConfigReady, applyPluginPreferences } from './config'
 import { network } from './platform-bridge'
-import { flushLogs } from './logger'
+import { diag, flushLogs } from './logger'
+import { startDebugCapture } from './debug'
 import {
   getCurrentJob, getOrchestrator, getOrchestratorSnapshot, resumeOrchestrator,
 } from './orchestrator'
@@ -168,7 +169,6 @@ async function executeCommand(
         break
       case 'debug.start': {
         // 手动调试：采集当前页 DOM + 30s 内操作记录（DBG 标签进日志）
-        const { startDebugCapture } = await import('./debug')
         startDebugCapture()
         break
       }
@@ -177,6 +177,7 @@ async function executeCommand(
     }
   } catch (e) {
     console.warn('[remote] 命令执行失败', cmd.action, e)
+    diag('REMOTE', `命令执行失败 ${cmd.action}: ${(e as Error).message}`)
   }
 }
 
