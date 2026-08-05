@@ -78,6 +78,32 @@ const text = (el: Element | null | undefined) => (el?.textContent || '').trim()
 const delay = (min: number, max: number) =>
   new Promise((r) => setTimeout(r, min + Math.random() * (max - min)))
 
+/**
+ * 记录一条会话的完整对话历史到插件日志（批量上传后端 /api/plugin/logs）。
+ *
+ * 用途：后续根据对话历史决定「会话删除策略」（如 HR 已读超时未回、
+ * 我方最后发言且 HR 长时间未回应 → 判定流程结束可删除）。
+ * 逐条成行记录避免日志截断；消息正文服务端上限 4000 字符。
+ *
+ * @param t      会话列表项（提供公司/岗位与最后消息时间文本）
+ * @param messages 读取到的消息（sender: hr | me）
+ */
+function logChatHistory(
+  t: ChatThread,
+  messages: Array<{ sender: 'hr' | 'me'; content: string }>,
+): void {
+  const company = t.company || '未知公司'
+  const jobTitle = t.jobTitle || '未知岗位'
+  const timeText = (t.el.querySelector('span.time, .time')?.textContent || '').trim()
+  diag('HIST', `会话历史 ${company} | ${jobTitle} | 共 ${messages.length} 条 | 最后消息 ${timeText || '未知时间'}`)
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    const who = m.sender === 'hr' ? 'HR' : '我'
+    const content = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+    if (content) diag('HIST', `  #${i + 1} [${who}] ${content}`)
+  }
+}
+
 /** 是否在 BOSS 聊天页 */
 export function onChatPage(): boolean {
   return /\/web\/geek\/chat/.test(location.pathname)
@@ -1518,6 +1544,8 @@ async function cleanupAgedReadThreads(
     await openThread(t.company, t.jobTitle)
     await delay(500, 900)
     const messages = await readMessages()
+    // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
+    logChatHistory(t, messages)
     const last = messages[messages.length - 1]
     if (!last || last.sender !== 'hr') return 'ok'
 
@@ -1622,6 +1650,8 @@ async function runChatRoundInner(
     // 读取消息：不再只看未读标记 —— 已读未回（最后一条是 HR）同样需要回复。
     // 只以「最后一条消息是否为 HR」判定，避免漏掉用户手动读过的消息。
     const messages = await readMessages()
+    // 记录对话历史（供会话删除策略分析，覆盖所有打开的会话）
+    logChatHistory(t, messages)
     const last = messages[messages.length - 1]
     const needsReply = !!last && last.sender === 'hr'
     const hrCount = messages.filter((m) => m.sender === 'hr').length
