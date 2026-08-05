@@ -1352,6 +1352,7 @@ async function forEachThreadScrolling(
       .map((x) => x.t)
 
     let fresh = 0
+    let skippedThisScreen = 0
     for (const t of windowThreads) {
       const key = threadKey(t)
       if (!key || key === '|') {
@@ -1359,12 +1360,9 @@ async function forEachThreadScrolling(
         continue // 身份不可辨的项跳过，避免污染去重集
       }
       if (seen.has(key)) {
-        diag('CHAT', `跳过已处理会话 key="${key}"`, {
-          company: t.company,
-          jobTitle: t.jobTitle,
-          seenSize: seen.size,
-          screen,
-        })
+        // 已处理会话只计数不逐条打日志：数百个会话的逐条日志会挤掉
+        // 发送失败等更关键的诊断行（历史问题：日志被刷掉看不全）。
+        skippedThisScreen++
         continue
       }
 
@@ -1404,6 +1402,9 @@ async function forEachThreadScrolling(
         log(`会话列表已遍历完毕（共 ${seen.size} 个）`)
         return
       }
+    }
+    if (skippedThisScreen > 0) {
+      diag('CHAT', `本屏跳过已处理会话 ${skippedThisScreen} 个（共已见 ${seen.size}）`)
     }
 
     // 容器可能已被重建（处理会话时切换过），重新定位后再滚
@@ -1640,12 +1641,20 @@ async function runChatRoundInner(
     if (synced >= maxThreads) return 'stop'   // 预算用完，提前结束
     if (shouldAbortChatRound()) return 'stop'
 
-    const threadId = currentThreadId()
     handled++
 
     // 切换到该会话
-    await openThread(t.company, t.jobTitle)
+    const opened = await openThread(t.company, t.jobTitle)
     await delay(500, 1000)
+    if (opened !== 'ok') {
+      // 打不开目标会话就跳过：读消息/发回复都必须在正确的会话里进行
+      diag('CHAT', `跳过会话：无法打开 ${t.company}（${opened}）`)
+      return 'ok'
+    }
+    // 目标会话指纹：必须在切换完成后捕获，作为发送前「仍是同一会话」的校验基准。
+    // 历史 bug：在 openThread 之前捕获，expectThread 恒为上一会话，切到目标后
+    // 必然失配 → 所有回复「未发送（会话已切换或发送失败）」（2026-08-05 现场）。
+    const threadId = currentThreadId()
 
     // 读取消息：不再只看未读标记 —— 已读未回（最后一条是 HR）同样需要回复。
     // 只以「最后一条消息是否为 HR」判定，避免漏掉用户手动读过的消息。
