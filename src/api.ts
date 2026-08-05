@@ -336,6 +336,29 @@ export async function markChatSent(
   }
 }
 
+/** POST /api/plugin/chat/mark-deleted — 会话已在 BOSS 端删除，同步标记后端记录 */
+export async function markConversationDeleted(
+  cfg: PluginConfig,
+  payload: { company: string; job_title?: string; reason?: string },
+): Promise<void> {
+  try {
+    await network.request({
+      method: 'POST',
+      url: `${cfg.apiBase}/api/plugin/chat/mark-deleted`,
+      headers: authHeaders(cfg),
+      data: JSON.stringify({
+        platform: 'zhipin',
+        company: payload.company,
+        job_title: payload.job_title || '',
+        reason: payload.reason || 'plugin_delete',
+      }),
+      timeout: 20000,
+    })
+  } catch {
+    /* 标记失败不影响 BOSS 端已删除的事实 */
+  }
+}
+
 /** POST /api/plugin/record — 记录一次投递 */
 export async function recordApplication(
   cfg: PluginConfig,

@@ -7,7 +7,9 @@
 // 全过程由后端 conversation_* 三表留痕（意图/回复/发送结果）供事后评判。
 import { diag } from '../logger'
 import type { PluginConfig } from '../types'
-import { markChatSent, syncChatOne } from '../api'
+import { markChatSent, markConversationDeleted, syncChatOne } from '../api'
+import { removeMirrorByKey } from '../ledger'
+import { loadConfig } from '../config'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
 import {
@@ -328,7 +330,7 @@ let dumpedMissingJobTitle = false
  *
  * @returns 'ok' 已删除 | 'not-found' 列表里没有匹配项 | 'failed' 找到但删除失败
  */
-export async function deleteThread(
+async function deleteThreadImpl(
   company: string,
   jobTitle = '',
 ): Promise<'ok' | 'not-found' | 'failed'> {
@@ -461,6 +463,16 @@ export async function deleteThread(
     unmarkOperateRow(hit.el)
     return 'failed'
   }
+}
+
+/** 删除会话（手动路径）：成功后同步标记后端记录 + 清本地镜像 */
+export async function deleteThread(
+  company: string,
+  jobTitle = '',
+): Promise<'ok' | 'not-found' | 'failed'> {
+  const r = await deleteThreadImpl(company, jobTitle)
+  if (r === 'ok') afterConversationDeleted(company, jobTitle, 'manual')
+  return r
 }
 
 /**
@@ -625,6 +637,16 @@ export function openThread(company: string, jobTitle = ''): 'ok' | 'not-found' |
 /** 读当前打开会话的消息（区分 hr / me）。会先滚动到底部确保全部加载。 */
 /** BOSS 系统通知文本模式（不是 HR 说话，不能当 HR 消息回复/统计） */
 const SYSTEM_MSG_RE = /对方已(查看|同意|接受|拒绝)|附件简历已(发送|送达)|撤回了一条消息|已交换联系方式|职位(已下线|已关闭)|系统消息/
+
+/**
+ * 会话已在 BOSS 端删除：同步标记后端记录（status=deleted，跨轮次不再残留）
+ * 并清本地镜像。三个删除路径（超时清理/被拒删除/手动删除）共用。
+ */
+function afterConversationDeleted(company: string, jobTitle: string, reason: string): void {
+  const cfg = loadConfig()
+  void markConversationDeleted(cfg, { company, job_title: jobTitle, reason })
+  void removeMirrorByKey(company, jobTitle)
+}
 
 async function readMessages(): Promise<Array<{ sender: 'hr' | 'me' | 'system'; content: string }>> {
   // 滚到消息区底部，确保读到最后一条。findChatPanel() 返回的容器不一定是
@@ -841,27 +863,46 @@ async function sendText(content: string, expectThread?: string): Promise<boolean
     input.focus()
     await delay(300, 700)
     if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
-      ;(input as HTMLTextAreaElement).value = content
-      input.dispatchEvent(new Event('input', { bubbles: true }))
+      const ta = input as HTMLTextAreaElement
+      ta.value = content
+      // React 受控组件要 setter 派发才认：直接赋值会丢 valueTracker
+      const proto = ta.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+      setter?.call(ta, content)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
     } else {
       input.textContent = content
-      input.dispatchEvent(new InputEvent('input', { bubbles: true }))
+      // 富文本/可编辑区：带 inputType + data 的 InputEvent 才能被 Vue/React 识别
+      input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: content,
+      }))
     }
     await delay(500, 1100)
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))
+
+    // 发送：Enter 键盘事件（keydown+keyup，补 keyCode/which 兼容旧 handler）
+    for (const type of ['keydown', 'keyup'] as const) {
+      input.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+      }))
+    }
     await delay(800, 1500)
 
-    // 兜底：找「发送」按钮
-    const sendBtn = Array.from(document.querySelectorAll('button, [class*="send"]')).find((el) =>
-      /^发\s*送$/.test(text(el).replace(/\s/g, '')),
-    ) as HTMLElement | undefined
+    // 兜底：找「发送」按钮（文本/aria/title/图标型，限定输入框附近，避免误点）
+    const sendBtn = findSendButton(input)
     if (sendBtn) {
       sendBtn.click()
       await delay(500, 1000)
     }
 
-    // 校验上屏
-    const ok = (document.body.textContent || '').includes(content.slice(0, 10))
+    // 校验上屏：读会话区最后几条「我方」气泡是否包含发送内容（比全文 contains 可靠）
+    const ok = await confirmMessageSent(content)
     diag('CHAT', `发送${ok ? '成功' : '未确认'}: ${content.slice(0, 30)}`)
 
     // 发送成功后，检查并恢复列表滚动位置
@@ -1261,6 +1302,42 @@ export async function runChatRound(
   }
 }
 
+/** 找输入框附近的「发送」按钮（文本/aria/title/图标 class，可见才算） */
+function findSendButton(input: HTMLElement): HTMLElement | null {
+  const scope = input.closest('div, section') || document
+  const cands = Array.from(scope.querySelectorAll(
+    'button, [role="button"], [class*="send"], [class*="Send"], [class*="btn"]',
+  )) as HTMLElement[]
+  for (const el of cands) {
+    const t = (el.textContent || '').replace(/\s+/g, '')
+    const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '')
+    if (!/^发送$/.test(t) && !/发送/.test(aria)) continue
+    const r = el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) return el
+  }
+  return null
+}
+
+/** 确认消息已上屏：轮询会话区最后几条「我方」气泡是否包含发送内容 */
+async function confirmMessageSent(content: string): Promise<boolean> {
+  const needle = content.replace(/\s+/g, '').slice(0, 12)
+  if (!needle) return false
+  for (let i = 0; i < 6; i++) {
+    await delay(500, 800)
+    const panel = findChatPanel()
+    if (panel) {
+      const mine = Array.from(panel.querySelectorAll('.item-myself'))
+      for (let j = mine.length - 1; j >= Math.max(0, mine.length - 3); j--) {
+        const t = (mine[j].textContent || '').replace(/\s+/g, '')
+        if (t.includes(needle)) return true
+      }
+    }
+    // 兜底：全文包含（BOSS 改版选择器失效时仍能确认）
+    if ((document.body.textContent || '').includes(content.slice(0, 10))) return true
+  }
+  return false
+}
+
 /**
  * 会话身份键：用于跨滚动窗口去重（虚拟列表节点会被复用，引用不可靠）
  *
@@ -1570,6 +1647,7 @@ async function cleanupAgedReadThreads(
     log(`  ↳ 删除已读超时会话：${t.company || t.name}`)
     if (await deleteCurrentThread()) {
       cleaned++
+      afterConversationDeleted(t.company, t.jobTitle, 'aged_cleanup')
     }
     return 'ok'
   })
@@ -1756,6 +1834,7 @@ async function runChatRoundInner(
         log(`  [${company || t.company}] 被拒，已发反馈询问，删除会话`)
         if (await deleteCurrentThread()) {
           cleaned++
+          afterConversationDeleted(company || t.company, jobTitle, 'rejection')
         } else {
           log('  ↳ 会话删除未确认（BOSS 端可能已无此会话）')
         }
