@@ -690,10 +690,12 @@ async function readMessages(): Promise<Array<{ sender: 'hr' | 'me' | 'system'; c
     else if (hasStatus) isMe = true
     else if (hasAvatar) isMe = false
     else isMe = r.left > mid
-    // 系统通知（对方已查看简历/同意发送/撤回消息等）单独归类，不做 HR 处理
-    const sender = isMe ? 'me' : SYSTEM_MSG_RE.test(content) ? 'system' : 'hr'
+    // 系统通知单独归类：优先用 BOSS 的 item-system 类（2026-08 实测 DOM），
+    // 再退回文本模式（对方已查看/同意发送/撤回消息等）
+    const isSystem = /item-system|system/.test(cls) || (!isMe && SYSTEM_MSG_RE.test(content))
+    const sender = isMe ? 'me' : isSystem ? 'system' : 'hr'
     out.push({ sender, content })
-    dbg.push(`${isMe ? 'ME' : 'HR'}|cls=${cls.slice(0, 24)}|st=${hasStatus ? 1 : 0}|av=${hasAvatar ? 1 : 0}|x=${Math.round(r.left)}`)
+    dbg.push(`${isMe ? 'ME' : isSystem ? 'SYS' : 'HR'}|cls=${cls.slice(0, 24)}|st=${hasStatus ? 1 : 0}|av=${hasAvatar ? 1 : 0}|x=${Math.round(r.left)}`)
   }
   if (dbg.length) diag("CHAT", "消息判定 mid=" + Math.round(mid), dbg.slice(0, 8))
   return out
@@ -1167,37 +1169,72 @@ function findDialogButton(root: HTMLElement, re: RegExp): HTMLElement | null {
   return null
 }
 
-/** 定位简历弹窗：可见、含「简历」文案、长度适中的 dialog/modal/layer 容器 */
+/** 简历名归一化：小写、去空白/点/加号、去 .pdf 等扩展名。
+ * BOSS 会用字体混淆文件名里的特殊字符（实测 "蔡韬的简历c++.pdf" 显示成 "蔡韬的简历c .pdf"），
+ * 精确匹配会失败，必须归一化后做包含匹配。 */
+function normResumeName(s: string): string {
+  return (s || '')
+    .toLowerCase()
+    .replace(/\.(pdf|docx?|txt|jpg|jpeg|png)$/i, '')
+    .replace(/[\s.+\-_]+/g, '')
+}
+
+/** 定位简历弹窗：优先「请选择要发送的简历」选择框，其次确认框，兜底 .dialog-wrap.active */
 function findResumeDialog(): HTMLElement | null {
   const cands = Array.from(document.querySelectorAll(
-    '[class*="dialog"], [class*="modal"], [class*="Dialog"], [class*="Modal"], [class*="layer"]',
+    '[class*="dialog"], [class*="modal"], [class*="layer"], [class*="popup"]',
   )) as HTMLElement[]
-  for (const d of cands) {
-    const t = (d.textContent || '').replace(/\s+/g, '')
-    if (t.length > 3000 || !/简历/.test(t)) continue
+  const visible = cands.filter((d) => {
     const r = d.getBoundingClientRect()
-    if (r.width > 0 && r.height > 0) return d
+    return r.width > 0 && r.height > 0
+  })
+  // 1) 简历选择弹窗（实测：.dialog-wrap.active，标题「请选择要发送的简历」）
+  const picker = visible.find((d) => {
+    const t = (d.textContent || '').replace(/\s+/g, '')
+    return t.length < 1500 && t.includes('请选择要发送的简历') && !t.includes('上传简历')
+  })
+  if (picker) return picker
+  // 2) 确认弹窗文案
+  const confirm = visible.find((d) => {
+    const t = (d.textContent || '').replace(/\s+/g, '')
+    return t.length < 500 && /确定向Boss发送简历|该附件简历将直接发送/.test(t)
+  })
+  if (confirm) return confirm
+  // 3) 兜底：带 active 且含「简历」的弹窗
+  for (const d of visible) {
+    if (d.classList.contains('active') && /简历/.test(d.textContent || '')) return d
   }
   return null
 }
 
-/** 在简历选择弹窗里选目标简历（按名称匹配列表项；找不到则保持弹窗默认选中） */
-function selectResumeInDialog(dialog: HTMLElement, targetName: string): void {
-  const needle = targetName.replace(/\s+/g, '')
-  const items = Array.from(dialog.querySelectorAll(
-    'li, [class*="resume"], [class*="item"], label',
-  )) as HTMLElement[]
-  for (const el of items) {
-    const t = (el.textContent || '').replace(/\s+/g, '')
-    if (!t.includes(needle)) continue
+/** 在简历选择弹窗里选目标简历：按归一化名称模糊匹配列表项，点其可点祖先；
+ * 找不到则保持弹窗默认选中项（BOSS 默认第一份）。 */
+function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
+  const targetNorm = normResumeName(targetName)
+  if (!targetNorm) return false
+  // 只扫叶子节点（自身文本），避免父容器把整弹窗文本算进去
+  const leaves = Array.from(dialog.querySelectorAll('*')) as HTMLElement[]
+  for (const el of leaves) {
+    const own = Array.from(el.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => (n.textContent || '').trim())
+      .join('')
+    if (!own) continue
+    const norm = normResumeName(own)
+    if (!norm || norm.length < 3) continue
+    if (!(norm.includes(targetNorm) || targetNorm.includes(norm))) continue
     const r = el.getBoundingClientRect()
-    if (r.width > 0 && r.height > 0) {
-      el.click()
-      diag('CHAT', `已选择默认简历: ${targetName}`)
-      return
-    }
+    if (r.width <= 0 || r.height <= 0) continue
+    const clickTarget = (
+      el.closest('[role="radio"], [role="checkbox"], label, [class*="item"], [class*="resume"]') ||
+      el
+    ) as HTMLElement
+    clickTarget.click()
+    diag('CHAT', `已选择默认简历: ${targetName}`)
+    return true
   }
   diag('CHAT', `弹窗里未匹配到默认简历「${targetName}」，用弹窗默认选中项`)
+  return false
 }
 
 function dumpDialogCandidates(): string[] {
