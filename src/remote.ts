@@ -141,7 +141,7 @@ async function executeCommand(
           p.quota_mode === 'per_combination' || p.quota_mode === 'total_llm'
             ? p.quota_mode
             : undefined
-        await orch.start(goal, keywords, city, plan, quotaMode)
+        await orch.start(goal, keywords, city, plan, quotaMode, p.chat_only === true)
         break
       }
       case 'orchestrator.pause':

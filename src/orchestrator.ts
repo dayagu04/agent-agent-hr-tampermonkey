@@ -71,6 +71,8 @@ export interface OrchestratorState {
   planIndex: number
   /** 额度模式（镜像） */
   quotaMode: 'per_combination' | 'total_llm' | 'legacy'
+  /** 只处理会话不投递（网页端「只处理会话」模式） */
+  chatOnly: boolean
   /** 尚未执行完的后端指令（页面跳转后由 resume() 续跑） */
   pendingAction: { action: string; payload: Record<string, unknown> } | null
 }
@@ -270,6 +272,7 @@ export class Orchestrator {
     cityCodeOverride?: string,
     plan?: Array<{ keyword: string; city: string; cityCode: string; quota: number }>,
     quotaMode: OrchestratorState['quotaMode'] = 'legacy',
+    chatOnly = false,
   ): Promise<void> {
     if (this.running) {
       diag('ORCH', '编排器已在运行，跳过重复启动')
@@ -305,6 +308,7 @@ export class Orchestrator {
       plan: normalizedPlan,
       planIndex: 0,
       quotaMode,
+      chatOnly,
       pendingAction: null,
     }
     // 启动时优先捕获当前页已生效的筛选；没有则回落到设置里保存的筛选
@@ -333,6 +337,7 @@ export class Orchestrator {
       max_replies: this.config.maxRepliesPerRound || 10,
       max_pages_per_keyword: this.config.maxPagesPerKeyword || 20,
       city_code: this.state.cityCode || '',
+      chat_only: chatOnly,
       run_id: this.state.runId,
     })
   }
