@@ -42,7 +42,8 @@ export default defineConfig({
           'GM_setValue',
           'GM_getValue',
           'GM_deleteValue',
-          'GM_addStyle',
+          'GM_listValues',
+          'GM_notification',
         ],
       },
       build: {

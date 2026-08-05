@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import type { PluginConfig, ApplyProgress, TabKey, TabItem, HRMessageSummary } from './types'
-import { loadConfig, saveConfig, isConfigReady } from './config'
+import { loadConfig, saveConfig, isConfigReady, applyPluginPreferences } from './config'
 import { fetchPluginConfig, login } from './api'
 import { detectPlatform } from './platforms/factory'
 import { onJobListPage } from './orchestrator'
 import { ApplyEngine } from './engine'
-import { clearDiag, diag, envSnapshot, getDiagText, hhmmss, MAX_LINES, onDiag } from './logger'
+import { diag, hhmmss } from './logger'
 import {
   currentThreadInfo,
   deleteThread,
@@ -102,6 +102,8 @@ onUnmounted(() => {
   if (resizeTimer !== undefined) clearTimeout(resizeTimer)
   if (statsTimer !== undefined) clearInterval(statsTimer)
   if (hrTimer !== null) clearInterval(hrTimer)
+  window.removeEventListener('aah:config-reload', onRemoteConfigReload)
+  if (configTimer !== undefined) clearInterval(configTimer)
 })
 
 /**
@@ -154,7 +156,7 @@ const tabs: TabItem[] = [
   { key: 'apply', label: '投递' },
   { key: 'chat', label: '会话' },
   { key: 'settings', label: '设置' },
-  { key: 'logs', label: '日志' },
+  { key: 'logs', label: '调试' },
 ]
 
 /** 未配置时从各处跳去设置页（取代原来的 showSettings = true） */
@@ -189,49 +191,9 @@ const loginMsg = ref('')
 // 是否已从网站同步到求职偏好（用于界面提示配置来源）
 const prefsSynced = ref(false)
 
-// ---- 诊断日志（BOSS 不能开 DevTools，日志必须落在页面内）----
-const diagLines = ref<string[]>(getDiagText() ? getDiagText().split('\n') : [])
-const copyMsg = ref('')
-/** 面板展示用：取最近 60 行并倒序（最新在顶，与动作日志方向一致） */
-const recentDiagLines = computed(() => diagLines.value.slice(-60).reverse())
 /** DOM 采集区独立缓冲（与行为日志分开，见日志 Tab） */
 const domLines = ref<string[]>([])
 const domCopyMsg = ref('')
-
-onDiag((line) => {
-  diagLines.value.push(line)
-  // 上限与 logger 的持久化上限共用同一常量，避免两处各写死数字后不一致
-  if (diagLines.value.length > MAX_LINES)
-    diagLines.value.splice(0, diagLines.value.length - MAX_LINES)
-})
-
-async function copyDiag() {
-  const text = `${envSnapshot()}\n---\n${getDiagText()}`
-  try {
-    await navigator.clipboard.writeText(text)
-    copyMsg.value = '已复制'
-  } catch {
-    // 剪贴板不可用时退回选中文本，用户手动 Ctrl+C
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0'
-    document.body.appendChild(ta)
-    ta.select()
-    try {
-      document.execCommand('copy')
-      copyMsg.value = '已复制'
-    } catch {
-      copyMsg.value = '复制失败'
-    }
-    ta.remove()
-  }
-  setTimeout(() => (copyMsg.value = ''), 2000)
-}
-
-function wipeDiag() {
-  clearDiag()
-  diagLines.value = []
-}
 
 /** 采集当前页真实 DOM 结构（岗位卡片/分页/聊天列表，见 dom-collector.ts） */
 function collectPageDom() {
@@ -277,11 +239,11 @@ async function wipeChatStore() {
   }
   try {
     await clearChatStore()
-    copyMsg.value = '已清空，下次托管会重新处理'
-    setTimeout(() => (copyMsg.value = ''), 3000)
+    domCopyMsg.value = '已清空，下次托管会重新处理'
+    setTimeout(() => (domCopyMsg.value = ''), 3000)
   } catch (e) {
-    copyMsg.value = `清空失败：${(e as Error).message}`
-    setTimeout(() => (copyMsg.value = ''), 3000)
+    domCopyMsg.value = `清空失败：${(e as Error).message}`
+    setTimeout(() => (domCopyMsg.value = ''), 3000)
   }
 }
 
@@ -296,7 +258,7 @@ async function dumpDom() {
   // 这三处是「翻不到底」「删不掉」「公司名为 -」的根源所在，
   // 而原有的 dumpStructure 只打印聊天面板子树，采不到它们。
   if (onChatPage()) {
-    copyMsg.value = '采集中...'
+    domCopyMsg.value = '采集中...'
     try {
       await probeChatPage()
     } catch (e) {
@@ -320,8 +282,8 @@ async function dumpDom() {
   nodes.forEach((n) =>
     diag('DOM', `  ${'·'.repeat(Math.min(n.depth, 8))}${n.tag}.${n.cls} [${n.rect}] ${n.text}`),
   )
-  copyMsg.value = '结构已记录，请点复制'
-  setTimeout(() => (copyMsg.value = ''), 3000)
+  domCopyMsg.value = '结构已记录，请点复制'
+  setTimeout(() => (domCopyMsg.value = ''), 3000)
 }
 
 // ---- 会话托管（BOSS 聊天页）----
@@ -861,12 +823,12 @@ function logout() {
   saveConfig(config)
 }
 
-async function loadRemoteConfig() {
+async function loadRemoteConfig(silent = false) {
   if (!config.apiBase || !config.token) {
     configError.value = '请先登录'
     return
   }
-  loadingConfig.value = true
+  if (!silent) loadingConfig.value = true
   configError.value = ''
   try {
     const data = await fetchPluginConfig(config)
@@ -882,7 +844,15 @@ async function loadRemoteConfig() {
       if (typeof p.apply_limit === 'number') config.maxApply = p.apply_limit
       // 期望城市：用于会话里判断 HR 发来的工作地点卡片能否接受
       if (p.city) config.prefCity = p.city
+      // 搜索关键词同样以网站「个人设置」为准：同步后插件面板与网页端编排一致
+      // （历史故障：网页端 start 不带关键词，插件回退 'C++'，与用户偏好脱节）
+      if (p.keyword) orchestratorKeywords.value = p.keyword
       prefsSynced.value = true
+    }
+    // 网页端插件偏好（回复模式等）覆盖本地设置：网页端为唯一真相源
+    if (data.plugin_preferences) {
+      Object.assign(config, applyPluginPreferences(config, data.plugin_preferences))
+      saveConfig(config)
     }
     // 从简历技能预填关键词（仅当用户未改过默认值时替换，改过就不覆盖）
     if (data.suggested_keywords && data.suggested_keywords.length > 0) {
@@ -970,6 +940,13 @@ async function stopOrchestrator() {
 
 /** 状态轮询 timer（onUnmounted 需清掉，否则组件销毁后仍在跑） */
 let statsTimer: number | undefined
+/** 配置周期刷新 timer（网页端改偏好后 60s 内兜底同步） */
+let configTimer: number | undefined
+
+/** 网页端入队 config.reload 后的事件回调：静默重拉配置（核心配置实时生效） */
+function onRemoteConfigReload() {
+  void loadRemoteConfig(true)
+}
 
 // 定期更新编排器状态（从编排器实例读取最新统计）
 function updateOrchestratorStats() {
@@ -1022,6 +999,15 @@ onMounted(() => {
     lastChatRefreshAt = Date.now()
     loadHRMessages()
   }, HR_REFRESH_MS)
+
+  // 网页端「保存设置」会入队 config.reload 命令,这里监听事件即时重拉;
+  // 60s 周期刷新兜底,确保网页端改的偏好最终一定生效。
+  window.addEventListener('aah:config-reload', onRemoteConfigReload)
+  configTimer = window.setInterval(() => {
+    if (!ready.value) return
+    if (collapsed.value) return
+    void loadRemoteConfig(true)
+  }, 60000)
 
   // 跨页交接：若用户在别的页面点了 HR 卡片，这里接手打开对应会话
   consumePendingOpen()
@@ -1130,11 +1116,11 @@ watch(activeTab, (tab) => {
           <!-- 两列栅格：简单字段并排，复合/长字段用 .aah-field-wide 跨整行。
                button / p / .aah-loggedin 在 CSS 里默认跨整行，不用逐个标。 -->
           <div v-if="activeTab === 'settings'" key="settings" class="aah-tab-pane aah-form-grid">
-            <!-- URL 值长，单列会被截断 → 整行 -->
-            <label class="aah-field aah-field-wide">
-              <span>后端地址</span>
-              <input v-model="config.apiBase" placeholder="http://localhost:8010" @change="persist" />
-            </label>
+            <!-- 服务器地址构建期固定,无需用户填写(测试版指向本机后端) -->
+            <div class="aah-field aah-field-wide">
+              <span>服务器地址</span>
+              <code class="aah-static-value">{{ config.apiBase }}</code>
+            </div>
 
             <!-- 未登录：显示登录表单。整块单列不拆 —— 邮箱/密码并排会被当成
                  两个无关字段，且密码管理器的自动填充在拆开后容易认错列。 -->
@@ -1165,7 +1151,7 @@ watch(activeTab, (tab) => {
                 <span class="aah-ok-text">✓ 已登录</span>
                 <button class="aah-link-btn" @click="logout">退出</button>
               </div>
-              <button class="aah-btn-secondary" :disabled="loadingConfig" @click="loadRemoteConfig">
+              <button class="aah-btn-secondary" :disabled="loadingConfig" @click="loadRemoteConfig()">
                 {{ loadingConfig ? '加载中...' : '从网站同步配置（简历 + 求职偏好）' }}
               </button>
               <p v-if="prefsSynced" class="aah-tip">
@@ -1234,6 +1220,40 @@ watch(activeTab, (tab) => {
               会话托管只回复匹配分 ≥ {{ config.minReplyScore }} 分的岗位，低于此分的会话在
               上方列表里标为「⊘ 低分」并跳过。设为 0 则全部回复（含垃圾岗）。
             </p>
+
+            <!-- 回复模式（2026-08-05 新增）：本轮投递岗位 vs 全部消息。
+                 网页端「我的助手」可覆盖此设置（users.plugin_preferences）。 -->
+            <label class="aah-field aah-field-wide">
+              <span>回复模式</span>
+              <select v-model="config.replyScope" @change="persist" class="aah-select">
+                <option value="this_round">只回复本轮投递岗位的消息</option>
+                <option value="all">回复全部待回复消息</option>
+              </select>
+              <span class="aah-hint">
+                「只回复本轮」按本轮 run_id 过滤，只处理本次投递岗位收到的 HR 消息；
+                「全部」处理所有待回复 HR 消息（仍按上面匹配分阈值过滤）。
+              </span>
+            </label>
+            <label class="aah-field aah-field-wide">
+              <span>单轮最多回复条数：{{ config.maxRepliesPerRound }}</span>
+              <input type="number" min="1" max="50" v-model.number="config.maxRepliesPerRound" @change="persist" />
+              <span class="aah-hint">
+                会话托管一轮最多发送几条回复（建议 5-10 条先验证发简历链路）
+              </span>
+            </label>
+            <label class="aah-field aah-field-wide">
+              <div class="aah-row">
+                <input type="checkbox" v-model="config.cleanReadConversations" @change="persist" />
+                <span>清理已读超时未回的会话</span>
+              </div>
+            </label>
+            <label class="aah-field aah-field-wide">
+              <span>已读后超过 {{ config.cleanReadAfterHours }} 小时未回则删除会话</span>
+              <input type="number" min="1" max="720" v-model.number="config.cleanReadAfterHours" @change="persist" />
+              <span class="aah-hint">
+                HR 消息已被读（无未读标记）且超过该时长未回复，判定该岗位流程已结束并删除会话；关闭开关则保留历史会话
+              </span>
+            </label>
 
             <!-- 两个纯数字短字段并排。「最多翻页数」受 autoPaginate 控制会消失，
                  那时「单次最多投递」独占半列、右边空着 —— 比整行更难看。
@@ -1595,25 +1615,8 @@ watch(activeTab, (tab) => {
             </template>
           </div>
 
-          <!-- ===== Tab: 日志 ===== -->
+          <!-- ===== Tab: 调试（行为日志已迁移到服务端,这里保留 DOM 采集/调试入口） ===== -->
           <div v-else-if="activeTab === 'logs'" key="logs" class="aah-tab-pane">
-            <!-- ===== 行为记录（原有诊断日志） ===== -->
-            <div class="aah-diag-head">
-              <span>行为记录（{{ diagLines.length }} 行）</span>
-              <span>
-                <button class="aah-link-btn" @click="copyDiag">{{ copyMsg || '复制' }}</button>
-                <button class="aah-link-btn" @click="wipeDiag">清空</button>
-              </span>
-            </div>
-            <!-- 倒序：与动作日志保持一致的「最新在顶」，
-                 否则两个日志区方向相反，读起来像时间戳错乱 -->
-            <div class="aah-logs aah-diag">
-              <div v-if="!recentDiagLines.length" class="aah-log-line">暂无日志</div>
-              <div v-for="(line, i) in recentDiagLines" :key="'d' + i" class="aah-log-line">{{ line }}</div>
-            </div>
-
-            <div class="aah-divider"></div>
-
             <!-- ===== DOM 采集（独立缓冲，回传日志供开发用） ===== -->
             <div class="aah-diag-head">
               <span>DOM 采集（{{ domLines.length }} 行）</span>

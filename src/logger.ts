@@ -1,56 +1,74 @@
-// 页面内日志器 —— 不依赖 DevTools Console
+// 页面内日志器 → 服务端批量上报
 //
-// BOSS 直聘有 devtools 检测（一开 F12 会白屏/断连），诊断信息不能只打 console，
-// 必须落在页面内 + 持久化，供用户一键复制导出。
-const BUFFER_KEY = 'aah_diag_log'
-/** 日志保留行数（面板展示与持久化共用同一常量，避免两处不一致） */
-export const MAX_LINES = 500
+// 插件本地不再持久化日志、不再提供日志面板；diag() 把日志行放进内存缓冲，
+// 攒够一批（≥50 条）或距上次上报超过 60 秒时，统一 POST /api/plugin/logs，
+// 由后端按用户（JWT）落库。console.log 保留供开发期排查。
+import { network } from './platform-bridge'
+import { loadConfig, isConfigReady } from './config'
 
-let buffer: string[] = []
+/** 攒够多少条触发一次上报 */
+const FLUSH_THRESHOLD = 50
+/** 距上次上报超过该时长则强制上报（毫秒） */
+const FLUSH_INTERVAL_MS = 60_000
+/** 内存缓冲上限（避免插件长时间运行无后端时无限膨胀） */
+const MAX_BUFFER = 200
 
-function loadBuffer(): string[] {
-  if (buffer.length) return buffer
-  try {
-    const raw = GM_getValue(BUFFER_KEY, '')
-    buffer = raw ? (JSON.parse(raw as string) as string[]) : []
-  } catch {
-    buffer = []
-  }
-  return buffer
+interface LogEntry {
+  tag: string
+  message: string
 }
 
-function persist(): void {
-  try {
-    GM_setValue(BUFFER_KEY, JSON.stringify(buffer.slice(-MAX_LINES)))
-  } catch {
-    /* 存储失败不影响主流程 */
+let buffer: LogEntry[] = []
+let lastFlush = 0
+let flushing = false
+
+/** 上报缓冲日志；未到阈值/间隔时跳过（非实时）。失败保留待下次重试。 */
+export function flushLogs(): Promise<void> {
+  if (flushing || buffer.length === 0) return Promise.resolve()
+  const now = Date.now()
+  if (buffer.length < FLUSH_THRESHOLD && now - lastFlush < FLUSH_INTERVAL_MS) {
+    return Promise.resolve()
   }
-}
 
-/** 订阅者（面板用于实时展示） */
-type Listener = (line: string) => void
-const listeners = new Set<Listener>()
+  const cfg = loadConfig()
+  if (!isConfigReady(cfg)) return Promise.resolve()
 
-export function onDiag(fn: Listener): () => void {
-  listeners.add(fn)
-  return () => listeners.delete(fn)
+  const batch = buffer.splice(0, FLUSH_THRESHOLD)
+  flushing = true
+  return network.request({
+    method: 'POST',
+    url: `${cfg.apiBase}/api/plugin/logs`,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cfg.token}`,
+    },
+    data: JSON.stringify({ logs: batch }),
+    timeout: 15000,
+  })
+    .then((resp) => {
+      if (resp.status !== 200) buffer = [...batch, ...buffer].slice(-MAX_BUFFER)
+      lastFlush = Date.now()
+    })
+    .catch(() => {
+      // 网络/后端不可达：放回缓冲下次再传
+      buffer = [...batch, ...buffer].slice(-MAX_BUFFER)
+      lastFlush = Date.now()
+    })
+    .finally(() => {
+      flushing = false
+      if (buffer.length >= FLUSH_THRESHOLD) void flushLogs()
+    })
 }
 
 /**
- * 记录一条诊断日志：写内存缓冲 + 持久化 + 通知面板 + （安全时）打 console。
+ * 记录一条诊断日志：进内存缓冲（攒批上报），并打 console 供开发排查。
  *
- * @param tag   模块标签，如 'BOSS' / 'ZHAOPIN' / 'ENGINE'
+ * @param tag   模块标签，如 'BOSS' / 'ENGINE' / 'ORCH'
  * @param msg   人类可读消息
  * @param data  可选结构化数据（会被 JSON 化附在行尾）
  */
 export function diag(tag: string, msg: string, data?: unknown): void {
-  loadBuffer()
-  // 固定 24 小时制（不用 toLocaleTimeString，避免受系统区域设置影响）；
-  // 日志缓冲跨天保留，故带月-日。
-  const d = new Date()
-  const p = (n: number) => String(n).padStart(2, '0')
-  const ts = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-  let line = `[${ts}][${tag}] ${msg}`
+  let line = msg
   if (data !== undefined) {
     try {
       const s = JSON.stringify(data)
@@ -59,53 +77,18 @@ export function diag(tag: string, msg: string, data?: unknown): void {
       line += ' [unserializable]'
     }
   }
-  buffer.push(line)
-  if (buffer.length > MAX_LINES) buffer = buffer.slice(-MAX_LINES)
-  persist()
-  listeners.forEach((fn) => {
-    try {
-      fn(line)
-    } catch {
-      /* ignore */
-    }
-  })
-
-  // console 仍打一份（智联/51 可正常开 DevTools）
+  buffer.push({ tag, message: line })
+  if (buffer.length > MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER)
   try {
-    console.log(line)
+    console.log(`[${tag}] ${line}`)
   } catch {
     /* ignore */
   }
+  void flushLogs()
 }
 
-/** 统一时间戳格式 HH:MM:SS（24 小时制，供动作日志与诊断日志共用） */
+/** 统一时间戳格式 HH:MM:SS（24 小时制，供动作日志共用） */
 export function hhmmss(d: Date = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0')
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-
-/** 取全部日志文本（供复制/导出） */
-export function getDiagText(): string {
-  loadBuffer()
-  return buffer.join('\n')
-}
-
-/** 清空日志 */
-export function clearDiag(): void {
-  buffer = []
-  try {
-    GM_deleteValue(BUFFER_KEY)
-  } catch {
-    /* ignore */
-  }
-}
-
-/** 环境快照：附在日志开头，便于定位平台/版本/页面状态 */
-export function envSnapshot(): string {
-  return [
-    `url=${location.href}`,
-    `ua=${navigator.userAgent}`,
-    `viewport=${window.innerWidth}x${window.innerHeight}`,
-    `time=${new Date().toISOString()}`,
-  ].join('\n')
 }

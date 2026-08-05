@@ -10,6 +10,37 @@ import { BasePlatform, type ApplyContext, type ApplyResult } from './base'
 import type { JobCard, PlatformCode } from '../types'
 import { diag } from '../logger'
 
+/**
+ * 读取 BOSS 顶部导航「消息」入口的未读角标数字（投递页消息变化量）。
+ *
+ * 每次「立即沟通」成功会新建会话 → 角标 +1；对比本轮起点角标即可得到
+ * 「本轮新增会话数」这个变化量，供编排器决定是否提前切去聊天页做快照。
+ * 选择器随 BOSS 改版可能失效：找不到就返回 0（宁可低估，不误报）。
+ */
+export function readMessageBadge(): number {
+  const digitRe = /^\d{1,3}$/
+  const visible = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect()
+    return r.width > 0 && r.height > 0
+  }
+  const nav = Array.from(
+    document.querySelectorAll<HTMLElement>('a, li, div, span'),
+  ).find((el) => (el.textContent || '').trim() === '消息' && visible(el))
+  if (!nav) return 0
+
+  const scope = nav.parentElement || nav
+  const badgeEl = Array.from(scope.querySelectorAll<HTMLElement>('*')).find((el) => {
+    const cls = String(el.className || '')
+    const t = (el.textContent || '').trim()
+    if (!digitRe.test(t)) return false
+    // 只认「纯数字小节点」或带 badge/num/count 关键词的节点，避免误读整块文本
+    if (el.children.length > 0 && !/badge|num|count|unread|tip/i.test(cls)) return false
+    return t.length <= 3
+  })
+  const n = badgeEl ? parseInt((badgeEl.textContent || '0').trim(), 10) : 0
+  return Number.isNaN(n) ? 0 : n
+}
+
 /** 薪资格式（数据层明文，如 8-12K / 1.5-2万 / 14-28K·14薪） */
 const SALARY_RE = /^\d+(?:\.\d+)?\s*[-~]\s*\d+(?:\.\d+)?\s*[Kk万](?:·\d+\s*薪)?/
 

@@ -19,10 +19,15 @@
 | GET  | /api/plugin/rules | 拉取投递过滤规则（黑白名单 / 最低薪资） |
 | POST | /api/plugin/greeting | 取打招呼语（BOSS 首条消息） |
 | POST | /api/plugin/decision | 上报跳过 / 失败原因 |
-| POST | /api/plugin/chat/sync-batch | 批量上报会话消息，取回后端回复 |
 | POST | /api/plugin/chat/sent | 回报回复真实发送结果 |
+| POST | /api/plugin/chat/snapshot | 上报会话行全量快照（DOM 结构 / 状态标签，评估用） |
 | POST | /api/plugin/record | 记录一次投递 |
 | POST | /api/plugin/orchestrator/event | 上报编排器事件（阶段切换 / 批次完成 / 停止） |
+| POST | /api/plugin/heartbeat | 心跳 + 命令轮询（返回待执行远程命令 / 后端编排指令） |
+| GET  | /api/plugin/status | 网页端查询插件连接状态（90s 内有心跳视为在线） |
+| POST | /api/plugin/commands | 网页端入队远程命令（orchestrator.start / pause / resume / stop / action） |
+| PUT  | /api/plugin/preferences | 网页端写入插件偏好（回复模式 / 回复条数 / 已读清理） |
+| POST | /api/plugin/logs | 插件批量上报诊断日志（按 JWT 用户落库） |
 | GET  | /api/conversations/list | 拉取最近会话摘要（HR 消息正文/时间/匹配分） |
 
 ## 演进规则

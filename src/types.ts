@@ -82,6 +82,22 @@ export interface PluginConfig {
    * 用于过滤 HR 主动骚扰（垃圾岗位、审核员等）。
    */
   minReplyScore: number
+  /**
+   * 会话回复范围（2026-08-05 新增）：
+   * - this_round：只回复「本轮投递岗位」收到的 HR 消息（默认）；
+   * - all：回复全部待回复 HR 消息（仍按 minReplyScore 过滤）。
+   * 网页端可覆盖此设置（users.plugin_preferences）。
+   */
+  replyScope: 'this_round' | 'all'
+  /** 单轮最多回复条数（用户要求先 5-10 条测试发简历链路） */
+  maxRepliesPerRound: number
+  /**
+   * 已读超时未回会话清理（2026-08-05 新增）：
+   * HR 消息已被读（无未读标记）且超过 cleanReadAfterHours 小时未回复，
+   * 判定该岗位流程已结束 → 删除会话。可在插件/网页端设置，可关闭。
+   */
+  cleanReadConversations: boolean
+  cleanReadAfterHours: number
 }
 
 /** 面板 Tab 键 */

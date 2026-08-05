@@ -30,6 +30,8 @@ export class ApplyEngine {
     private onProgress: (p: ApplyProgress) => void,
     /** 本次运行要跳过的岗位 id（已尝试过，防同页续跑重复投） */
     private readonly skipJobIds?: Set<string>,
+    /** 本轮编排 run_id（后端用于标识本轮投递岗位，只回复本轮消息用） */
+    private readonly orchestratorRunId = '',
   ) {}
 
   /** 中断标记；长睡眠期间也会被 waitAbortable 感知，不必等睡完 */
@@ -316,6 +318,7 @@ export class ApplyEngine {
         try {
           const rec = await recordApplication(
             this.config, this.platform.code, job, score, outcome, message, greetingSent,
+            this.orchestratorRunId,
           )
           if (rec.duplicate) log(`  ↳ 该岗位之前已投递过`)
         } catch (e) {

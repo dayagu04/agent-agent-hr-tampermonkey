@@ -63,6 +63,7 @@ export async function fetchPluginConfig(cfg: PluginConfig): Promise<{
     apply_limit: number | null
   }
   suggested_keywords?: string[]  // 从简历提取的 top 技能，供预填
+  plugin_preferences?: Record<string, unknown>  // 网页端插件偏好（回复模式等）
 }> {
   const resp = await network.request({
     method: 'GET',
@@ -209,10 +210,10 @@ export async function logDecision(
   }
 }
 
-/** POST /api/plugin/chat/sync-batch — 批量会话处理 */
-export async function syncChatBatch(
+/** POST /api/plugin/chat/sync — 单条会话同步+回复生成（完整版：去重/已回复判定/评分） */
+export async function syncChatOne(
   cfg: PluginConfig,
-  conversations: Array<{
+  payload: {
     platform: string
     platform_job_id?: string
     company?: string
@@ -222,8 +223,10 @@ export async function syncChatBatch(
     min_reply_score?: number
     salary?: string
     city?: string
-  }>,
-): Promise<Array<{
+    run_id?: string
+    reply_scope?: 'this_round' | 'all'
+  },
+): Promise<{
   conversation_id: number | null
   new_messages: number
   intent: string
@@ -232,26 +235,23 @@ export async function syncChatBatch(
   send_resume: boolean
   action_id: number | null
   message: string
-} | null>> {
+} | null> {
   try {
-    diag('API', `批量处理 ${conversations.length} 个会话`)
     const resp = await network.request({
       method: 'POST',
-      url: `${cfg.apiBase}/api/plugin/chat/sync-batch`,
+      url: `${cfg.apiBase}/api/plugin/chat/sync`,
       headers: authHeaders(cfg),
-      data: JSON.stringify({ conversations }),
-      timeout: 300000, // 批量处理需要更长时间
+      data: JSON.stringify(payload),
+      timeout: 60000,
     })
     if (resp.status !== 200) {
-      diag('API', `chat/sync-batch 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
-      return conversations.map(() => null)
+      diag('API', `chat/sync 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      return null
     }
-    const body = JSON.parse(resp.responseText)
-    diag('API', `批量处理完成：成功 ${body.succeeded}/${body.total}`)
-    return body.results || []
+    return JSON.parse(resp.responseText)
   } catch (e) {
-    diag('API', `chat/sync-batch 异常: ${(e as Error).message}`)
-    return conversations.map(() => null)
+    diag('API', `chat/sync 异常: ${(e as Error).message}`)
+    return null
   }
 }
 
@@ -344,6 +344,7 @@ export async function recordApplication(
   outcome: ApplyOutcome = 'applied',
   error = '',
   greetingSent = false,
+  runId = '',
 ): Promise<{ success: boolean; duplicate: boolean; message: string }> {
   const payload = {
     platform,
@@ -359,6 +360,7 @@ export async function recordApplication(
     outcome,
     error,
     greeting_sent: greetingSent,
+    run_id: runId || null,
   }
   const resp = await network.request({
     method: 'POST',
@@ -385,6 +387,7 @@ export async function reportOrchestratorEvent(
     phase: string
     stats?: Record<string, number>
     details?: Record<string, unknown>
+    run_id?: string
   },
 ): Promise<void> {
   try {
@@ -400,5 +403,32 @@ export async function reportOrchestratorEvent(
     }
   } catch {
     /* 上报失败不影响运行 */
+  }
+}
+
+/** POST /api/plugin/chat/snapshot — 上报会话行全量快照（评估状态标签/DOM 用） */
+export async function reportThreadSnapshot(
+  cfg: PluginConfig,
+  payload: {
+    run_id: string
+    url: string
+    reason: string
+    captured_at: string
+    threads: unknown[]
+  },
+): Promise<void> {
+  try {
+    const resp = await network.request({
+      method: 'POST',
+      url: `${cfg.apiBase}/api/plugin/chat/snapshot`,
+      headers: authHeaders(cfg),
+      data: JSON.stringify(payload),
+      timeout: 60000,
+    })
+    if (resp.status !== 200) {
+      diag('API', `chat/snapshot 上报失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+    }
+  } catch (e) {
+    diag('API', `chat/snapshot 上报异常: ${(e as Error).message}`)
   }
 }

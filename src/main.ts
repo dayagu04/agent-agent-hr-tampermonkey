@@ -1,6 +1,10 @@
 // 油猴脚本入口 —— 注入 Vue 悬浮面板到招聘平台页面
 import { createApp } from 'vue'
 import App from './App.vue'
+import { startRemoteLoop } from './remote'
+import { onChatPage } from './platforms/boss-chat'
+import { loadConfig, isConfigReady } from './config'
+import { reportThreadSnapshotOnce } from './thread-snapshot'
 
 function mount() {
   // 创建挂载容器，直接挂在 body（样式用 .aah- 前缀避免与宿主冲突）
@@ -12,7 +16,28 @@ function mount() {
 
 // 等页面加载完成再挂载（SPA 平台可能延迟渲染）
 if (document.readyState === 'complete' || document.readyState === 'interactive') {
-  setTimeout(mount, 1000)
+  setTimeout(() => {
+    mount()
+    // 网页端远程管理：心跳 + 命令轮询（与悬浮面板独立）
+    startRemoteLoop()
+    void scheduleChatSnapshot()
+  }, 1000)
 } else {
-  window.addEventListener('load', () => setTimeout(mount, 1000))
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      mount()
+      startRemoteLoop()
+      void scheduleChatSnapshot()
+    }, 1000)
+  })
+}
+
+/** 聊天页加载后自动做一次全量会话快照（节流在模块内：60s/run+url）。 */
+async function scheduleChatSnapshot(): Promise<void> {
+  if (!onChatPage()) return
+  const cfg = loadConfig()
+  if (!isConfigReady(cfg)) return
+  // 等 DOM 渲染稳定（SPA 虚拟列表）
+  await new Promise((r) => setTimeout(r, 3000))
+  void reportThreadSnapshotOnce(cfg, { reason: 'page_load' })
 }

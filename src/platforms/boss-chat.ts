@@ -7,7 +7,7 @@
 // 全过程由后端 conversation_* 三表留痕（意图/回复/发送结果）供事后评判。
 import { diag } from '../logger'
 import type { PluginConfig } from '../types'
-import { markChatSent, syncChatBatch } from '../api'
+import { markChatSent, syncChatOne } from '../api'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
 import {
@@ -21,12 +21,7 @@ import {
   revealOperateBtn,
   unmarkOperateRow,
 } from './boss-delete'
-import {
-  getThread,
-  isKnownLowScore,
-  recordLowScore,
-} from '../chat-store'
-import { upsertMirrorFromSync } from '../ledger'
+import { reportThreadSnapshotOnce } from '../thread-snapshot'
 
 /** 聊天页单个会话条目 */
 export interface ChatThread {
@@ -599,52 +594,6 @@ export function openThread(company: string, jobTitle = ''): 'ok' | 'not-found' |
     diag('CHAT', `openThread 切换异常: ${(e as Error).message}`)
     return 'failed'
   }
-}
-
-/**
- * 带滚动查找的openThread版本（用于删除等需要找到任意会话的场景）
- */
-async function openThreadWithScroll(company: string, jobTitle = ''): Promise<'ok' | 'not-found' | 'failed'> {
-  // 先尝试不滚动
-  const quickResult = openThread(company, jobTitle)
-  if (quickResult === 'ok') return 'ok'
-
-  // 如果没找到，尝试滚动查找
-  const container = findThreadScrollContainer()
-  if (!container) return 'not-found'
-
-  diag('CHAT', `openThreadWithScroll 开始滚动查找: ${company}`)
-
-  // 滚动到顶部
-  container.scrollTo({ top: 0 })
-  await delay(300, 500)
-
-  let attempts = 0
-  const maxAttempts = 30 // 最多30屏
-
-  while (attempts < maxAttempts) {
-    // 尝试在当前窗口查找
-    const result = openThread(company, jobTitle)
-    if (result === 'ok') {
-      diag('CHAT', `openThreadWithScroll 找到并切换（第${attempts}屏）`)
-      return 'ok'
-    }
-
-    // 向下滚动一屏
-    const before = container.scrollTop
-    container.scrollBy({ top: Math.floor(container.clientHeight * 0.8) })
-    await delay(300, 500)
-
-    // 如果到底了，停止
-    if (Math.abs(container.scrollTop - before) < 10) {
-      diag('CHAT', `openThreadWithScroll 滚动到底仍未找到: ${company}`)
-      break
-    }
-
-    attempts++
-  }
-
-  return 'not-found'
 }
 
 /** 读当前打开会话的消息（区分 hr / me）。会先滚动到底部确保全部加载。 */
@@ -1251,7 +1200,19 @@ export async function runChatRound(
   cfg: PluginConfig,
   maxThreads = 5,
   log: (m: string) => void = () => {},
-): Promise<{ handled: number; replied: number }> {
+  opts: {
+    mode?: 'full' | 'snapshot'
+    runId?: string
+    replyScope?: 'this_round' | 'all'
+  } = {},
+): Promise<{
+  handled: number
+  replied: number
+  resumes_sent?: number
+  pending?: number
+  synced?: number
+  cleaned?: number
+}> {
   if (chatRoundRunning) {
     log('已有会话托管在运行，本次跳过（防止重复发消息给 HR）')
     diag('CHAT', '拒绝并发的会话托管请求')
@@ -1262,7 +1223,7 @@ export async function runChatRound(
   // 不复位则下一轮启动即刻自杀（表现为「点了开始，一条没处理就完成了」）。
   chatRoundAbort = false
   try {
-    return await runChatRoundInner(cfg, maxThreads, log)
+    return await runChatRoundInner(cfg, maxThreads, log, opts)
   } finally {
     chatRoundRunning = false
     chatRoundAbort = false
@@ -1473,171 +1434,239 @@ function findThreadScrollContainer(): HTMLElement | null {
   return fallback
 }
 
+/** BOSS 会话行时间文本 → epoch 毫秒（"刚刚"/"昨天"/"HH:mm"/"MM-DD"/"YYYY-MM-DD"）。 */
+function parseThreadTimeMs(text: string, now: number): number | null {
+  const t = (text || '').trim()
+  if (!t) return null
+  if (t === '刚刚') return now
+  const num = Number(t)
+  if (!Number.isNaN(num)) {
+    // 纯数字：可能是 epoch 秒/毫秒，也可能是"3分钟前"这类被解析成数字
+    return num > 1e12 ? num : now - num * 1000
+  }
+  const nowDate = new Date(now)
+  const y = nowDate.getFullYear()
+  if (t === '昨天') return now - 24 * 3600 * 1000
+  const full = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/)
+  if (full) {
+    return new Date(
+      Number(full[1]), Number(full[2]) - 1, Number(full[3]),
+      full[4] ? Number(full[4]) : 0, full[5] ? Number(full[5]) : 0,
+    ).getTime()
+  }
+  const md = t.match(/^(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/)
+  if (md) {
+    return new Date(
+      y, Number(md[1]) - 1, Number(md[2]),
+      md[3] ? Number(md[3]) : 0, md[4] ? Number(md[4]) : 0,
+    ).getTime()
+  }
+  const hm = t.match(/^(\d{1,2}):(\d{2})$/)
+  if (hm) {
+    const d = new Date(now)
+    d.setHours(Number(hm[1]), Number(hm[2]), 0, 0)
+    return d.getTime()
+  }
+  return null
+}
+
+/** 删除当前已打开的会话（头部菜单 → 确认弹窗）。 */
+async function deleteCurrentThread(): Promise<boolean> {
+  const header = findChatHeader()
+  if (!header) {
+    diag('CHAT', '清理删除：未找到会话头部')
+    return false
+  }
+  const before = currentThreadId()
+  const ok = await clickDeleteInHeaderMenu(
+    header,
+    () => currentThreadId() === before,
+    (el) => insideThreadList(el),
+  )
+  if (!ok) {
+    diag('CHAT', '清理删除：头部菜单未触发删除')
+    return false
+  }
+  const confirmed = await confirmDeleteDialog()
+  diag('CHAT', `清理删除：${confirmed ? '已确认删除' : '确认弹窗未出现'}`)
+  return confirmed
+}
+
+/**
+ * 清理「已读且超时未回」的会话：
+ * - 无未读标记（我方已读）且最后一条是 HR 消息（我方未回）；
+ * - 最后消息时间超过 cleanReadAfterHours；
+ * 满足则删除会话，判定该岗位流程已结束。
+ */
+async function cleanupAgedReadThreads(
+  cfg: PluginConfig,
+  log: (m: string) => void,
+): Promise<number> {
+  const hours = Math.max(1, cfg.cleanReadAfterHours || 16)
+  const agedMs = hours * 3600 * 1000
+  let cleaned = 0
+
+  await forEachThreadScrolling(log, async (t) => {
+    if (t.unread) return 'ok' // 未读消息不清理（还要回）
+
+    const timeEl = t.el.querySelector('span.time, .time')
+    if (!timeEl) return 'ok'
+    const age = parseThreadTimeMs((timeEl.textContent || '').trim(), Date.now())
+    if (age === null || Date.now() - age < agedMs) return 'ok'
+
+    // 打开确认最后一条是 HR（避免删掉我方最后回复的会话）
+    await openThread(t.company, t.jobTitle)
+    await delay(500, 900)
+    const messages = await readMessages()
+    const last = messages[messages.length - 1]
+    if (!last || last.sender !== 'hr') return 'ok'
+
+    diag('CHAT', `清理已读超时未回会话`, {
+      company: t.company,
+      jobTitle: t.jobTitle,
+      timeText: (timeEl.textContent || '').trim(),
+      lastMsg: (last.content || '').slice(0, 30),
+    })
+    log(`  ↳ 删除已读超时会话：${t.company || t.name}`)
+    if (await deleteCurrentThread()) {
+      cleaned++
+    }
+    return 'ok'
+  })
+  return cleaned
+}
+
 async function runChatRoundInner(
   cfg: PluginConfig,
   maxThreads: number,
   log: (m: string) => void,
-): Promise<{ handled: number; replied: number }> {
+  opts: {
+    mode?: 'full' | 'snapshot'
+    runId?: string
+    replyScope?: 'this_round' | 'all'
+  },
+): Promise<{
+  handled: number
+  replied: number
+  resumes_sent?: number
+  pending?: number
+  synced?: number
+  cleaned?: number
+}> {
   let handled = 0
   let replied = 0
+  let resumesSent = 0
+  let cleaned = 0
+  const mode = opts.mode || 'full'
 
-  log(`开始遍历会话列表（动作预算 ${maxThreads}）。运行中请勿手动点击会话列表。`)
+  log(
+    mode === 'snapshot'
+      ? `开始消息快照（只读统计待回复会话，不发送）。运行中请勿手动点击会话列表。`
+      : `开始遍历会话列表（回复预算 ${maxThreads}）。运行中请勿手动点击会话列表。`,
+  )
   // 影响「回不回复」的判断同时写进导出日志，便于事后排查
-  diag('CHAT', `本轮开始遍历会话，动作预算 ${maxThreads}`)
+  diag('CHAT', `本轮开始遍历会话，mode=${mode} 预算 ${maxThreads}`)
 
-  // 三阶段：快速扫描（不调后端）→ 批量分类 → 按结果发送
+  // 快照模式：只统计待回复（未读）会话数，不打开会话、不调后端、不发送。
+  // 「精确到岗位」由聊天页会话列表行提供（公司+岗位+未读标记），
+  // 后端在 chat_snapshot_done 事件里取 max(DOM 未读数, DB 待回复数) 作为真相源。
+  if (mode === 'snapshot') {
+    // 全量会话行快照（DOM 结构 + 送达/已读等状态标签）上报，供评估数据可用性
+    void reportThreadSnapshotOnce(cfg, { runId: opts.runId, reason: 'snapshot' })
 
-  interface PendingConversation {
-    thread: ChatThread
-    threadId: string
-    messages: Array<{ sender: 'hr' | 'me'; content: string }>
-    company: string
-    jobTitle: string
-    salary?: string
-    city?: string
-    shouldSkip: boolean
-    skipReason?: string
+    let pending = 0
+    await forEachThreadScrolling(log, async (t) => {
+      handled++
+      if (t.unread) pending++
+      return 'ok'
+    })
+    log(`消息快照完成：扫描 ${handled} 个会话，待回复 ${pending} 个`)
+    diag('CHAT', `消息快照完成 handled=${handled} pending=${pending}`)
+    return { handled, replied: 0, pending }
   }
 
-  const pendingConversations: PendingConversation[] = []
+  // 清理已读超时未回会话（用户设置开启时）：HR 消息已被读且超过 N 小时未回复，
+  // 判定该岗位流程已结束 → 删除会话。先清理再回复，避免给「已结束」的会话发消息。
+  if (cfg.cleanReadConversations) {
+    log(`清理已读超时未回会话（${cfg.cleanReadAfterHours}h 未回则删）...`)
+    cleaned = await cleanupAgedReadThreads(cfg, log)
+    if (cleaned > 0) log(`已清理 ${cleaned} 个超时未回会话`)
+    else log('本轮没有需要清理的超时未回会话')
+  }
 
-  log('【阶段1/3】快速扫描会话...')
-  diag('CHAT', '开始阶段1：快速扫描')
+  // 回复范围：只有编排器运行时才有「本轮」概念（runId 存在）；手动开启会话托管
+  // 没有本轮，一律按 all 处理，否则后端 this_round 缺 run_id 会全部拒回。
+  const replyScope: 'this_round' | 'all' = opts.runId
+    ? (opts.replyScope || cfg.replyScope || 'this_round')
+    : 'all'
 
-  // 遍历方式：滚动窗口增量处理（见 forEachThreadScrolling 注释）。
+  // 单遍流水线：遍历到哪个会话，就在「当前已打开」的状态下直接 同步+发送。
+  // 不再三阶段重开 —— 历史问题：阶段1把虚拟列表滚到底后，阶段3再按公司名
+  // re-open，每个会话都要滚整张列表，一轮回复卡在消息页好几分钟。
+  // 预算（maxThreads）用完后提前结束遍历。
+  log(`开始单遍处理会话（回复预算 ${maxThreads}）...`)
+  diag('CHAT', `开始单遍处理，replyScope=${replyScope}`)
+  let synced = 0
+
   await forEachThreadScrolling(log, async (t, seq) => {
+    if (synced >= maxThreads) return 'stop'   // 预算用完，提前结束
+    if (shouldAbortChatRound()) return 'stop'
+
     const threadId = currentThreadId()
     handled++
-
-    // 无未读的会话本轮跳过（HR 回复必然带未读标记），
-    // 仍计入 handled，但不打开、不读消息、不上报后端。
-    if (!t.unread) {
-      pendingConversations.push({
-        thread: t,
-        threadId,
-        messages: [],
-        company: t.company,
-        jobTitle: t.jobTitle,
-        shouldSkip: true,
-        skipReason: '无未读消息，本轮跳过',
-      })
-      return 'ok'
-    }
-
-    // 快速跳过检查（无需调用后端的情况）
-    const quickSkip = await checkQuickSkip(t, cfg, log)
-    if (quickSkip.should) {
-      pendingConversations.push({
-        thread: t,
-        threadId,
-        messages: [],
-        company: t.company,
-        jobTitle: t.jobTitle,
-        shouldSkip: true,
-        skipReason: quickSkip.reason,
-      })
-      return 'ok'
-    }
 
     // 切换到该会话
     await openThread(t.company, t.jobTitle)
     await delay(500, 1000)
 
-    // 读取消息
+    // 读取消息：不再只看未读标记 —— 已读未回（最后一条是 HR）同样需要回复。
+    // 只以「最后一条消息是否为 HR」判定，避免漏掉用户手动读过的消息。
     const messages = await readMessages()
+    const last = messages[messages.length - 1]
+    const needsReply = !!last && last.sender === 'hr'
     const hrCount = messages.filter((m) => m.sender === 'hr').length
-    diag('CHAT', `消息读取 mid=${seq}：${messages.length} 条（HR ${hrCount} / 我方 ${messages.length - hrCount}）`)
+    diag(
+      'CHAT',
+      `消息读取 mid=${seq}：${messages.length} 条（HR ${hrCount} / 我方 ${messages.length - hrCount}）` +
+        ` needsReply=${needsReply}`,
+    )
+
+    if (!needsReply) {
+      return 'ok'
+    }
 
     // 读取会话信息
     const info = currentThreadInfo()
     const { company, jobTitle, salary, city } = info
     diag('CHAT', `会话归属信息 company="${company}" job="${jobTitle}"`)
 
-    // 存入待处理列表
-    pendingConversations.push({
-      thread: t,
-      threadId,
-      messages,
+    // 单条同步后端（完整版 sync_chat：去重/已回复判定/评分/建档）
+    const res = await syncChatOne(cfg, {
+      platform: 'zhipin',
+      platform_job_id: '',
       company,
-      jobTitle,
-      salary,
-      city,
-      shouldSkip: false,
+      job_title: jobTitle,
+      messages: messages.map((m) => ({
+        sender: m.sender === 'hr' ? 'hr' : 'me',
+        content: m.content,
+        timestamp: '',
+      })),
+      auto_reply: true,
+      // 透传用户设置的最低回复匹配分；0 或未设置时后端不过滤
+      min_reply_score: cfg.minReplyScore || 0,
+      salary: salary || '',
+      city: city || '',
+      run_id: opts.runId || '',
+      reply_scope: replyScope,
     })
-
-    return 'ok'
-  })
-
-  log(`【阶段2/3】批量分类 ${pendingConversations.length} 个会话...`)
-  diag('CHAT', `开始阶段2：批量分类 ${pendingConversations.length} 个会话`)
-
-  // 过滤出需要调用后端的会话
-  const needsBackend = pendingConversations.filter(c => !c.shouldSkip)
-
-  if (needsBackend.length === 0) {
-    log('所有会话均已跳过，无需调用后端')
-    return { handled, replied: 0 }
-  }
-
-  // 批量调用后端
-  const batchPayload = needsBackend.map(c => ({
-    platform: 'zhipin',
-    platform_job_id: '',
-    company: c.company,
-    job_title: c.jobTitle,
-    messages: c.messages.map(m => ({
-      sender: m.sender === 'hr' ? 'hr' : 'me',
-      content: m.content,
-      timestamp: '',
-    })),
-    auto_reply: true,
-    min_reply_score: cfg.minReplyScore,
-    salary: c.salary || '',
-    city: c.city || '',
-  }))
-
-  const results = await syncChatBatch(cfg, batchPayload)
-
-  log(`【阶段3/3】发送回复...`)
-  diag('CHAT', `开始阶段3：发送回复`)
-
-  // 阶段3：根据结果发送回复
-  for (let i = 0; i < needsBackend.length; i++) {
-    const conv = needsBackend[i]
-    const res = results[i]
-
-    if (replied >= maxThreads) {
-      log(`已达动作上限 ${maxThreads}，剩余会话不再处理`)
-      break
-    }
-
-    if (shouldAbortChatRound()) {
-      log('用户已停止，中止发送')
-      break
-    }
-
-    // 切换到该会话
-    await openThreadWithScroll(conv.company, conv.jobTitle)
-    await delay(500, 1000)
+    synced++
 
     if (!res) {
-      log(`  [${conv.company}] 后端处理失败，跳过`)
-      continue
+      log(`  [${company || t.company}] 后端处理失败，跳过`)
+      return 'ok'
     }
 
-    // 同步成功 → 更新本地镜像（列表即时反映，不用等下一轮服务器拉取）
-    if (res.conversation_id) {
-      await upsertMirrorFromSync({
-        conversation_id: res.conversation_id,
-        company: conv.company,
-        jobTitle: conv.jobTitle,
-        salary: conv.salary,
-        messages: conv.messages,
-      })
-    }
-
-    // 记录后端返回
-    diag('CHAT', `后端返回 ${conv.company}`, {
+    diag('CHAT', `后端返回 ${company || t.company}`, {
       intent: res.intent,
       newMessages: res.new_messages,
       hasReply: !!res.reply,
@@ -1645,84 +1674,43 @@ async function runChatRoundInner(
     })
 
     if (!res.reply) {
-      // 处理各种无需回复的情况
-      if (res.intent === 'low_score_skip' || res.intent === 'no_score_skip') {
-        const noScore = res.intent === 'no_score_skip'
-        const why = noScore
-          ? '该岗位未经匹配评分（HR 主动打招呼，非你投递的）'
-          : `匹配分低于阈值 ${cfg.minReplyScore} 分`
-        log(`  [${conv.company}] ⊘ 低质量跳过：${why}`)
-        diag('CHAT', `低质量跳过 ${conv.company}`, {
-          intent: res.intent,
-          threshold: cfg.minReplyScore,
-          backendMessage: res.message || '-',
-        })
-        // 缓存低分判定供下轮快速跳过；列表项身份与头部身份文本形态不同，
-        // threadKey 不同，需各记一份
-        await recordLowScore(conv.company, conv.jobTitle, cfg.minReplyScore)
-        await recordLowScore(conv.thread.company, conv.thread.jobTitle, cfg.minReplyScore)
-      } else {
-        log(`  [${conv.company}] 无需回复（${res.message || ''}）`)
-        diag('CHAT', `后端判定无需回复 ${conv.company}`, { reason: res.message || '-' })
-      }
-      continue
+      log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
+      return 'ok'
     }
 
-    // 发送回复
-    log(`  [${conv.company}] 回复: ${res.reply}`)
-    const ok = await sendText(res.reply, conv.threadId)
+    // 发送回复（当前会话已打开，直接发，无需重开）
+    log(`  [${company || t.company}] 回复: ${res.reply}`)
+    const ok = await sendText(res.reply, threadId)
 
     if (ok) {
       replied++
       if (res.send_resume) {
         const resumeOk = await sendResume()
         if (!resumeOk) log('  ↳ 简历未发出，需手动处理')
+        else resumesSent++
       }
       if (res.action_id) {
         await markChatSent(cfg, res.action_id, true, '')
       }
     } else {
-      log(`  [${conv.company}] 未发送（会话已切换或发送失败）`)
+      log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
       if (res.action_id) {
         await markChatSent(cfg, res.action_id, false, '页面发送未确认')
       }
     }
 
-    // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
-    // 低分/无分跳过的会话不会走到这里，不会给低质量岗位发简历。
+    // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）
     for (const card of findPendingCards()) {
-      await handleCard(card, cfg, conv.threadId, log)
+      await handleCard(card, cfg, threadId, log)
     }
 
     await delay(2000, 4000) // 会话间间隔
-  }
+    return 'ok'
+  })
 
-  log(`批量处理完成：扫描 ${pendingConversations.length} 个会话，发送 ${replied} 条回复`)
-  diag('CHAT', `批量处理完成 handled=${handled} replied=${replied}`)
+  log(`单遍处理完成：扫描 ${handled} 个会话，同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次`)
+  diag('CHAT', `单遍处理完成 handled=${handled} synced=${synced} replied=${replied} resumes_sent=${resumesSent}`)
 
-  return { handled, replied }
+  return { handled, replied, resumes_sent: resumesSent, synced, cleaned }
 }
 
-/** 是否命中缓存的低分判定（判定过期或用户调低阈值后失效，见 chat-store） */
-async function getCachedLowScore(company: string, jobTitle: string, threshold: number): Promise<boolean> {
-  const rec = await getThread(company, jobTitle)
-  return !!rec && isKnownLowScore(rec, threshold)
-}
-
-// 辅助函数：快速跳过检查（无需调用后端）
-async function checkQuickSkip(
-  t: ChatThread,
-  cfg: PluginConfig,
-  log: (m: string) => void,
-): Promise<{ should: boolean; reason?: string }> {
-  const { company, jobTitle } = t
-
-  // 检查是否缓存为低分
-  const cached = await getCachedLowScore(company, jobTitle, cfg.minReplyScore)
-  if (cached) {
-    log(`  [${company}] 跳过：缓存的低匹配分`)
-    return { should: true, reason: '缓存的低匹配分' }
-  }
-
-  return { should: false }
-}
