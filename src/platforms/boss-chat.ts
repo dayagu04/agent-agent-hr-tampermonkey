@@ -1097,7 +1097,13 @@ async function handleCard(
     card.acceptBtn.click()
     await delay(1200, 2000)
     diag('CHAT', '已同意发送附件简历')
-    return true
+    // 同意后 BOSS 弹简历选择框（多简历时）：选默认简历并发送
+    const cfg = loadConfig()
+    const targetName =
+      cfg.defaultSendResumeId && cfg.resumeNames
+        ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
+        : null
+    return await completeResumeSend(targetName)
   }
 
   if (card.kind === 'location_confirm') {
@@ -1134,7 +1140,119 @@ async function handleCard(
   return false
 }
 
-/** 点「发简历」（HR 要简历时用） */
+/** 按钮禁用判定（unable/disabled/aria/pointer-events） */
+function isDialogButtonDisabled(el: HTMLElement): boolean {
+  const cls = String(el.className || '')
+  return (
+    /unable|disabled|is-disabled/.test(cls) ||
+    el.getAttribute('aria-disabled') === 'true' ||
+    getComputedStyle(el).pointerEvents === 'none'
+  )
+}
+
+/** 在弹窗里找按钮：只匹配叶子节点自身文本，排除 拒绝/取消，且可见 */
+function findDialogButton(root: HTMLElement, re: RegExp): HTMLElement | null {
+  const els = Array.from(root.querySelectorAll('div,span,button,a,[role="button"]')) as HTMLElement[]
+  for (const el of els) {
+    const own = Array.from(el.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => (n.textContent || '').trim())
+      .join('')
+      .replace(/\s+/g, '')
+    if (!own || !re.test(own)) continue
+    if (/拒绝|取消/.test(own)) continue
+    const r = el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) return el
+  }
+  return null
+}
+
+/** 定位简历弹窗：可见、含「简历」文案、长度适中的 dialog/modal/layer 容器 */
+function findResumeDialog(): HTMLElement | null {
+  const cands = Array.from(document.querySelectorAll(
+    '[class*="dialog"], [class*="modal"], [class*="Dialog"], [class*="Modal"], [class*="layer"]',
+  )) as HTMLElement[]
+  for (const d of cands) {
+    const t = (d.textContent || '').replace(/\s+/g, '')
+    if (t.length > 3000 || !/简历/.test(t)) continue
+    const r = d.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) return d
+  }
+  return null
+}
+
+/** 在简历选择弹窗里选目标简历（按名称匹配列表项；找不到则保持弹窗默认选中） */
+function selectResumeInDialog(dialog: HTMLElement, targetName: string): void {
+  const needle = targetName.replace(/\s+/g, '')
+  const items = Array.from(dialog.querySelectorAll(
+    'li, [class*="resume"], [class*="item"], label',
+  )) as HTMLElement[]
+  for (const el of items) {
+    const t = (el.textContent || '').replace(/\s+/g, '')
+    if (!t.includes(needle)) continue
+    const r = el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) {
+      el.click()
+      diag('CHAT', `已选择默认简历: ${targetName}`)
+      return
+    }
+  }
+  diag('CHAT', `弹窗里未匹配到默认简历「${targetName}」，用弹窗默认选中项`)
+}
+
+function dumpDialogCandidates(): string[] {
+  return Array.from(document.querySelectorAll(
+    '[class*="dialog"], [class*="modal"], [class*="layer"]',
+  )).map((el) => {
+    const r = el.getBoundingClientRect()
+    return `${String(el.className || '').slice(0, 50)}[${Math.round(r.width)}x${Math.round(r.height)}]`
+  }).slice(0, 10)
+}
+
+/**
+ * 简历发送弹窗流：确认（同意/确定）→ 选择默认简历 → 发送。
+ *
+ * BOSS 实际弹窗（2026-08 实测结构）：
+ * 1. 确认弹窗：按钮是「同意/拒绝」卡片（不是"确定"）；
+ * 2. 简历选择弹窗：多份简历时默认选中第一个，点「发送」；
+ * 账号有多份简历时，按用户配置的默认简历（defaultSendResumeId）选中后发送。
+ */
+async function completeResumeSend(
+  targetName: string | null,
+  alreadyAgreed = false,
+): Promise<boolean> {
+  let agreed = alreadyAgreed
+  for (let i = 0; i < 20; i++) {
+    await delay(400, 600)
+    const dialog = findResumeDialog()
+    if (!dialog) continue
+
+    // 发送按钮（选择弹窗/直接发送）
+    const sendBtn = findDialogButton(dialog, /^(发送|确定)$/)
+    if (sendBtn && !isDialogButtonDisabled(sendBtn)) {
+      if (targetName) selectResumeInDialog(dialog, targetName)
+      sendBtn.click()
+      await delay(1000, 1500)
+      diag('CHAT', `已发送简历（${targetName ? `默认: ${targetName}` : '未配置默认，用弹窗默认'}）`)
+      return true
+    }
+
+    // 确认弹窗：BOSS 用「同意/拒绝」，点了之后等选择弹窗
+    if (!agreed) {
+      const agreeBtn = findDialogButton(dialog, /^(同意|确定|确认)$/)
+      if (agreeBtn && !isDialogButtonDisabled(agreeBtn)) {
+        agreeBtn.click()
+        agreed = true
+        await delay(900, 1300)
+        diag('CHAT', '已点击简历确认（同意），等待选择弹窗')
+      }
+    }
+  }
+  diag('CHAT', '⚠ 简历弹窗处理失败：未找到发送/确认按钮', dumpDialogCandidates())
+  return false
+}
+
+/** 点「发简历」（HR 要简历时用）→ 确认 + 选择默认简历 + 发送 */
 async function sendResume(): Promise<boolean> {
   // 按可见文本定位（"发简历" 这类文案比 class 稳定得多）
   const btn = findByText(/^(发简历|发送简历|附件简历)$/, { clickable: true })
@@ -1142,72 +1260,19 @@ async function sendResume(): Promise<boolean> {
     diag('CHAT', '未找到「发送简历」按钮')
     return false
   }
-
-  // 禁用态检测：按钮带 unable/disabled 类或 pointer-events:none 时硬点无效，
-  // 还会误报成功，故先判再点。
-  const cls = String(btn.className || '')
-  const disabled =
-    /unable|disabled|is-disabled/.test(cls) ||
-    btn.getAttribute('aria-disabled') === 'true' ||
-    getComputedStyle(btn).pointerEvents === 'none'
-  if (disabled) {
-    diag('CHAT', '「发简历」按钮处于禁用态，跳过', { cls: cls.slice(0, 60) })
+  if (isDialogButtonDisabled(btn)) {
+    diag('CHAT', '「发简历」按钮处于禁用态，跳过', { cls: String(btn.className || '').slice(0, 60) })
     return false
   }
-
   btn.click()
+  await delay(1200, 1800)
 
-  // 必须点掉「确定向 Boss 发送简历吗？」弹窗，否则简历没发出去
-  // 却已告知 HR「简历发您了」。BOSS 的「确定」是 div/span 而非 button，
-  // 且弹窗有入场动画，需要轮询等待。
-  const confirmed = await waitForResumeConfirm()
-  if (!confirmed) {
-    diag('CHAT', '⚠ 未找到简历确认弹窗的「确定」按钮，简历可能未真正发出')
-    return false
-  }
-
-  diag('CHAT', '已发送简历（含确认弹窗）')
-  return true
-}
-
-/**
- * 轮询等待并点击简历确认弹窗的「确定」。
- * @returns 是否确认成功（没弹窗出现也算失败，调用方据此判断是否真发出）
- */
-async function waitForResumeConfirm(): Promise<boolean> {
-  for (let i = 0; i < 16; i++) {
-    await delay(300, 450)
-
-    // 先定位弹窗容器：文案含"发送简历"且可见
-    const dialogs = Array.from(
-      document.querySelectorAll('div,section'),
-    ) as HTMLElement[]
-    const dialog = dialogs.find((d) => {
-      const t = (d.textContent || '').replace(/\s/g, '')
-      if (!/确定向Boss发送简历|该附件简历将直接发送/.test(t)) return false
-      // 只要最内层那个容器，避免命中整个 body
-      if (t.length > 200) return false
-      const r = d.getBoundingClientRect()
-      return r.width > 0 && r.height > 0
-    })
-    if (!dialog) continue
-
-    // 在弹窗内找「确定」，排除「取消」
-    const btns = Array.from(dialog.querySelectorAll('div,span,button,a')) as HTMLElement[]
-    const ok = btns.find((el) => {
-      const t = text(el).replace(/\s/g, '')
-      if (!/^(确定|确认|发送)$/.test(t)) return false
-      const r = el.getBoundingClientRect()
-      return r.width > 0 && r.height > 0
-    })
-    if (ok) {
-      ok.click()
-      await delay(900, 1500)
-      diag('CHAT', '已点击简历确认弹窗「确定」')
-      return true
-    }
-  }
-  return false
+  const cfg = loadConfig()
+  const targetName =
+    cfg.defaultSendResumeId && cfg.resumeNames
+      ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
+      : null
+  return completeResumeSend(targetName)
 }
 
 /**

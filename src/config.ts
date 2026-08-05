@@ -31,6 +31,8 @@ const DEFAULT_CONFIG: PluginConfig = {
   maxRepliesPerRound: 10,
   cleanReadConversations: true,
   cleanReadAfterHours: 16,
+  defaultSendResumeId: null,
+  resumeNames: {},
 }
 
 export function loadConfig(): PluginConfig {
@@ -79,6 +81,9 @@ export function applyPluginPreferences(
   }
   if (typeof prefs.clean_read_after_hours === 'number' && prefs.clean_read_after_hours > 0) {
     next.cleanReadAfterHours = Math.min(24 * 30, Math.max(1, Math.round(prefs.clean_read_after_hours)))
+  }
+  if (typeof prefs.default_send_resume_id === 'number' && prefs.default_send_resume_id > 0) {
+    next.defaultSendResumeId = prefs.default_send_resume_id
   }
   return next
 }

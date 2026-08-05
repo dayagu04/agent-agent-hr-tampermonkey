@@ -98,6 +98,10 @@ export interface PluginConfig {
    */
   cleanReadConversations: boolean
   cleanReadAfterHours: number
+  /** 默认发送的简历 ID（网页端可设置；null=用 BOSS 弹窗默认第一份） */
+  defaultSendResumeId: number | null
+  /** 简历 id → 名称（从 /api/plugin/config 同步，简历选择弹窗里按名字匹配） */
+  resumeNames: Record<string, string>
 }
 
 /** 面板 Tab 键 */

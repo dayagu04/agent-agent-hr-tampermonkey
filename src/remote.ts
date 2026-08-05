@@ -97,7 +97,8 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
         next.replyScope !== cfg.replyScope ||
         next.maxRepliesPerRound !== cfg.maxRepliesPerRound ||
         next.cleanReadConversations !== cfg.cleanReadConversations ||
-        next.cleanReadAfterHours !== cfg.cleanReadAfterHours
+        next.cleanReadAfterHours !== cfg.cleanReadAfterHours ||
+        next.defaultSendResumeId !== cfg.defaultSendResumeId
       ) {
         saveConfig(next)
       }

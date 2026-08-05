@@ -833,8 +833,15 @@ async function loadRemoteConfig(silent = false) {
   try {
     const data = await fetchPluginConfig(config)
     resumes.value = data.resumes
+    // 简历 id → 名称缓存：会话里发简历时，BOSS 选择弹窗按名称匹配默认简历
+    config.resumeNames = Object.fromEntries(data.resumes.map((r) => [String(r.id), r.name]))
     if (!config.resumeId && data.resumes.length > 0) {
       config.resumeId = data.resumes[0].id
+    }
+    // 默认发送简历：优先网页端设置（plugin_preferences 随后合并覆盖）；
+    // 未设置时跟随投递用的简历，保证「投哪份就发哪份」的一致性
+    if (!config.defaultSendResumeId && config.resumeId) {
+      config.defaultSendResumeId = config.resumeId
     }
     if (config.threshold === 60) config.threshold = data.default_threshold
     // 同步网站侧的求职偏好（唯一真相源），避免插件与网站各配一套
