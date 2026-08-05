@@ -32,6 +32,7 @@ import { dumpStructure, findEditable, findByText, findChatPanel } from './dompro
 import { getOrchestrator, resumeOrchestrator } from './orchestrator'
 import { storage } from './platform-bridge'
 import { collectAndLogDom } from './dom-collector'
+import { startDebugCapture } from './debug'
 import { applyFilterOption, captureCurrentFilterQuery, readFilterOptions } from './search-filter'
 import { VERSION_LABEL } from './version'
 
@@ -199,6 +200,17 @@ const domCopyMsg = ref('')
 function collectPageDom() {
   domLines.value = collectAndLogDom()
   diag('DOM', `已采集当前页结构，共 ${domLines.value.length} 行（详见 DOM 采集区）`)
+}
+
+/** 手动调试：采集当前 DOM + 30s 内操作记录（DBG 标签进日志，供开发者适配） */
+const debugCapturing = ref(false)
+function startDebug() {
+  if (debugCapturing.value) return
+  debugCapturing.value = true
+  startDebugCapture()
+  window.setTimeout(() => {
+    debugCapturing.value = false
+  }, 31000)
 }
 
 function copyDom() {
@@ -1630,6 +1642,9 @@ watch(activeTab, (tab) => {
               <span>
                 <button class="aah-link-btn" @click="collectPageDom">采集当前页</button>
                 <button class="aah-link-btn" @click="dumpDom">聊天页结构</button>
+                <button class="aah-link-btn" :disabled="debugCapturing" @click="startDebug">
+                  {{ debugCapturing ? '调试采集中(30s)' : '开始调试' }}
+                </button>
                 <button class="aah-link-btn" @click="copyDom">{{ domCopyMsg || '复制' }}</button>
                 <button class="aah-link-btn" @click="wipeDom">清空</button>
               </span>

@@ -166,6 +166,12 @@ async function executeCommand(
         // 网页端改了核心配置(单轮投递上限/阈值等):通知面板静默重拉配置,实时生效
         window.dispatchEvent(new CustomEvent('aah:config-reload'))
         break
+      case 'debug.start': {
+        // 手动调试：采集当前页 DOM + 30s 内操作记录（DBG 标签进日志）
+        const { startDebugCapture } = await import('./debug')
+        startDebugCapture()
+        break
+      }
       default:
         console.warn('[remote] 未知命令', cmd.action)
     }
