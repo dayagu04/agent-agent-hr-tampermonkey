@@ -7,6 +7,7 @@ import type { ApplyOutcome, ApplyRule, JobCard, PluginConfig, ApplyProgress } fr
 import {
   fetchGreeting,
   fetchRules,
+  judgeJobs,
   logDecision,
   matchJobs,
   recordApplication,
@@ -187,6 +188,21 @@ export class ApplyEngine {
         log('已关闭匹配度计算：跳过后端匹配，规则过滤通过后全部投递')
       }
 
+      // LLM 低质量岗位判定：外包/批量招聘等（公司维度缓存，命中不重复判）
+      const blockedReasonMap = new Map(
+        results.filter((r) => r.blocked_reason).map((r) => [r.platform_job_id, r.blocked_reason as string]),
+      )
+      const lowQualityMap = new Map<string, string>()
+      if (this.config.qualityJudge) {
+        const verdicts = await judgeJobs(this.config, jobs)
+        for (const v of verdicts) {
+          if (v.verdict === 'low_quality') lowQualityMap.set(v.company, v.reason || '')
+        }
+        if (lowQualityMap.size) {
+          log(`低质量公司拦截 ${lowQualityMap.size} 家：${Array.from(lowQualityMap.keys()).join('、')}`)
+        }
+      }
+
       // 3. 筛选推荐岗位（规则过滤 + 匹配阈值），跳过原因上报后端决策日志
       const recommended: Array<{ job: JobCard; score: number }> = []
       let ruleBlocked = 0
@@ -213,6 +229,40 @@ export class ApplyEngine {
             reason: `命中规则 ${hitRule.rule_type}=${hitRule.value}`,
             match_score: r?.score,
             details: { title: job.title, company: job.company, rule_id: hitRule.id },
+          })
+          continue
+        }
+
+        // 公司投递频率：该公司近期已达投递上限（后端 match 结果标记）
+        const blockedReason = blockedReasonMap.get(job.platformJobId)
+        if (blockedReason === 'company_apply_limit') {
+          progress.skipped++
+          this.platform.markCard(job, '#d1d5db')
+          void logDecision(this.config, {
+            run_id: this.runId,
+            platform: this.platform.code,
+            platform_job_id: job.platformJobId,
+            decision: 'blocked_company_apply_limit',
+            reason: '该公司近期投递已达上限（防重复投递）',
+            match_score: r?.score,
+            details: { title: job.title, company: job.company },
+          })
+          continue
+        }
+
+        // LLM 判定低质量公司（外包/批量招聘话术等）
+        const lqReason = lowQualityMap.get(job.company)
+        if (lqReason !== undefined) {
+          progress.skipped++
+          this.platform.markCard(job, '#ef4444')
+          void logDecision(this.config, {
+            run_id: this.runId,
+            platform: this.platform.code,
+            platform_job_id: job.platformJobId,
+            decision: 'rejected_low_quality_company',
+            reason: `LLM 判定低质量：${lqReason || '外包/批量招聘'}`,
+            match_score: r?.score,
+            details: { title: job.title, company: job.company },
           })
           continue
         }

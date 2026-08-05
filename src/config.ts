@@ -33,6 +33,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   cleanReadAfterHours: 16,
   defaultSendResumeId: null,
   resumeNames: {},
+  qualityJudge: true,
 }
 
 export function loadConfig(): PluginConfig {

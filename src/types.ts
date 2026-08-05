@@ -22,6 +22,8 @@ export interface MatchResultItem {
   score: number
   recommend: boolean
   reason: string
+  /** company_apply_limit=该公司近期投递已达上限 */
+  blocked_reason?: string
 }
 
 /** 投递过滤规则（来自后端 /api/plugin/rules，与 Web Agent 同源） */
@@ -102,6 +104,8 @@ export interface PluginConfig {
   defaultSendResumeId: number | null
   /** 简历 id → 名称（从 /api/plugin/config 同步，简历选择弹窗里按名字匹配） */
   resumeNames: Record<string, string>
+  /** 是否启用 LLM 低质量岗位判定（外包/批量招聘等，默认开启） */
+  qualityJudge: boolean
 }
 
 /** 面板 Tab 键 */

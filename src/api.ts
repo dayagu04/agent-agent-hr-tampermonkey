@@ -256,6 +256,41 @@ export async function syncChatOne(
   }
 }
 
+/** POST /api/plugin/judge-jobs — LLM 判断岗位是否低质量（外包/批量招聘） */
+export interface QualityVerdict {
+  company: string
+  title: string
+  verdict: 'low_quality' | 'ok' | 'unknown' | 'pending'
+  reason: string
+  cached: boolean
+}
+
+export async function judgeJobs(
+  cfg: PluginConfig,
+  jobs: JobCard[],
+): Promise<QualityVerdict[]> {
+  try {
+    const resp = await network.request({
+      method: 'POST',
+      url: `${cfg.apiBase}/api/plugin/judge-jobs`,
+      headers: authHeaders(cfg),
+      data: JSON.stringify({
+        jobs: jobs.map((j) => ({
+          company: j.company || '',
+          title: j.title,
+          description: j.description || '',
+          salary: j.salary || '',
+        })),
+      }),
+      timeout: 120000,
+    })
+    if (resp.status !== 200) return []
+    return JSON.parse(resp.responseText).results || []
+  } catch {
+    return []
+  }
+}
+
 /**
  * GET /api/conversations/list — 拉最近会话，转成面板卡片用的 HR 消息摘要。
  *
