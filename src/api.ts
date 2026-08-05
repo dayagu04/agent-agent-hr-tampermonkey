@@ -235,6 +235,7 @@ export async function syncChatOne(
   send_resume: boolean
   action_id: number | null
   message: string
+  delete_after_send?: boolean
 } | null> {
   try {
     const resp = await network.request({

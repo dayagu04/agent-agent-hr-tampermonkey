@@ -90,7 +90,7 @@ const delay = (min: number, max: number) =>
  */
 function logChatHistory(
   t: ChatThread,
-  messages: Array<{ sender: 'hr' | 'me'; content: string }>,
+  messages: Array<{ sender: 'hr' | 'me' | 'system'; content: string }>,
 ): void {
   const company = t.company || '未知公司'
   const jobTitle = t.jobTitle || '未知岗位'
@@ -98,7 +98,7 @@ function logChatHistory(
   diag('HIST', `会话历史 ${company} | ${jobTitle} | 共 ${messages.length} 条 | 最后消息 ${timeText || '未知时间'}`)
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i]
-    const who = m.sender === 'hr' ? 'HR' : '我'
+    const who = m.sender === 'hr' ? 'HR' : m.sender === 'system' ? '系统' : '我'
     const content = (m.content || '').replace(/\s+/g, ' ').trim().slice(0, 500)
     if (content) diag('HIST', `  #${i + 1} [${who}] ${content}`)
   }
@@ -623,7 +623,10 @@ export function openThread(company: string, jobTitle = ''): 'ok' | 'not-found' |
 }
 
 /** 读当前打开会话的消息（区分 hr / me）。会先滚动到底部确保全部加载。 */
-async function readMessages(): Promise<Array<{ sender: 'hr' | 'me'; content: string }>> {
+/** BOSS 系统通知文本模式（不是 HR 说话，不能当 HR 消息回复/统计） */
+const SYSTEM_MSG_RE = /对方已(查看|同意|接受|拒绝)|附件简历已(发送|送达)|撤回了一条消息|已交换联系方式|职位(已下线|已关闭)|系统消息/
+
+async function readMessages(): Promise<Array<{ sender: 'hr' | 'me' | 'system'; content: string }>> {
   // 滚到消息区底部，确保读到最后一条。findChatPanel() 返回的容器不一定是
   // 可滚动节点，需从消息节点往上找真正可滚动的祖先。
   const panel = findChatPanel()
@@ -640,7 +643,7 @@ async function readMessages(): Promise<Array<{ sender: 'hr' | 'me'; content: str
     }
   }
 
-  const out: Array<{ sender: 'hr' | 'me'; content: string }> = []
+  const out: Array<{ sender: 'hr' | 'me' | 'system'; content: string }> = []
   const dbg: string[] = []
   if (!panel) return out
   const pr = panel.getBoundingClientRect()
@@ -665,7 +668,9 @@ async function readMessages(): Promise<Array<{ sender: 'hr' | 'me'; content: str
     else if (hasStatus) isMe = true
     else if (hasAvatar) isMe = false
     else isMe = r.left > mid
-    out.push({ sender: isMe ? 'me' : 'hr', content })
+    // 系统通知（对方已查看简历/同意发送/撤回消息等）单独归类，不做 HR 处理
+    const sender = isMe ? 'me' : SYSTEM_MSG_RE.test(content) ? 'system' : 'hr'
+    out.push({ sender, content })
     dbg.push(`${isMe ? 'ME' : 'HR'}|cls=${cls.slice(0, 24)}|st=${hasStatus ? 1 : 0}|av=${hasAvatar ? 1 : 0}|x=${Math.round(r.left)}`)
   }
   if (dbg.length) diag("CHAT", "消息判定 mid=" + Math.round(mid), dbg.slice(0, 8))
@@ -1691,11 +1696,15 @@ async function runChatRoundInner(
       platform_job_id: '',
       company,
       job_title: jobTitle,
-      messages: messages.map((m) => ({
-        sender: m.sender === 'hr' ? 'hr' : 'me',
-        content: m.content,
-        timestamp: '',
-      })),
+      // 系统通知（对方已查看简历/撤回消息等）不进后端：不是对话内容，
+      // 混进去会污染意图分类与「最后一条 HR 消息」判定。
+      messages: messages
+        .filter((m) => m.sender !== 'system')
+        .map((m) => ({
+          sender: m.sender === 'hr' ? 'hr' : 'me',
+          content: m.content,
+          timestamp: '',
+        })),
       auto_reply: true,
       // 透传用户设置的最低回复匹配分；0 或未设置时后端不过滤
       min_reply_score: cfg.minReplyScore || 0,
@@ -1740,6 +1749,16 @@ async function runChatRoundInner(
         }
       } else if (res.action_id) {
         await markChatSent(cfg, res.action_id, true, '')
+      }
+      // 明确被拒：后端已换成「拿信息」话术并标记 delete_after_send。
+      // 发完删除该会话：BOSS 若回复仍能收到消息，不回复则删除无损失。
+      if (res.delete_after_send) {
+        log(`  [${company || t.company}] 被拒，已发反馈询问，删除会话`)
+        if (await deleteCurrentThread()) {
+          cleaned++
+        } else {
+          log('  ↳ 会话删除未确认（BOSS 端可能已无此会话）')
+        }
       }
     } else {
       log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
