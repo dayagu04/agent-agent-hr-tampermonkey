@@ -1477,6 +1477,88 @@ function threadKey(t: ChatThread): string {
   return fallback
 }
 
+// ============ 零滚动数据源（方案 C）：virtual-list.dataSources = 完整会话列表 ============
+//
+// 探测结论（2026-08-06 tag=STORE）：BOSS 聊天页的虚拟列表组件（vue-virtual-scroll-list，
+// 组件名 virtual-list）的 $props.dataSources 保存全部会话对象（67 条），每项自带
+// encryptJobId / unreadCount / lastText / lastTS / brandName / positionName 等字段。
+// 因此可以：一次内存读取枚举全部会话（不滚动）；需要处理的会话用 scrollToIndex 直达，
+// 只渲染/只打开目标行。组件名或字段变动时 readChatSources() 返回 null，自动回落滚动方案。
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyVm = any
+
+/** 从任意会话行向上找 virtual-list 组件实例。 */
+function findVirtualListVm(): AnyVm | null {
+  const row = document.querySelector<HTMLElement>(SEL.thread.join(','))
+  if (!row) return null
+  let vm: AnyVm = (row as AnyVm).__vue__
+  for (let i = 0; i < 12 && vm; i++) {
+    const name = vm.$options?.name || vm.$options?._componentTag || ''
+    if (name === 'virtual-list') return vm
+    vm = vm.$parent
+  }
+  return null
+}
+
+interface ChatSourceItem {
+  boss: AnyVm
+  index: number
+}
+
+/** 读取完整会话列表（零滚动）。拿不到（组件改名/未在聊天页）返回 null。 */
+function readChatSources(): ChatSourceItem[] | null {
+  const vl = findVirtualListVm()
+  const sources = vl?.$props?.dataSources
+  if (!Array.isArray(sources) || sources.length === 0) return null
+  return sources.map((boss: AnyVm, index: number) => ({ boss, index }))
+}
+
+/** 让虚拟列表渲染到指定下标（优先原生 scrollToIndex，退化为 scrollToOffset / 容器滚动）。 */
+async function scrollToSourceIndex(vl: AnyVm, index: number): Promise<void> {
+  if (typeof vl.scrollToIndex === 'function') {
+    vl.scrollToIndex(index)
+    await delay(250, 400)
+    return
+  }
+  const estimate = Number(vl.$props?.estimateSize) || 100
+  if (typeof vl.scrollToOffset === 'function') {
+    vl.scrollToOffset(index * estimate)
+    await delay(250, 400)
+    return
+  }
+  const container = findThreadScrollContainer()
+  if (container) {
+    container.scrollTop = index * estimate
+    await delay(250, 400)
+  }
+}
+
+/** 渲染目标行并点击切换，返回该行（失败返回 null）。 */
+async function openThreadByIndex(index: number): Promise<ChatThread | null> {
+  const vl = findVirtualListVm()
+  if (!vl) return null
+  await scrollToSourceIndex(vl, index)
+  const threads = listThreadsQuiet()
+  let hit = threads.find(
+    (t) => (t.el as AnyVm).__vue__?.$props?.index === index,
+  )
+  if (!hit) {
+    hit = threads.find(
+      (t) => (t.el as AnyVm).__vue__?.$parent?.$props?.index === index,
+    )
+  }
+  if (!hit) return null
+  try {
+    if (!switchThreadViaVue(hit.el)) realClick(hit.el)
+    await delay(250, 450)
+    return hit
+  } catch (e) {
+    diag('CHAT', `索引切换异常 idx=${index}: ${(e as Error).message}`)
+    return null
+  }
+}
+
 /**
  * 滚动会话列表并回调新出现的会话（增量遍历）。
  *
@@ -1715,6 +1797,7 @@ async function maybeCleanupThread(
   t: ChatThread,
   log: (m: string) => void,
   dbLastMessageAt: number | null,
+  opened = false,
 ): Promise<number> {
   const hours = Math.max(1, cfg.cleanReadAfterHours || 16)
   const agedMs = hours * 3600 * 1000
@@ -1730,9 +1813,11 @@ async function maybeCleanupThread(
   }
   if (!aged) return 0
 
-  const opened = await openThread(t.company, t.jobTitle)
-  await delay(250, 450)
-  if (opened !== 'ok') return 0
+  if (!opened) {
+    const ok = await openThread(t.company, t.jobTitle)
+    await delay(250, 450)
+    if (ok !== 'ok') return 0
+  }
   const messages = await readMessages()
   // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
   logChatHistory(t, messages)
@@ -1773,6 +1858,18 @@ async function processReplyThread(
     diag('CHAT', `跳过会话：无法打开 ${t.company}（${opened}）`)
     return { synced: 0, replied: 0, resumesSent: 0, cleaned: 0 }
   }
+  return processOpenedThread(cfg, t, seq, log, opts, replyScope)
+}
+
+/** 会话已打开后的完整回复流程（滚动方案与零滚动方案共用，避免重复 open）。 */
+async function processOpenedThread(
+  cfg: PluginConfig,
+  t: ChatThread,
+  seq: number,
+  log: (m: string) => void,
+  opts: { runId?: string },
+  replyScope: 'this_round' | 'all',
+): Promise<{ synced: number; replied: number; resumesSent: number; cleaned: number }> {
   // 目标会话指纹：必须在切换完成后捕获，作为发送前「仍是同一会话」的校验基准。
   // 历史 bug：在 openThread 之前捕获，expectThread 恒为上一会话，切到目标后
   // 必然失配 → 所有回复「未发送（会话已切换或发送失败）」（2026-08-05 现场）。
@@ -1955,10 +2052,54 @@ async function runChatRoundInner(
 
   log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup}，回复预算 ${maxThreads}）...`)
   let synced = 0
+  let storeMode = false
 
-  // 2) 单遍滚动：行 → 键 → 查计划。只打开「计划命中 reply / 计划命中 cleanup /
-  //    未读兜底」的行；其余行跳过（不打开、不等待），一轮从分钟级降到秒级。
-  await forEachThreadScrolling(log, async (t, seq) => {
+  // 2a) 零滚动快路径（方案 C）：virtual-list.dataSources 一次拿到全部会话，
+  //     只对目标行 scrollToIndex 渲染并打开，不滚动整张列表。
+  const sources = readChatSources()
+  if (sources && sources.length > 0) {
+    storeMode = true
+    diag('CHAT', `零滚动数据源命中：${sources.length} 条（virtual-list.dataSources）`)
+    for (const item of sources) {
+      if (synced >= maxThreads) break
+      if (shouldAbortChatRound()) break
+      handled++
+      const boss = item.boss
+      const key = chatRowKey({
+        encryptJobId: boss.encryptJobId || '',
+        company: boss.brandName || boss.company || '',
+        jobTitle: boss.positionName || boss.title || '',
+      })
+      const target = byKey.get(key)
+      const unread = Number(boss.unreadCount || 0) > 0
+      if (!target && !unread) {
+        skipped++
+        continue
+      }
+      const t = await openThreadByIndex(item.index)
+      if (!t) {
+        diag('CHAT', `索引跳转失败 idx=${item.index} ${boss.brandName || boss.name}`)
+        continue
+      }
+      if (target?.action === 'cleanup' && !unread) {
+        if (!cfg.cleanReadConversations) {
+          skipped++
+          continue
+        }
+        cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at, true)
+        continue
+      }
+      const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
+      synced += r.synced
+      replied += r.replied
+      resumesSent += r.resumesSent
+      cleaned += r.cleaned
+    }
+  }
+
+  // 2b) 滚动兜底：零滚动数据源不可用（组件改名/字段变动）时，单遍滚动照旧，
+  //     行 → 键 → 查计划，只打开目标行。
+  if (!storeMode) await forEachThreadScrolling(log, async (t, seq) => {
     if (synced >= maxThreads) return 'stop'   // 预算用完，提前结束
     if (shouldAbortChatRound()) return 'stop'
     handled++
@@ -1984,7 +2125,7 @@ async function runChatRoundInner(
         skipped++
         return 'ok'
       }
-      cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at)
+      cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at, false)
       return 'ok'
     }
 
@@ -1997,8 +2138,8 @@ async function runChatRoundInner(
     return 'ok'
   })
 
-  log(`单遍处理完成：扫描 ${handled} 个会话（跳过 ${skipped}），同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次，清理 ${cleaned}`)
-  diag('CHAT', `单遍处理完成 handled=${handled} skipped=${skipped} synced=${synced} replied=${replied} resumes_sent=${resumesSent} cleaned=${cleaned}`)
+  log(`单遍处理完成${storeMode ? '（零滚动）' : ''}：扫描 ${handled} 个会话（跳过 ${skipped}），同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次，清理 ${cleaned}`)
+  diag('CHAT', `单遍处理完成 mode=${storeMode ? 'store' : 'scroll'} handled=${handled} skipped=${skipped} synced=${synced} replied=${replied} resumes_sent=${resumesSent} cleaned=${cleaned}`)
 
   return { handled, replied, resumes_sent: resumesSent, synced, cleaned }
 }
