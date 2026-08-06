@@ -33,6 +33,44 @@ export function chatRowKey(info: {
   return `text:${(info.company || '').replace(/\s+/g, '')}|${(info.jobTitle || '').replace(/\s+/g, '')}`
 }
 
+/** 标准化文本：去空白 + 小写（与 openThread 同容忍度）。 */
+const norm = (s: string) => (s || '').replace(/\s+/g, '').toLowerCase()
+
+/**
+ * 在计划目标里匹配一个会话行。
+ *
+ * 优先级：encryptJobId 精确 → 公司+岗位双向子串。inbound 会话（HR 主动建档）的
+ * platform_job_id 是后端虚构的 `inbound:公司:岗位`，与 BOSS 真实 jobId 永远对不上，
+ * 必须靠公司/岗位模糊匹配兜底（2026-08-06 现场：45 个 reply 目标 0 个被打开）。
+ *
+ * @param lenient 宽松模式（reply）：允许「仅公司命中」；严格模式（cleanup）要求
+ *                岗位也命中，避免同公司多岗位时删错会话。
+ */
+export function findPlanTarget(
+  targets: ChatPlanTarget[],
+  row: { encryptJobId?: string; company?: string; jobTitle?: string },
+  opts: { lenient: boolean },
+): ChatPlanTarget | null {
+  const jobId = (row.encryptJobId || '').trim()
+  if (jobId) {
+    const hit = targets.find((t) => t.encrypt_job_id && t.encrypt_job_id.trim() === jobId)
+    if (hit) return hit
+  }
+  const cc = norm(row.company || '')
+  const cj = norm(row.jobTitle || '')
+  if (!cc) return null
+  for (const t of targets) {
+    const tc = norm(t.company || '')
+    if (!tc) continue
+    if (!(cc.includes(tc) || tc.includes(cc))) continue
+    const tj = norm(t.job_title || '')
+    if (opts.lenient && !tj) return t
+    if (!tj) continue
+    if (cj && (cj.includes(tj) || tj.includes(cj))) return t
+  }
+  return null
+}
+
 /**
  * 拉取本轮会话处理计划。
  * 失败时返回空计划并打日志：插件降级为「只处理未读行」，绝不回退到逐个打开全部会话
@@ -41,12 +79,7 @@ export function chatRowKey(info: {
 export async function loadChatPlan(
   cfg: PluginConfig,
   opts: { replyScope: 'this_round' | 'all' },
-): Promise<{ pending: number; byKey: Map<string, ChatPlanTarget> }> {
+): Promise<{ pending: number; targets: ChatPlanTarget[] }> {
   const plan = await fetchChatPlan(cfg, { reply_scope: opts.replyScope })
-  const byKey = new Map<string, ChatPlanTarget>()
-  for (const t of plan.targets || []) {
-    const key = chatTargetKey(t)
-    if (key && key !== 'text:|') byKey.set(key, t)
-  }
-  return { pending: plan.pending || 0, byKey }
+  return { pending: plan.pending || 0, targets: plan.targets || [] }
 }
