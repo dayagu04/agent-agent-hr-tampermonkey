@@ -33,6 +33,7 @@ import { getOrchestrator, resumeOrchestrator } from './orchestrator'
 import { storage } from './platform-bridge'
 import { collectAndLogDom } from './dom-collector'
 import { startDebugCapture } from './debug'
+import { probeChatStore } from './chat-store-probe'
 import { VERSION_LABEL } from './version'
 
 const platform = detectPlatform()
@@ -238,6 +239,16 @@ function copyDom() {
 
 function wipeDom() {
   domLines.value = []
+}
+
+/** 方案 C 探测：读 BOSS 聊天页内存里的完整会话列表数据结构（零滚动可行性验证） */
+function probeChatStoreData() {
+  try {
+    domCopyMsg.value = probeChatStore()
+  } catch (e) {
+    domCopyMsg.value = `探测失败：${(e as Error).message}`
+  }
+  setTimeout(() => (domCopyMsg.value = ''), 8000)
 }
 
 /**
@@ -1375,6 +1386,7 @@ watch(activeTab, (tab) => {
               <span>
                 <button class="aah-link-btn" @click="collectPageDom">采集当前页</button>
                 <button class="aah-link-btn" @click="dumpDom">聊天页结构</button>
+                <button class="aah-link-btn" @click="probeChatStoreData">探测会话数据源</button>
                 <button class="aah-link-btn" :disabled="debugCapturing" @click="startDebug">
                   {{ debugCapturing ? '调试采集中(30s)' : '开始调试' }}
                 </button>
@@ -1385,6 +1397,10 @@ watch(activeTab, (tab) => {
             <p class="aah-hint">
               去目标页面（岗位搜索页 / 聊天页）点「采集当前页」，把下方内容复制回传给开发者，
               用于基于真实 DOM 开发（如岗位翻页）。「聊天页结构」输出在行为记录里。
+            </p>
+            <p class="aah-hint">
+              「探测会话数据源」：在 BOSS 聊天页列表加载完成后点一下，自动把页面内存里的
+              会话列表结构（store/组件树/字段名）写入日志（tag=STORE），用于实现零滚动读会话。
             </p>
             <div class="aah-logs aah-diag aah-dom-view">
               <div v-if="!domLines.length" class="aah-log-line">
