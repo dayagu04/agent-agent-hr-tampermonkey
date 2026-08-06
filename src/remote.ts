@@ -13,6 +13,7 @@ import { startDebugCapture } from './debug'
 import {
   getCurrentJob, getOrchestrator, getOrchestratorSnapshot, resumeOrchestrator,
 } from './orchestrator'
+import { runChatAudit } from './platforms/boss-chat'
 import { detectPlatform } from './platforms/factory'
 
 /** 当前页面平台代号（用于心跳上报） */
@@ -187,6 +188,13 @@ async function executeCommand(
       case 'orchestrator.action':
         // 后端 LangGraph 下发的执行指令（apply_batch / chat_snapshot / chat_reply / stop / pause）
         await orch.applyBackendAction((cmd.payload || {}) as Record<string, unknown>)
+        break
+      case 'chat.audit':
+        // 只读会话审计（测试阶段人工核对）：采集分类消息，不回复不删除
+        await runChatAudit(cfg, (m) => diag('AUDIT', m), {
+          runId: typeof cmd.payload?.run_id === 'string' ? cmd.payload.run_id : '',
+          replyScope: cmd.payload?.reply_scope === 'this_round' ? 'this_round' : 'all',
+        })
         break
       case 'config.reload':
         // 网页端改了核心配置(单轮投递上限/阈值等):通知面板静默重拉配置,实时生效

@@ -15,6 +15,7 @@ import {
   openThread,
   readRowJobInfo,
   requestStopChatRound,
+  runChatAudit,
   runChatRound,
 } from './platforms/boss-chat'
 import { probeChatPage } from './platforms/boss-probe'
@@ -247,6 +248,22 @@ function probeChatStoreData() {
     domCopyMsg.value = probeChatStore()
   } catch (e) {
     domCopyMsg.value = `探测失败：${(e as Error).message}`
+  }
+  setTimeout(() => (domCopyMsg.value = ''), 8000)
+}
+
+/** 只读会话审计：采集并区分 系统/HR/我方 三类消息，不回复不删除（测试阶段核对用） */
+const auditRunning = ref(false)
+async function runChatAuditNow() {
+  if (auditRunning.value) return
+  auditRunning.value = true
+  try {
+    await runChatAudit(config, (m) => diag('AUDIT', m), {})
+    domCopyMsg.value = '审计完成，结果已上报（只读，未做任何回复/删除）'
+  } catch (e) {
+    domCopyMsg.value = `审计失败：${(e as Error).message}`
+  } finally {
+    auditRunning.value = false
   }
   setTimeout(() => (domCopyMsg.value = ''), 8000)
 }
@@ -1387,6 +1404,9 @@ watch(activeTab, (tab) => {
                 <button class="aah-link-btn" @click="collectPageDom">采集当前页</button>
                 <button class="aah-link-btn" @click="dumpDom">聊天页结构</button>
                 <button class="aah-link-btn" @click="probeChatStoreData">探测会话数据源</button>
+                <button class="aah-link-btn" :disabled="auditRunning" @click="runChatAuditNow">
+                  {{ auditRunning ? '采集中...' : '会话审计（只读）' }}
+                </button>
                 <button class="aah-link-btn" :disabled="debugCapturing" @click="startDebug">
                   {{ debugCapturing ? '调试采集中(30s)' : '开始调试' }}
                 </button>
