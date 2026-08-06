@@ -134,6 +134,41 @@ function walkAncestors(vm: Any): void {
       '?'
     const dataKeys = safeKeys(cur.$data || {})
     diag('STORE', `祖先[${depth}] ${name}：data keys=${dataKeys.join(', ') || '(空)'}`)
+    const propKeys = safeKeys(cur.$props || {})
+    diag('STORE', `祖先[${depth}] ${name}：props keys=${propKeys.join(', ') || '(空)'}`)
+    for (const k of propKeys) {
+      const v = (cur.$props || {})[k]
+      diag('STORE', `  props.${k} → ${describe(v)}`)
+      if (Array.isArray(v) && v.length >= 1) {
+        const isFriendList = looksLikeBoss(v[0])
+        diag('STORE', `  数组 props.${k}(${v.length})${isFriendList ? ' → 疑似会话列表！' : ''}`)
+        if (isFriendList) {
+          diag('STORE', `  [0] 样例: ${sampleFields(v[0])}`)
+          return
+        }
+      }
+    }
+    const computedNames = safeKeys(cur.$options?.computed || {})
+    diag('STORE', `祖先[${depth}] ${name}：computed=${computedNames.join(', ') || '(无)'}`)
+    for (const k of computedNames) {
+      try {
+        const v = cur[k]
+        if (Array.isArray(v) && v.length >= 1 && looksLikeBoss(v[0])) {
+          diag('STORE', `  computed.${k} → 会话数组(${v.length})`)
+          diag('STORE', `  [0] 样例: ${sampleFields(v[0])}`)
+          return
+        }
+      } catch {
+        /* getter 可能抛 */
+      }
+    }
+    const methods = safeKeys(cur.$options?.methods || {}).filter((m) =>
+      /select|open|click|chat|friend|switch|jump|go/i.test(m),
+    )
+    if (methods.length) diag('STORE', `祖先[${depth}] ${name}：会话相关方法=${methods.join(', ')}`)
+    if (cur.$options?.name === 'virtual-list' && cur.range) {
+      diag('STORE', `virtual-list range: ${JSON.stringify(cur.range)}`)
+    }
     for (const k of dataKeys) {
       const v = (cur.$data || {})[k]
       if (Array.isArray(v) && v.length >= 1) {
