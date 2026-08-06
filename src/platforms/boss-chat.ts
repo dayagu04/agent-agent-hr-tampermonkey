@@ -2035,9 +2035,9 @@ async function processOpenedThread(
 
   if (!res.reply) {
     log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
-    // 低质量公司：不回复但要求删除会话（delete_after_send 且无回复）
+    // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
     if (res.delete_after_send) {
-      log(`  ↳ 低质量公司：删除会话`)
+      log(`  ↳ 策略删除会话（${res.message || ''}）`)
       if (await deleteCurrentThread()) {
         cleaned++
         afterConversationDeleted(company || t.company, jobTitle, 'low_quality')
@@ -2063,10 +2063,10 @@ async function processOpenedThread(
     } else if (res.action_id) {
       await markChatSent(cfg, res.action_id, true, '')
     }
-    // 明确被拒：后端已换成「拿信息」话术并标记 delete_after_send。
-    // 发完删除该会话：BOSS 若回复仍能收到消息，不回复则删除无损失。
+    // 明确被拒：后端已换成「拿信息」话术；会话保留等原因（不再发完即删），
+    // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
     if (res.delete_after_send) {
-      log(`  [${company || t.company}] 被拒，已发反馈询问，删除会话`)
+      log(`  [${company || t.company}] 策略删除会话`)
       if (await deleteCurrentThread()) {
         cleaned++
         afterConversationDeleted(company || t.company, jobTitle, 'rejection')
