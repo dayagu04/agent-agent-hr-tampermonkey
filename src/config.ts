@@ -20,7 +20,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   chatCheckInterval: 5,
   maxPagesPerKeyword: 20,
   searchFilterQuery: '',
-  applyIntervalSeconds: 30,
+  applyIntervalSeconds: 8,
   autoPaginate: true,
   maxPages: 5,
   prefCity: '',

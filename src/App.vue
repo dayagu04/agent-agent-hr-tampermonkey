@@ -33,7 +33,6 @@ import { getOrchestrator, resumeOrchestrator } from './orchestrator'
 import { storage } from './platform-bridge'
 import { collectAndLogDom } from './dom-collector'
 import { startDebugCapture } from './debug'
-import { applyFilterOption, captureCurrentFilterQuery, readFilterOptions } from './search-filter'
 import { VERSION_LABEL } from './version'
 
 const platform = detectPlatform()
@@ -156,7 +155,7 @@ const activeTab = ref<TabKey>('apply')
 const tabs: TabItem[] = [
   { key: 'apply', label: '投递' },
   { key: 'chat', label: '会话' },
-  { key: 'settings', label: '设置' },
+  { key: 'settings', label: '连接' },
   { key: 'logs', label: '调试' },
 ]
 
@@ -636,65 +635,6 @@ function relativeTime(ts: number): string {
 
 // ---- 编排器状态（智能投递 + 自动会话托管） ----
 const orchestratorRunning = ref(false)
-const orchestratorGoal = ref<'apply_count' | 'hr_reply_count' | 'time_elapsed'>('apply_count')
-/**
- * 编排目标值。null = 跟随个人设置的「单次投递上限」。
- *
- * 优先级：用户在此处填了值 → 用它；留空 → 用 config.maxApply（网站个人设置同步来的）。
- * 早先两个数字各管一段又互不知情：设置页填 3、编排填 10，实际每批投 3 个跑 4 批，
- * 用户看不出这层关系，只觉得两个上限在打架。
- */
-const orchestratorTarget = ref<number | null>(null)
-const orchestratorKeywords = ref('C++,Python,Java')
-
-// ---- 搜索筛选（动态读取当前搜索页选项，见 search-filter.ts） ----
-const filterOptions = ref<{ jobCategory: string[]; district: string[] }>({
-  jobCategory: [],
-  district: [],
-})
-const filterMsg = ref('')
-const filterMsgError = ref(false)
-
-async function refreshFilterOptions(): Promise<void> {
-  filterMsg.value = '正在读取页面筛选选项...'
-  filterMsgError.value = false
-  const [jc, d] = await Promise.all([
-    readFilterOptions('jobCategory'),
-    readFilterOptions('district'),
-  ])
-  filterOptions.value = { jobCategory: jc, district: d }
-  filterMsg.value = `已读取：职位类型 ${jc.length} 项、区域 ${d.length} 项（需在搜索页操作）`
-}
-
-async function pickFilterOption(kind: 'jobCategory' | 'district', value: string): Promise<void> {
-  const ok = await applyFilterOption(kind, value)
-  filterMsg.value = ok
-    ? `已应用「${value}」，可点「捕获当前页筛选」让编排记住`
-    : `应用「${value}」失败，请在页面上手动选择后再捕获`
-  filterMsgError.value = !ok
-}
-
-function captureSearchFilter(): void {
-  const q = captureCurrentFilterQuery()
-  config.searchFilterQuery = q
-  persist()
-  filterMsg.value = q
-    ? `已捕获筛选参数：${q}（编排翻页/换关键词时自动带上）`
-    : '当前页面没有额外筛选参数（仅 query 或 page）'
-  filterMsgError.value = false
-}
-
-function clearSearchFilter(): void {
-  config.searchFilterQuery = ''
-  persist()
-  filterMsg.value = '已清除保存的筛选'
-  filterMsgError.value = false
-}
-
-/** 目标值的实际生效数：用户填了就用填的，否则回落到个人设置 */
-const effectiveTarget = computed(() =>
-  orchestratorTarget.value ?? (orchestratorGoal.value === 'time_elapsed' ? 60 : config.maxApply),
-)
 const orchestratorStats = reactive({
   appliedTotal: 0,
   hrRepliesTotal: 0,
@@ -760,9 +700,9 @@ const currentJob = computed(() => progress.currentJob)
 /**
  * 进度条的分母：整轮投递目标数。
  *
- * 注意与上面的 effectiveTarget 区分 —— 那个是"启动时用哪个目标值"（表单值 ??
- * config.maxApply），这个是"正在跑的这轮，分母是多少"。已跑起来后真实目标在
- * 编排器 state.goal 里，可能与表单当前显示值不同（用户改了表单但没重启）。
+ * 注意：投递策略已收归网页端，目标由编排器 state.goal 下发；
+ * 这里是"正在跑的这轮，分母是多少"。已跑起来后真实目标在编排器
+ * state.goal 里，以它为准。
  *
  * 取值分两种运行方式：
  * - 编排器在跑且目标是 apply_count → 用 state.goal.target（整轮、跨批次）。
@@ -863,22 +803,12 @@ async function loadRemoteConfig(silent = false) {
       if (typeof p.apply_limit === 'number') config.maxApply = p.apply_limit
       // 期望城市：用于会话里判断 HR 发来的工作地点卡片能否接受
       if (p.city) config.prefCity = p.city
-      // 搜索关键词同样以网站「个人设置」为准：同步后插件面板与网页端编排一致
-      // （历史故障：网页端 start 不带关键词，插件回退 'C++'，与用户偏好脱节）
-      if (p.keyword) orchestratorKeywords.value = p.keyword
       prefsSynced.value = true
     }
     // 网页端插件偏好（回复模式等）覆盖本地设置：网页端为唯一真相源
     if (data.plugin_preferences) {
       Object.assign(config, applyPluginPreferences(config, data.plugin_preferences))
       saveConfig(config)
-    }
-    // 从简历技能预填关键词（仅当用户未改过默认值时替换，改过就不覆盖）
-    if (data.suggested_keywords && data.suggested_keywords.length > 0) {
-      const DEFAULT_KW = 'C++,Python,Java'
-      if (orchestratorKeywords.value === DEFAULT_KW) {
-        orchestratorKeywords.value = data.suggested_keywords.join(',')
-      }
     }
     saveConfig(config)
   } catch (e) {
@@ -922,32 +852,6 @@ async function start() {
 
 function stop() {
   engine?.abort()
-}
-
-// ---- 编排器控制 ----
-async function startOrchestrator() {
-  if (orchestratorRunning.value) return
-  if (!ready.value) {
-    gotoSettings()
-    return
-  }
-
-  const keywords = orchestratorKeywords.value.split(/[,，]/).map((k) => k.trim()).filter(Boolean)
-  if (!keywords.length) {
-    alert('请填写搜索关键词（多个用逗号分隔）')
-    return
-  }
-
-  // 界面按「分钟」收时长，状态机内部统一按秒判断，在此处换算
-  const target =
-    orchestratorGoal.value === 'time_elapsed'
-      ? effectiveTarget.value * 60
-      : effectiveTarget.value
-
-  const orch = getOrchestrator(config)
-  await orch.start({ type: orchestratorGoal.value, target }, keywords)
-  orchestratorRunning.value = true
-  diag('APP', '编排器已启动')
 }
 
 async function stopOrchestrator() {
@@ -1211,8 +1115,8 @@ watch(activeTab, (tab) => {
             <!-- 投递/回复策略已收归网页端「我的助手」管理，插件不再提供本地输入。
                  改策略请在网页端操作，保存后点上方「从网站同步配置」生效。 -->
             <p class="aah-tip">
-              投递额度、投递节奏、回复预算、翻页上限、最低回复分、会话清理等策略
-              已收归网页端「我的助手」管理，插件只负责执行。
+              投递额度、投递间隔、投递节奏、回复预算、翻页上限、最低回复分、
+              会话清理等策略已收归网页端「我的助手」管理，插件只负责执行。
             </p>
 
             <p v-if="configError" class="aah-error">{{ configError }}</p>
@@ -1305,78 +1209,20 @@ watch(activeTab, (tab) => {
                   </div>
 
                   <div v-else class="aah-orchestrator-config">
-                    <label class="aah-field">
-                      <span>目标条件</span>
-                      <select v-model="orchestratorGoal">
-                        <option value="apply_count">投递数达到</option>
-                        <option value="hr_reply_count">收到 HR 回复数</option>
-                        <option value="time_elapsed">运行时长（分钟）</option>
-                      </select>
-                    </label>
-                    <label class="aah-field">
-                      <span>目标值</span>
-                      <div class="aah-row">
-                        <input
-                          type="number"
-                          v-model.number="orchestratorTarget"
-                          min="1"
-                          max="500"
-                          :placeholder="`跟随设置（${effectiveTarget}）`"
-                        />
-                        <span class="aah-unit">
-                          {{ orchestratorGoal === 'time_elapsed' ? '分钟' : '个' }}
-                        </span>
-                      </div>
-                      <span class="aah-hint">
-                        留空 = 用个人设置的上限（当前 {{ effectiveTarget }}{{ orchestratorGoal === 'time_elapsed' ? ' 分钟' : ' 个' }}）；填了以填的为准
-                      </span>
-                    </label>
-                    <label class="aah-field">
-                      <span>搜索关键词（多个用逗号分隔，轮换使用）</span>
-                      <input v-model="orchestratorKeywords" placeholder="C++,Python,Java" />
-                    </label>
-                    <details class="aah-advanced">
-                      <summary>搜索筛选（选项动态读取当前搜索页）</summary>
-                      <div class="aah-filter-box">
-                        <div class="aah-row" style="gap:8px;margin-bottom:8px;flex-wrap:wrap">
-                          <button class="aah-btn-secondary" style="margin:0;padding:4px 10px" @click="refreshFilterOptions">
-                            读取页面选项
-                          </button>
-                          <button class="aah-btn-secondary" style="margin:0;padding:4px 10px" @click="captureSearchFilter">
-                            捕获当前页筛选
-                          </button>
-                          <button v-if="config.searchFilterQuery" class="aah-link-btn" @click="clearSearchFilter">
-                            清除
-                          </button>
-                        </div>
-                        <p v-if="config.searchFilterQuery" class="aah-hint" style="margin-bottom:6px">
-                          已保存筛选：<code>{{ config.searchFilterQuery }}</code>
-                        </p>
-                        <template v-if="filterOptions.jobCategory.length">
-                          <span class="aah-hint">职位类型：</span>
-                          <span
-                            v-for="o in filterOptions.jobCategory"
-                            :key="'jc' + o"
-                            class="aah-filter-chip"
-                            @click="pickFilterOption('jobCategory', o)"
-                          >{{ o }}</span>
-                        </template>
-                        <template v-if="filterOptions.district.length">
-                          <span class="aah-hint">区域：</span>
-                          <span
-                            v-for="o in filterOptions.district"
-                            :key="'d' + o"
-                            class="aah-filter-chip"
-                            @click="pickFilterOption('district', o)"
-                          >{{ o }}</span>
-                        </template>
-                        <p v-if="filterMsg" :class="filterMsgError ? 'aah-error' : 'aah-hint'" style="margin-top:6px">
-                          {{ filterMsg }}
-                        </p>
-                      </div>
-                    </details>
-                    <button class="aah-btn-primary" @click="startOrchestrator">
-                      启动智能编排（目标 {{ effectiveTarget }}{{ orchestratorGoal === 'time_elapsed' ? ' 分钟' : ' 个' }}）
+                    <div class="aah-config-notice">
+                      投递策略（关键词、城市、额度、投递间隔、投递节奏、回复预算、
+                      最低回复分等）已全部收归网页端「我的助手」管理。
+                    </div>
+                    <p class="aah-tip">
+                      请打开网页端「我的助手」配置好策略后点「开始自动投递」，
+                      插件会在下次心跳时自动执行，无需在本面板配置任何参数。
+                    </p>
+                    <p class="aah-tip">
+                      编排器由网页端跨页托管：投递 ↔ 会话回复自动切换，
+                      刷新页面自动恢复；本面板只负责展示实时状态与紧急停止。
+                    </p>
+                    <button class="aah-btn-secondary" @click="gotoJobListPage">
+                      前往职位搜索列表
                     </button>
                   </div>
                 </div>

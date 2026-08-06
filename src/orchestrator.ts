@@ -276,6 +276,7 @@ export class Orchestrator {
     chatOnly = false,
     opts: {
       chatInterval?: number
+      applyIntervalSeconds?: number
       maxReplies?: number
       maxPagesPerKeyword?: number
       minReplyScore?: number
@@ -327,6 +328,11 @@ export class Orchestrator {
     if (opts.replyScope) {
       this.config.replyScope = opts.replyScope
     }
+    // 投递间隔（秒）：网页端下发的拟人节奏，立即落本地配置供 engine 读取；
+    // 网页端仍是唯一真相源，本地不提供设置入口。
+    if (opts.applyIntervalSeconds !== undefined) {
+      this.config.applyIntervalSeconds = Math.min(120, Math.max(1, Math.round(opts.applyIntervalSeconds)))
+    }
     saveConfig(this.config)
     // 启动时优先捕获当前页已生效的筛选；没有则回落到设置里保存的筛选
     this.state.filterQuery = captureSearchFilterQuery() || this.config.searchFilterQuery || ''
@@ -352,6 +358,7 @@ export class Orchestrator {
       quota_mode: quotaMode,
       reply_scope: opts.replyScope || this.config.replyScope || 'this_round',
       chat_interval: opts.chatInterval || this.config.chatCheckInterval || 5,
+      apply_interval_seconds: opts.applyIntervalSeconds ?? this.config.applyIntervalSeconds ?? 8,
       max_replies: opts.maxReplies || this.config.maxRepliesPerRound || 10,
       max_pages_per_keyword: opts.maxPagesPerKeyword || this.config.maxPagesPerKeyword || 20,
       min_reply_score: opts.minReplyScore ?? this.config.minReplyScore ?? 0,

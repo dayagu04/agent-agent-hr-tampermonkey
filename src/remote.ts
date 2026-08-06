@@ -147,6 +147,10 @@ async function executeCommand(
             typeof p.chat_interval === 'number' && p.chat_interval > 0
               ? Math.min(200, Math.max(1, Math.round(p.chat_interval)))
               : undefined,
+          applyIntervalSeconds:
+            typeof p.apply_interval_seconds === 'number' && p.apply_interval_seconds > 0
+              ? Math.min(120, Math.max(1, Math.round(p.apply_interval_seconds)))
+              : undefined,
           maxReplies:
             typeof p.max_replies === 'number' && p.max_replies > 0
               ? Math.min(50, Math.max(1, Math.round(p.max_replies)))

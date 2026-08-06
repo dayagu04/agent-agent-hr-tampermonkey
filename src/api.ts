@@ -256,6 +256,45 @@ export async function syncChatOne(
   }
 }
 
+/** GET /api/plugin/chat/plan — 后端决策层：本轮需要打开处理的会话目标清单。
+ *  插件只执行计划，不再本地猜测「哪个会话要回复/清理」。 */
+export interface ChatPlanTarget {
+  company: string
+  job_title: string
+  encrypt_job_id: string
+  action: 'reply' | 'cleanup'
+  last_message_at: number | null
+}
+
+export interface ChatPlan {
+  pending: number
+  reply_scope: string
+  targets: ChatPlanTarget[]
+}
+
+export async function fetchChatPlan(
+  cfg: PluginConfig,
+  opts: { reply_scope: 'this_round' | 'all' },
+): Promise<ChatPlan> {
+  const qs = new URLSearchParams({ reply_scope: opts.reply_scope })
+  const resp = await network.request({
+    method: 'GET',
+    url: `${cfg.apiBase}/api/plugin/chat/plan?${qs.toString()}`,
+    headers: authHeaders(cfg),
+    timeout: 20000,
+  })
+  if (resp.status !== 200) {
+    diag('API', `chat/plan 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+    return { pending: 0, reply_scope: opts.reply_scope, targets: [] }
+  }
+  const data = JSON.parse(resp.responseText) as ChatPlan
+  return {
+    pending: Number(data.pending) || 0,
+    reply_scope: data.reply_scope || opts.reply_scope,
+    targets: Array.isArray(data.targets) ? data.targets : [],
+  }
+}
+
 /** POST /api/plugin/judge-jobs — LLM 判断岗位是否低质量（外包/批量招聘） */
 export interface QualityVerdict {
   company: string
