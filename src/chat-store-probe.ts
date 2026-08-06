@@ -13,9 +13,17 @@ type Any = any
 
 const CHAT_KEY_RE = /chat|session|friend|conversation|msg|boss|list|geek/i
 
-/** 与 boss-delete 同口径：带 securityId 的对象视为「会话/BOSS 数据」。 */
+/** 会话/BOSS 数据判定：securityId（行级）或 encryptBossId/friendId/uid（列表项）任一命中。 */
 function looksLikeBoss(v: unknown): boolean {
-  return !!v && typeof v === 'object' && !Array.isArray(v) && typeof (v as Any).securityId === 'string'
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  const o = v as Any
+  return (
+    typeof o.securityId === 'string' ||
+    typeof o.encryptBossId === 'string' ||
+    typeof o.friendId === 'string' ||
+    typeof o.uid === 'string' ||
+    typeof o.uniqueId === 'string'
+  )
 }
 
 function truncate(v: unknown, n = 40): string {
@@ -55,12 +63,21 @@ function sampleFields(obj: unknown): string {
   return parts.join(' ')
 }
 
-/** 找根 Vue 实例（Vue2 挂 __vue__，Vue3 挂 __vue_app__），尽量定位 $store。 */
+/** 找根 Vue 实例：常见挂载容器 + 聊天页行组件兜底。 */
 function findRoots(): Array<{ label: string; value: Any }> {
   const out: Array<{ label: string; value: Any }> = []
-  const app = document.querySelector('#app') as Any
-  if (app?.__vue__) out.push({ label: '#app.__vue__ (Vue2)', value: app.__vue__ })
-  if (app?.__vue_app__) out.push({ label: '#app.__vue_app__ (Vue3)', value: app.__vue_app__ })
+  for (const sel of ['#app', '#root', '#main', '.app', '[class*="app-shell"]', 'body']) {
+    const app = document.querySelector(sel) as Any
+    if (!app) continue
+    if (app.__vue__) {
+      out.push({ label: `${sel}.__vue__ (Vue2)`, value: app.__vue__ })
+      break
+    }
+    if (app.__vue_app__) {
+      out.push({ label: `${sel}.__vue_app__ (Vue3)`, value: app.__vue_app__ })
+      break
+    }
+  }
   // 兜底：任意元素上的 __vue__ 实例（聊天页行组件）
   const row = document.querySelector('.geek-item, .user-list li, [class*="chat-user-item"]')
   if (row && (row as Any).__vue__) out.push({ label: 'row.__vue__', value: (row as Any).__vue__ })
@@ -97,6 +114,37 @@ function dumpStoreState(store: Any): void {
         if (Array.isArray(sv) && looksLikeBoss(sv[0])) diag('STORE', `    [0] boss 样例: ${sampleFields(sv[0])}`)
       }
     }
+  }
+  // 模块名 + chat 相关 actions/getters
+  const modules = safeKeys(store._modules?.root?._children || {})
+  diag('STORE', `store 模块: ${modules.join(', ') || '(无)'}`)
+  const actions = safeKeys(store._actions || {}).filter((k) => CHAT_KEY_RE.test(k))
+  diag('STORE', `store chat 相关 actions: ${actions.join(', ') || '(无)'}`)
+}
+
+/** 从行实例向上走 $parent 链，找「整份会话列表」所在容器（列表数组在祖先组件里）。 */
+function walkAncestors(vm: Any): void {
+  let cur: Any = vm
+  for (let depth = 0; depth < 10 && cur; depth++) {
+    const name = cur.$options?.name || cur.$options?._componentTag || cur.$.type?.name || cur.$.type?.__name || '?'
+    const dataKeys = safeKeys(cur.$data || {})
+    diag('STORE', `祖先[${depth}] ${name}：data keys=${dataKeys.join(', ') || '(空)'}`)
+    for (const k of dataKeys) {
+      const v = (cur.$data || {})[k]
+      if (Array.isArray(v) && v.length >= 1) {
+        const first = v[0]
+        const isFriendList = first && typeof first === 'object' && looksLikeBoss(first)
+        diag(
+          'STORE',
+          `  数组 ${k}(${v.length}) ${isFriendList ? '→ 疑似会话列表！' : ''} [0] keys=${safeKeys(first).join(', ')}`,
+        )
+        if (isFriendList) {
+          diag('STORE', `  [0] 样例: ${sampleFields(first)}`)
+          return
+        }
+      }
+    }
+    cur = cur.$parent || cur.$.parent
   }
 }
 
@@ -139,12 +187,26 @@ function walkComponentTree(root: Any): void {
     }
 
     if (depth < 6) {
-      const children = (vm.$children || vm.$.subTree?.component?.subTree || []).filter(Boolean)
-      for (const c of children) queue.push({
-        vm: c,
-        depth: depth + 1,
-        path: `${path} > ${c.$options?.name || c.$options?._componentTag || c.$.type?.name || '?'}`,
-      })
+      const kids: Any[] = []
+      if (Array.isArray(vm.$children)) kids.push(...vm.$children)
+      const sub = vm.$.subTree
+      if (sub) {
+        if (sub.component) kids.push(sub.component)
+        const collect = (vn: Any) => {
+          if (vn?.component) kids.push(vn.component)
+          if (Array.isArray(vn?.children)) vn.children.forEach(collect)
+          if (Array.isArray(vn?.dynamicChildren)) vn.dynamicChildren.forEach(collect)
+        }
+        collect(sub)
+      }
+      for (const c of kids) {
+        if (!c || typeof c !== 'object') continue
+        queue.push({
+          vm: c,
+          depth: depth + 1,
+          path: `${path} > ${c.$options?.name || c.$options?._componentTag || c.$.type?.name || c.$.type?.__name || '?'}`,
+        })
+      }
     }
   }
   diag('STORE', `组件树遍历 ${nodes} 个节点，未找到 boss 会话数组（需在聊天页且列表已加载）`)
@@ -199,6 +261,7 @@ export function probeChatStore(): string {
     const store = findStore(r.value)
     diag('STORE', `${r.label}：$store=${store ? '有' : '无'}`)
     if (store) dumpStoreState(store)
+    walkAncestors(r.value)
     walkComponentTree(r.value)
   }
   dumpRowBossObject()
