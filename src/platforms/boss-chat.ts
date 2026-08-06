@@ -2151,36 +2151,43 @@ async function runChatRoundInner(
   let synced = 0
   let storeMode = false
 
-  // 2a) 零滚动快路径（方案 C）：virtual-list.dataSources 一次拿到全部会话，
-  //     只对目标行 scrollToIndex 渲染并打开，不滚动整张列表。
+  // 2a) 零滚动快路径（方案 C）：virtual-list.dataSources 一次拿到全部会话。
+  //     全量打开核对：以「前端实际读到的最后一条消息 + 意图」为准决定回不回，
+  //     不复用 DB 计划做打开过滤——DB 滞后会漏掉真实待回复（HR 在我方上次同步后
+  //     又发消息）；全量打开同时把「我方已发的回复」回写 DB，让数据库自我校准。
+  //     回复预算 maxThreads 只限制实际发送条数，不限制扫描。
   const sources = readChatSources()
   if (sources && sources.length > 0) {
     storeMode = true
-    diag('CHAT', `零滚动数据源命中：${sources.length} 条（virtual-list.dataSources）`)
-    // 按计划目标逐个处理。关键：每次处理前重新读取列表再定位目标——
-    // 删除会话会让虚拟列表下标整体前移，缓存下标会点错会话（把回复发给错误的
-    // HR 不可接受）。目标匹配：encryptJobId 精确优先，inbound 会话回退公司/岗位模糊。
-    const handledKeys = new Set<string>()
-    for (const target of planTargets) {
-      if (synced >= maxThreads) break
+    diag('CHAT', `零滚动数据源命中：${sources.length} 条（全量打开核对，前端实测为准）`)
+    for (const item of sources) {
+      if (replied >= maxThreads) break   // 回复预算：限制实际发送条数
       if (shouldAbortChatRound()) break
-      const tkey = chatTargetKey(target)
-      if (handledKeys.has(tkey)) continue
+      handled++
+      // 每次处理前按会话身份（friendId/uniqueId/encryptJobId）在最新列表里重新定位：
+      // 清理删除会让虚拟列表下标前移，缓存下标会点错会话（把回复发给错误的 HR）。
       const current = readChatSources()
       if (!current) break
-      const item = current.find((s) =>
-        findPlanTarget([target], bossRowInfo(s.boss), { lenient: target.action === 'reply' }),
+      const live = current.find(
+        (s) =>
+          s.boss.uniqueId === item.boss.uniqueId ||
+          s.boss.friendId === item.boss.friendId ||
+          s.boss.encryptJobId === item.boss.encryptJobId,
       )
-      if (!item) continue // 目标已不在当前列表（可能已被删除/未加载）
-      handledKeys.add(tkey)
-      handled++
-      const unread = Number(item.boss.unreadCount || 0) > 0
-      const t = await openThreadByIndex(item.index)
+      if (!live) continue // 已被删除/未加载
+      const boss = live.boss
+      const unread = Number(boss.unreadCount || 0) > 0
+      let target = findPlanTarget(planTargets, bossRowInfo(boss), { lenient: false })
+      if (!target) {
+        const loose = findPlanTarget(planTargets, bossRowInfo(boss), { lenient: true })
+        if (loose?.action === 'reply') target = loose
+      }
+      const t = await openThreadByIndex(live.index)
       if (!t) {
-        diag('CHAT', `索引跳转失败 idx=${item.index} ${item.boss.brandName || item.boss.name}`)
+        diag('CHAT', `索引跳转失败 idx=${live.index} ${boss.brandName || boss.name}`)
         continue
       }
-      if (target.action === 'cleanup' && !unread) {
+      if (target?.action === 'cleanup' && !unread) {
         if (!cfg.cleanReadConversations) {
           skipped++
           continue
@@ -2188,22 +2195,6 @@ async function runChatRoundInner(
         cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at, true)
         continue
       }
-      const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
-      synced += r.synced
-      replied += r.replied
-      resumesSent += r.resumesSent
-      cleaned += r.cleaned
-    }
-
-    // 未读兜底：计划没覆盖的新会话（HR 刚发来、后端还没建档）
-    for (const s of readChatSources() ?? []) {
-      if (synced >= maxThreads) break
-      if (shouldAbortChatRound()) break
-      if (Number(s.boss.unreadCount || 0) <= 0) continue
-      if (findPlanTarget(planTargets, bossRowInfo(s.boss), { lenient: true })) continue
-      handled++
-      const t = await openThreadByIndex(s.index)
-      if (!t) continue
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
       synced += r.synced
       replied += r.replied
