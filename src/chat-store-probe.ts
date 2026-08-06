@@ -87,7 +87,7 @@ function findRoots(): Array<{ label: string; value: Any }> {
 /** 从组件实例找 $store（Vue2 直挂；Vue3 在 provides / _context 里）。 */
 function findStore(vm: Any): Any | null {
   if (vm?.$store) return vm.$store
-  const provides = vm?.$.provides || vm?._context?.provides || vm?.appContext?.provides
+  const provides = vm?.$?.provides || vm?._context?.provides || vm?.appContext?.provides
   if (!provides) return null
   const found = Object.values(provides).find(
     (v) => v && typeof v === 'object' && (v as Any).state && typeof (v as Any).state === 'object',
@@ -126,7 +126,12 @@ function dumpStoreState(store: Any): void {
 function walkAncestors(vm: Any): void {
   let cur: Any = vm
   for (let depth = 0; depth < 10 && cur; depth++) {
-    const name = cur.$options?.name || cur.$options?._componentTag || cur.$.type?.name || cur.$.type?.__name || '?'
+    const name =
+      cur.$options?.name ||
+      cur.$options?._componentTag ||
+      cur.$?.type?.name ||
+      cur.$?.type?.__name ||
+      '?'
     const dataKeys = safeKeys(cur.$data || {})
     diag('STORE', `祖先[${depth}] ${name}：data keys=${dataKeys.join(', ') || '(空)'}`)
     for (const k of dataKeys) {
@@ -151,7 +156,16 @@ function walkAncestors(vm: Any): void {
 /** 广度遍历组件树，找「boss 对象数组」（即整份会话列表）。 */
 function walkComponentTree(root: Any): void {
   const queue: Array<{ vm: Any; depth: number; path: string }> = [
-    { vm: root, depth: 0, path: root.$options?.name || root.$options?._componentTag || 'root' },
+    {
+      vm: root,
+      depth: 0,
+      path:
+        root.$options?.name ||
+        root.$options?._componentTag ||
+        root.$?.type?.name ||
+        root.$?.type?.__name ||
+        'root',
+    },
   ]
   const seen = new Set<Any>()
   let nodes = 0
@@ -189,7 +203,7 @@ function walkComponentTree(root: Any): void {
     if (depth < 6) {
       const kids: Any[] = []
       if (Array.isArray(vm.$children)) kids.push(...vm.$children)
-      const sub = vm.$.subTree
+      const sub = vm.$?.subTree
       if (sub) {
         if (sub.component) kids.push(sub.component)
         const collect = (vn: Any) => {
@@ -204,7 +218,13 @@ function walkComponentTree(root: Any): void {
         queue.push({
           vm: c,
           depth: depth + 1,
-          path: `${path} > ${c.$options?.name || c.$options?._componentTag || c.$.type?.name || c.$.type?.__name || '?'}`,
+          path: `${path} > ${
+            c.$options?.name ||
+            c.$options?._componentTag ||
+            c.$?.type?.name ||
+            c.$?.type?.__name ||
+            '?'
+          }`,
         })
       }
     }
@@ -255,16 +275,36 @@ function dumpRowBossObject(): void {
 /** 一键探测：根实例 → store → 组件树 → 行对象，全部写入日志并立即上传。 */
 export function probeChatStore(): string {
   diag('STORE', '==== 会话数据源探测开始（只读） ====')
-  const roots = findRoots()
-  diag('STORE', `根实例: ${roots.length ? roots.map((r) => r.label).join(' / ') : '未找到 __vue__'}`)
-  for (const r of roots) {
-    const store = findStore(r.value)
-    diag('STORE', `${r.label}：$store=${store ? '有' : '无'}`)
-    if (store) dumpStoreState(store)
-    walkAncestors(r.value)
-    walkComponentTree(r.value)
+  try {
+    const roots = findRoots()
+    diag('STORE', `根实例: ${roots.length ? roots.map((r) => r.label).join(' / ') : '未找到 __vue__'}`)
+    for (const r of roots) {
+      try {
+        const store = findStore(r.value)
+        diag('STORE', `${r.label}：$store=${store ? '有' : '无'}`)
+        if (store) dumpStoreState(store)
+      } catch (e) {
+        diag('STORE', `store 探测异常: ${(e as Error).message}`)
+      }
+      try {
+        walkAncestors(r.value)
+      } catch (e) {
+        diag('STORE', `祖先链探测异常: ${(e as Error).message}`)
+      }
+      try {
+        walkComponentTree(r.value)
+      } catch (e) {
+        diag('STORE', `组件树探测异常: ${(e as Error).message}`)
+      }
+    }
+  } catch (e) {
+    diag('STORE', `根实例探测异常: ${(e as Error).message}`)
   }
-  dumpRowBossObject()
+  try {
+    dumpRowBossObject()
+  } catch (e) {
+    diag('STORE', `行对象探测异常: ${(e as Error).message}`)
+  }
   diag('STORE', '==== 探测结束，日志已上传（tag=STORE） ====')
   void flushLogs()
   return '探测完成，结果已写入日志（tag=STORE）并上传'
