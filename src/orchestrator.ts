@@ -13,6 +13,7 @@
 import type { ApplyProgress, PluginConfig } from './types'
 import { storage, notification } from './platform-bridge'
 import { diag } from './logger'
+import { saveConfig } from './config'
 import { ApplyEngine } from './engine'
 import { detectPlatform } from './platforms/factory'
 import { onChatPage, requestStopChatRound, runChatRound } from './platforms/boss-chat'
@@ -273,6 +274,13 @@ export class Orchestrator {
     plan?: Array<{ keyword: string; city: string; cityCode: string; quota: number }>,
     quotaMode: OrchestratorState['quotaMode'] = 'legacy',
     chatOnly = false,
+    opts: {
+      chatInterval?: number
+      maxReplies?: number
+      maxPagesPerKeyword?: number
+      minReplyScore?: number
+      replyScope?: 'this_round' | 'all'
+    } = {},
   ): Promise<void> {
     if (this.running) {
       diag('ORCH', '编排器已在运行，跳过重复启动')
@@ -311,6 +319,15 @@ export class Orchestrator {
       chatOnly,
       pendingAction: null,
     }
+    // 网页端下发的回复策略参数立即落本地配置（不回写网页端，网页端仍是唯一真相源）：
+    // 会话托管用 cfg.minReplyScore / cfg.replyScope 调后端，必须与网页端一致。
+    if (opts.minReplyScore !== undefined) {
+      this.config.minReplyScore = Math.min(100, Math.max(0, Math.round(opts.minReplyScore)))
+    }
+    if (opts.replyScope) {
+      this.config.replyScope = opts.replyScope
+    }
+    saveConfig(this.config)
     // 启动时优先捕获当前页已生效的筛选；没有则回落到设置里保存的筛选
     this.state.filterQuery = captureSearchFilterQuery() || this.config.searchFilterQuery || ''
     if (this.state.filterQuery) {
@@ -326,16 +343,18 @@ export class Orchestrator {
       `执行器启动 goal=${this.state.goal.type}:${this.state.goal.target} ` +
         `组合=${normalizedPlan.length} 模式=${quotaMode}`,
     )
-    // 后端据 started 事件创建持久化 run 并产出首个指令，由下一次心跳带回
+    // 后端据 started 事件创建持久化 run 并产出首个指令，由下一次心跳带回。
+    // 投递节奏/回复预算/翻页上限等策略参数由网页端下发（opts），插件不再本地配置。
     await this.reportEvent('started', {
       goal: this.state.goal,
       keywords: this.state.keywords,
       plan: normalizedPlan,
       quota_mode: quotaMode,
-      reply_scope: this.config.replyScope || 'this_round',
-      chat_interval: this.config.chatCheckInterval || 5,
-      max_replies: this.config.maxRepliesPerRound || 10,
-      max_pages_per_keyword: this.config.maxPagesPerKeyword || 20,
+      reply_scope: opts.replyScope || this.config.replyScope || 'this_round',
+      chat_interval: opts.chatInterval || this.config.chatCheckInterval || 5,
+      max_replies: opts.maxReplies || this.config.maxRepliesPerRound || 10,
+      max_pages_per_keyword: opts.maxPagesPerKeyword || this.config.maxPagesPerKeyword || 20,
+      min_reply_score: opts.minReplyScore ?? this.config.minReplyScore ?? 0,
       city_code: this.state.cityCode || '',
       chat_only: chatOnly,
       run_id: this.state.runId,
@@ -489,7 +508,7 @@ export class Orchestrator {
       const baselineFailed = this.state.stats.failedTotal || 0
       let scannedThisPage = 0
       let scanCompleteThisPage = false
-      this.engine = new ApplyEngine(
+      const engine = new ApplyEngine(
         platform,
         // autoPaginate 强制关闭：翻页权归后端（next_action.page），
         // 否则两套页码会错位，导致重复扫描与页码统计失真。
@@ -509,11 +528,15 @@ export class Orchestrator {
         new Set(this.state!.attemptedJobIds || []),
         this.state!.runId,
       )
+      this.engine = engine
 
-      await this.engine.run()
-      // 合并本次尝试过的岗位 id（上限 1000 防存储膨胀），供同页续跑/翻页去重
+      await engine.run()
+      // 合并本次尝试过的岗位 id（上限 1000 防存储膨胀），供同页续跑/翻页去重。
+      // stop()/pause() 会 abort 并把 this.engine 置 null，这里必须用局部引用，
+      // 否则 abort 返回后会抛 "Cannot read properties of null (reading 'attemptedIds')"
+      // （2026-08-06 run mshjhqs7ee23vd3i 现场：执行指令失败 → 整轮暂停）。
       this.state.attemptedJobIds = Array.from(
-        new Set([...(this.state.attemptedJobIds || []), ...this.engine.attemptedIds]),
+        new Set([...(this.state.attemptedJobIds || []), ...(engine.attemptedIds || [])]),
       ).slice(-1000)
       this.engine = null
 

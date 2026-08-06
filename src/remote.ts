@@ -97,6 +97,7 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
       if (
         next.replyScope !== cfg.replyScope ||
         next.maxRepliesPerRound !== cfg.maxRepliesPerRound ||
+        next.minReplyScore !== cfg.minReplyScore ||
         next.cleanReadConversations !== cfg.cleanReadConversations ||
         next.cleanReadAfterHours !== cfg.cleanReadAfterHours ||
         next.defaultSendResumeId !== cfg.defaultSendResumeId
@@ -141,7 +142,27 @@ async function executeCommand(
           p.quota_mode === 'per_combination' || p.quota_mode === 'total_llm'
             ? p.quota_mode
             : undefined
-        await orch.start(goal, keywords, city, plan, quotaMode, p.chat_only === true)
+        await orch.start(goal, keywords, city, plan, quotaMode, p.chat_only === true, {
+          chatInterval:
+            typeof p.chat_interval === 'number' && p.chat_interval > 0
+              ? Math.min(200, Math.max(1, Math.round(p.chat_interval)))
+              : undefined,
+          maxReplies:
+            typeof p.max_replies === 'number' && p.max_replies > 0
+              ? Math.min(50, Math.max(1, Math.round(p.max_replies)))
+              : undefined,
+          maxPagesPerKeyword:
+            typeof p.max_pages_per_keyword === 'number' && p.max_pages_per_keyword > 0
+              ? Math.min(100, Math.max(1, Math.round(p.max_pages_per_keyword)))
+              : undefined,
+          minReplyScore:
+            typeof p.min_reply_score === 'number'
+              ? Math.min(100, Math.max(0, Math.round(p.min_reply_score)))
+              : undefined,
+          replyScope: p.reply_scope === 'this_round' || p.reply_scope === 'all'
+            ? p.reply_scope
+            : undefined,
+        })
         break
       }
       case 'orchestrator.pause':

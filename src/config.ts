@@ -77,6 +77,9 @@ export function applyPluginPreferences(
   if (typeof prefs.max_replies_per_round === 'number' && prefs.max_replies_per_round > 0) {
     next.maxRepliesPerRound = Math.min(50, Math.max(1, Math.round(prefs.max_replies_per_round)))
   }
+  if (typeof prefs.min_reply_score === 'number') {
+    next.minReplyScore = Math.min(100, Math.max(0, Math.round(prefs.min_reply_score)))
+  }
   if (typeof prefs.clean_read_conversations === 'boolean') {
     next.cleanReadConversations = prefs.clean_read_conversations
   }

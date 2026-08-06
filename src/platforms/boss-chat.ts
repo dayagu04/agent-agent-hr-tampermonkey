@@ -33,6 +33,8 @@ export interface ChatThread {
   company: string
   jobTitle: string
   unread: boolean
+  /** 列表行最后一条消息预览（.last-msg / .friend-content），用于免开预判 */
+  preview: string
 }
 
 const SEL = {
@@ -194,7 +196,12 @@ function listThreadsQuiet(): ChatThread[] {
     const jobTitle = text(el.querySelector('[class*="job"], .source-job'))
     // 未读标记：红点/数字气泡
     const unread = !!el.querySelector('.badge-count, [class*="badge"], [class*="unread"]')
-    threads.push({ el, name, company: company || name, jobTitle, unread })
+    const preview = text(
+      el.querySelector('.gray.last-msg') ||
+      el.querySelector('.last-msg') ||
+      el.querySelector('.friend-content'),
+    ).replace(/\s+/g, ' ').trim()
+    threads.push({ el, name, company: company || name, jobTitle, unread, preview })
   }
   return threads
 }
@@ -1756,6 +1763,47 @@ async function cleanupAgedReadThreads(
   return cleaned
 }
 
+
+/**
+ * 免开预判：根据会话列表行信息判断「大概率无需回复」，跳过 openThread。
+ *
+ * 背景（2026-08-06）：投递 50 个后进入会话托管，一次遍历要逐个打开 70+ 会话，
+ * 多数会话只有我方打招呼语、最后一条不是 HR，完全不需要打开。
+ * 判定基于列表行预览文本（.last-msg / .friend-content），只跳过特征明确的：
+ *   - 未读 → 必须打开（HR 有新消息）；
+ *   - 预览是我方打招呼语/我方消息特征 → 最后一条是我方，无需回复；
+ *   - 预览是系统/状态提示 → 无需回复；
+ *   - 特征不明（含预览为空）→ 保守打开，走完整读取判定。
+ */
+function likelyNoReplyRow(t: ChatThread): boolean {
+  if (t.unread) return false
+  const p = t.preview || ''
+  if (!p) return false
+
+  const SYSTEM_PATTERNS = [
+    '对方查看了你的简历',
+    '查看过你的简历',
+    '对方已查看',
+    '职位已关闭',
+    '已交换联系方式',
+    '系统通知',
+    '您已投递',
+    '已发送',
+  ]
+  if (SYSTEM_PATTERNS.some((s) => p.includes(s))) return true
+
+  const OWN_LAST_PATTERNS = [
+    '看到贵司',
+    '觉得我挺合适',
+    '是否可以聊聊',
+    '我对贵司',
+    '您好，我对贵司',
+  ]
+  if (OWN_LAST_PATTERNS.some((s) => p.includes(s))) return true
+  return false
+}
+
+
 async function runChatRoundInner(
   cfg: PluginConfig,
   maxThreads: number,
@@ -1827,12 +1875,20 @@ async function runChatRoundInner(
   log(`开始单遍处理会话（回复预算 ${maxThreads}）...`)
   diag('CHAT', `开始单遍处理，replyScope=${replyScope}`)
   let synced = 0
+  let skippedPreview = 0
 
   await forEachThreadScrolling(log, async (t, seq) => {
     if (synced >= maxThreads) return 'stop'   // 预算用完，提前结束
     if (shouldAbortChatRound()) return 'stop'
 
     handled++
+
+    // 免开预判（2026-08-06 提速）：大部分会话只有我方打招呼语、无需回复，
+    // 逐个 openThread 会把一轮 70+ 会话拖到 2-3 分钟。列表行预览可判定的直接跳过。
+    if (likelyNoReplyRow(t)) {
+      skippedPreview++
+      return 'ok'
+    }
 
     // 切换到该会话
     const opened = await openThread(t.company, t.jobTitle)
@@ -1965,8 +2021,8 @@ async function runChatRoundInner(
     return 'ok'
   })
 
-  log(`单遍处理完成：扫描 ${handled} 个会话，同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次`)
-  diag('CHAT', `单遍处理完成 handled=${handled} synced=${synced} replied=${replied} resumes_sent=${resumesSent}`)
+  log(`单遍处理完成：扫描 ${handled} 个会话（免开跳过 ${skippedPreview}），同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次`)
+  diag('CHAT', `单遍处理完成 handled=${handled} skippedPreview=${skippedPreview} synced=${synced} replied=${replied} resumes_sent=${resumesSent}`)
 
   return { handled, replied, resumes_sent: resumesSent, synced, cleaned }
 }
