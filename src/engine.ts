@@ -88,8 +88,10 @@ export class ApplyEngine {
       applied: 0,
       skipped: 0,
       failed: 0,
+      unknown: 0,
       running: true,
       logs: [],
+      blockedByQuality: [],
     }
 
     const log = (msg: string) => {
@@ -101,8 +103,23 @@ export class ApplyEngine {
     this.effectiveMaxApply = this.config.maxApply
 
     // 加载后端投递规则（黑白名单/最低薪资），与 Web Agent 同源
-    this.rules = await fetchRules(this.config)
-    if (this.rules.length) log(`已加载 ${this.rules.length} 条投递规则`)
+    const rules = await fetchRules(this.config)
+    if (rules === null) {
+      if (this.config.matchEnabled) {
+        // 后端 match 仍会做公司级拦截（黑名单/冷静期/频率/已投），只提示本地规则未生效
+        log('⚠ 投递规则拉取失败：后端匹配仍会做公司级拦截，但本地黑名单/关键词规则本轮未生效')
+        this.rules = []
+      } else {
+        // 匹配已关闭时没有后端兜底：继续跑会绕过用户黑名单，宁停勿放
+        log('⚠ 投递规则拉取失败且匹配已关闭：为避免绕过黑名单，本次已停止，请检查网络后重试')
+        progress.running = false
+        this.onProgress({ ...progress })
+        return progress
+      }
+    } else {
+      this.rules = rules
+      if (this.rules.length) log(`已加载 ${this.rules.length} 条投递规则`)
+    }
 
     // 不做服务器端配额预检：插件在用户浏览器里直接投递，独立于网页端
     // Agent 的配额/限流体系，投递节奏只由用户配置控制。
@@ -132,7 +149,10 @@ export class ApplyEngine {
       }
     }
 
-    log(`全部完成！共投递 ${progress.applied}，跳过 ${progress.skipped}，失败 ${progress.failed}`)
+    log(
+      `全部完成！共投递 ${progress.applied}，跳过 ${progress.skipped}，` +
+        `未确认 ${progress.unknown}，失败 ${progress.failed}`,
+    )
     progress.running = false
     this.onProgress({ ...progress })
     return progress
@@ -192,14 +212,25 @@ export class ApplyEngine {
       const blockedReasonMap = new Map(
         results.filter((r) => r.blocked_reason).map((r) => [r.platform_job_id, r.blocked_reason as string]),
       )
-      const lowQualityMap = new Map<string, string>()
+      // 岗位级低质量判定：只拦截被判定为 low_quality 的具体岗位，
+      // 不再「同公司任一岗低质 → 全公司拦截」（2026-08-07 与后端 judge-jobs 对齐）。
+      const qualityBlocked = new Map<string, { reason: string; confidence?: number }>()
       if (this.config.qualityJudge) {
         const verdicts = await judgeJobs(this.config, jobs)
-        for (const v of verdicts) {
-          if (v.verdict === 'low_quality') lowQualityMap.set(v.company, v.reason || '')
-        }
-        if (lowQualityMap.size) {
-          log(`低质量公司拦截 ${lowQualityMap.size} 家：${Array.from(lowQualityMap.keys()).join('、')}`)
+        if (verdicts === null) {
+          // 降级可见：不能让外包/批量招聘拦截在网络抖动时无声失效
+          log('⚠ 低质量岗位判定接口失败：本轮不拦截外包/批量招聘岗位，请检查网络')
+        } else {
+          for (const v of verdicts) {
+            if (v.verdict !== 'low_quality') continue
+            const key = v.platform_job_id
+              ? `job:${v.platform_job_id}`
+              : `co:${v.company}|${v.title}`
+            qualityBlocked.set(key, { reason: v.reason || '外包/批量招聘', confidence: v.confidence })
+          }
+          if (qualityBlocked.size) {
+            log(`质量拦截 ${qualityBlocked.size} 个岗位（岗位级判定，可复核）`)
+          }
         }
       }
 
@@ -256,17 +287,29 @@ export class ApplyEngine {
           continue
         }
 
-        // LLM 判定低质量公司（外包/批量招聘话术等）
-        const lqReason = lowQualityMap.get(job.company)
-        if (lqReason !== undefined) {
+        // LLM 判定低质量岗位（外包/批量招聘话术等；仅拦截被判定岗位）
+        const qKey = job.platformJobId
+          ? `job:${job.platformJobId}`
+          : `co:${job.company}|${job.title}`
+        const qb = qualityBlocked.get(qKey)
+        if (qb) {
           progress.skipped++
           this.platform.markCard(job, '#ef4444')
+          progress.blockedByQuality = [
+            ...(progress.blockedByQuality || []),
+            {
+              company: job.company,
+              title: job.title,
+              reason: qb.reason,
+              confidence: qb.confidence,
+            },
+          ]
           void logDecision(this.config, {
             run_id: this.runId,
             platform: this.platform.code,
             platform_job_id: job.platformJobId,
             decision: 'rejected_low_quality_company',
-            reason: `LLM 判定低质量：${lqReason || '外包/批量招聘'}`,
+            reason: `LLM 判定低质量：${qb.reason || '外包/批量招聘'}`,
             match_score: r?.score,
             details: { title: job.title, company: job.company },
           })
@@ -328,6 +371,7 @@ export class ApplyEngine {
         let outcome: ApplyOutcome = 'failed'
         let message = ''
         let greetingSent = false
+        let alreadyApplied = false
 
         try {
           // 注入招呼语获取器：BOSS 建立会话需发首条消息，复用后端主项目话术
@@ -342,6 +386,7 @@ export class ApplyEngine {
             outcome = res.outcome
             message = res.message || ''
             greetingSent = !!res.greetingSent
+            alreadyApplied = !!res.alreadyApplied
           }
         } catch (e) {
           outcome = 'failed'
@@ -355,13 +400,34 @@ export class ApplyEngine {
         progress.currentJob = null
         this.onProgress({ ...progress })
 
+        // 该岗位此前已沟通过（如 BOSS「继续沟通」态）：不是本次投递失败，
+        // 计为跳过；同时向后端补记真实投递（real_applied=True），
+        // 让后续轮次的 already_applied 拦截直接生效，不再重复点击。
+        if (alreadyApplied) {
+          progress.skipped++
+          this.platform.markCard(job, '#d1d5db') // 灰色=已投过
+          log(`  ↳ 该岗位已沟通过，跳过（不重复骚扰 HR）`)
+          try {
+            await recordApplication(
+              this.config, this.platform.code, job, score,
+              'applied', message, false, this.orchestratorRunId,
+            )
+          } catch (e) {
+            log(`  ↳ 记账失败: ${(e as Error).message}`)
+          }
+          this.onProgress({ ...progress })
+          continue
+        }
+
         // 计数与视觉标记按真实结果区分
         if (outcome === 'applied') {
           progress.applied++
           this.platform.markCard(job, '#3b82f6') // 蓝色=已投
           log(`  ↳ 成功${message ? '：' + message : ''}`)
         } else if (outcome === 'unknown') {
-          progress.applied++ // 计入尝试，但库里不记 real_applied
+          // 未确认的尝试不推进投递目标（不 applied++），也不污染失败计数；
+          // 后端记 real_applied=False，两者口径一致。
+          progress.unknown++
           this.platform.markCard(job, '#a855f7') // 紫色=待核对
           log(`  ↳ 未能确认${message ? '：' + message : ''}（请在平台核对）`)
         } else {

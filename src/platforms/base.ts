@@ -7,6 +7,11 @@ export interface ApplyResult {
   message?: string
   /** 是否已发送打招呼语（BOSS 沟通场景） */
   greetingSent?: boolean
+  /**
+   * 该岗位此前已沟通过（如 BOSS「继续沟通」态）——不是本次投递失败，
+   * 应计为跳过而非 failed；同时后端应补记真实投递记录便于跨轮去重。
+   */
+  alreadyApplied?: boolean
 }
 
 /** 投递上下文：由引擎注入，供适配器按需取招呼语等 */

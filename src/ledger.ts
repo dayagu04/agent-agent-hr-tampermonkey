@@ -8,7 +8,7 @@
 
 import { storage } from './platform-bridge'
 import type { HRMessageSummary, PluginConfig } from './types'
-import { fetchHRMessages } from './api'
+import { fetchHRMessages, markConversationDeleted } from './api'
 
 /** 本地镜像中的单条会话（= HRMessageSummary + 增量刷新锚点） */
 export interface MirrorItem extends HRMessageSummary {
@@ -17,8 +17,12 @@ export interface MirrorItem extends HRMessageSummary {
 
 const MIRROR_KEY = 'aah_mirror_conversations'
 const JOB_CACHE_KEY = 'aah_job_cache'
+/** 待补发的「会话已在 BOSS 端删除」标记（网络失败时留待下次对账） */
+const DELETED_MARKS_KEY = 'aah_pending_deleted_marks'
 /** 本地镜像最多保留条数（防存储无限膨胀） */
 const MAX_MIRROR = 1000
+/** 待补发删除标记最多保留条数 */
+const MAX_DELETED_MARKS = 200
 /** 岗位缓存最多保留条数（按最近投递淘汰） */
 const MAX_JOB_CACHE = 2000
 
@@ -177,17 +181,80 @@ export async function upsertMirrorFromDom(items: HRMessageSummary[]): Promise<vo
     next.push({
       ...it,
       lastMessageAt: existing?.lastMessageAt || '',
+      // 增量刷新时 DOM/后端可能没带身份字段，保留镜像里已有的
+      bossId: it.bossId || existing?.bossId,
+      encryptJobId: it.encryptJobId || existing?.encryptJobId,
     })
   }
   await saveMirror(next.sort((a, b) => b.timestamp - a.timestamp))
 }
 
-/** 从本地镜像移除指定会话（聊天页删除后调用，避免镜像残留死条目） */
-export async function removeMirrorByKey(company: string, jobTitle: string): Promise<void> {
+/**
+ * 从本地镜像移除指定会话（聊天页删除后调用，避免镜像残留死条目）。
+ *
+ * 优先按身份（bossId / encryptJobId）精确移除，身份没命中再退回
+ * 公司|岗位 key —— 同公司多会话时 key 会误删同公司的其它条目。
+ */
+export async function removeMirrorByKey(
+  company: string,
+  jobTitle: string,
+  identity?: { bossId?: string; encryptJobId?: string },
+): Promise<void> {
   const mirror = await loadMirror()
-  const key = mirrorKey(company, jobTitle)
-  const next = mirror.filter((m) => mirrorKey(m.company, m.jobTitle) !== key)
+  let next: MirrorItem[]
+  const bossId = identity?.bossId || ''
+  const jobId = identity?.encryptJobId || ''
+  if (bossId || jobId) {
+    next = mirror.filter(
+      (m) => !((bossId && m.bossId === bossId) || (jobId && m.encryptJobId === jobId)),
+    )
+    // 身份没匹配到任何条目（身份信息缺失/对不上）时退回文本 key，保住旧行为
+    if (next.length === mirror.length) {
+      const key = mirrorKey(company, jobTitle)
+      next = mirror.filter((m) => mirrorKey(m.company, m.jobTitle) !== key)
+    }
+  } else {
+    const key = mirrorKey(company, jobTitle)
+    next = mirror.filter((m) => mirrorKey(m.company, m.jobTitle) !== key)
+  }
   if (next.length !== mirror.length) await saveMirror(next)
+}
+
+/** 待补发的删除标记（去重：同一身份只留一条） */
+export interface DeletedMarkPayload {
+  company: string
+  job_title?: string
+  reason?: string
+  encrypt_job_id?: string
+}
+
+/** 入队「BOSS 端已删除」标记；网络失败时由 flush 补发，不丢对账。 */
+export async function queueConversationDeletedMark(payload: DeletedMarkPayload): Promise<void> {
+  const q = await storage.get<DeletedMarkPayload[]>(DELETED_MARKS_KEY, [])
+  const key = (x: DeletedMarkPayload) =>
+    `${x.encrypt_job_id || ''}|${x.company || ''}|${x.job_title || ''}`
+  if (!q.some((x) => key(x) === key(payload))) {
+    q.push(payload)
+    await storage.set(DELETED_MARKS_KEY, q.slice(-MAX_DELETED_MARKS))
+  }
+}
+
+/**
+ * 补发积压的删除标记。请求成功（HTTP 200）即从队列移除 —— 即使后端
+ * marked=0（那条记录不存在），说明 BOSS 端确实已无此会话，无需再补。
+ */
+export async function flushConversationDeletedMarks(cfg: PluginConfig): Promise<void> {
+  const q = await storage.get<DeletedMarkPayload[]>(DELETED_MARKS_KEY, [])
+  if (!q.length) return
+  const done: DeletedMarkPayload[] = []
+  for (const p of q) {
+    const res = await markConversationDeleted(cfg, p)
+    if (res !== null) done.push(p)
+  }
+  if (done.length) {
+    const remaining = q.filter((x) => !done.includes(x))
+    await storage.set(DELETED_MARKS_KEY, remaining)
+  }
 }
 
 /**
@@ -277,6 +344,9 @@ export async function upsertMirrorFromSync(payload: {
     // 同步结果里没有匹配分，沿用镜像里已有的（首见时为 null = 无从判断）
     matchScore: existing?.matchScore ?? null,
     lastMessageAt: existing?.lastMessageAt || '',
+    // 身份字段同步接口不返回，沿用镜像已有的（删除定位/对账用）
+    bossId: existing?.bossId,
+    encryptJobId: existing?.encryptJobId,
   })
   await saveMirror(Array.from(byId.values()).sort((a, b) => b.timestamp - a.timestamp))
 }

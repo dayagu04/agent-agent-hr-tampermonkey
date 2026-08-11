@@ -141,8 +141,13 @@ export async function matchJobs(
   return data.results || []
 }
 
-/** GET /api/plugin/rules — 拉取投递过滤规则（黑白名单/最低薪资） */
-export async function fetchRules(cfg: PluginConfig): Promise<ApplyRule[]> {
+/**
+ * GET /api/plugin/rules — 拉取投递过滤规则（黑白名单/最低薪资）。
+ *
+ * 失败返回 null（不再是空数组）：空数组会被当成「没有规则」静默放行，
+ * 导致用户的黑名单在网络抖动瞬间被绕过。调用方需据此提示或中止。
+ */
+export async function fetchRules(cfg: PluginConfig): Promise<ApplyRule[] | null> {
   try {
     const resp = await network.request({
       method: 'GET',
@@ -150,10 +155,14 @@ export async function fetchRules(cfg: PluginConfig): Promise<ApplyRule[]> {
       headers: authHeaders(cfg),
       timeout: 30000,
     })
-    if (resp.status !== 200) return []
+    if (resp.status !== 200) {
+      diag('API', `rules 拉取失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      return null
+    }
     return JSON.parse(resp.responseText).rules || []
-  } catch {
-    return [] // 规则拉取失败不阻断投递（与后端「降级不报错」一致）
+  } catch (e) {
+    diag('API', `rules 拉取异常: ${(e as Error).message}`)
+    return null
   }
 }
 
@@ -262,7 +271,8 @@ export interface ChatPlanTarget {
   company: string
   job_title: string
   encrypt_job_id: string
-  action: 'reply' | 'cleanup'
+  action: 'reply' | 'cleanup' | 'follow_up'
+  follow_up_text?: string
   last_message_at: number | null
 }
 
@@ -333,19 +343,26 @@ export async function reportChatAudit(
   }
 }
 
-/** POST /api/plugin/judge-jobs — LLM 判断岗位是否低质量（外包/批量招聘） */
+/**
+ * POST /api/plugin/judge-jobs — LLM 判断岗位是否低质量（外包/批量招聘）。
+ *
+ * 失败返回 null（不再是空数组）：空数组会被当成「全部通过」静默放行，
+ * 调用方需给出降级提示，让用户知道本轮没有质量拦截。
+ */
 export interface QualityVerdict {
+  platform_job_id?: string
   company: string
   title: string
-  verdict: 'low_quality' | 'ok' | 'unknown' | 'pending'
+  verdict: 'low_quality' | 'ok' | 'unknown' | 'pending' | 'low_confidence'
   reason: string
+  confidence?: number
   cached: boolean
 }
 
 export async function judgeJobs(
   cfg: PluginConfig,
   jobs: JobCard[],
-): Promise<QualityVerdict[]> {
+): Promise<QualityVerdict[] | null> {
   try {
     const resp = await network.request({
       method: 'POST',
@@ -353,6 +370,7 @@ export async function judgeJobs(
       headers: authHeaders(cfg),
       data: JSON.stringify({
         jobs: jobs.map((j) => ({
+          platform_job_id: j.platformJobId || '',
           company: j.company || '',
           title: j.title,
           description: j.description || '',
@@ -361,10 +379,14 @@ export async function judgeJobs(
       }),
       timeout: 120000,
     })
-    if (resp.status !== 200) return []
+    if (resp.status !== 200) {
+      diag('API', `judge-jobs 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      return null
+    }
     return JSON.parse(resp.responseText).results || []
-  } catch {
-    return []
+  } catch (e) {
+    diag('API', `judge-jobs 异常: ${(e as Error).message}`)
+    return null
   }
 }
 
@@ -409,6 +431,7 @@ export async function fetchHRMessages(
         id: c.id,
         company: c.company || '未知公司',
         jobTitle: c.job_title || '',
+        encryptJobId: c.encrypt_job_id || undefined,
         content: hr.truncated ? `${hr.content}…` : hr.content || '',
         timestamp: Number.isNaN(ts) ? 0 : ts,
         // 未读近似：HR 消息且未分类（intent 为空）。后端无已读字段。
@@ -448,27 +471,105 @@ export async function markChatSent(
   }
 }
 
-/** POST /api/plugin/chat/mark-deleted — 会话已在 BOSS 端删除，同步标记后端记录 */
-export async function markConversationDeleted(
+/** POST /api/plugin/chat/follow-up — 回报一次主动跟进的真实发送结果（Phase 1）。 */
+export async function reportChatFollowUp(
   cfg: PluginConfig,
-  payload: { company: string; job_title?: string; reason?: string },
+  payload: {
+    platform?: string
+    encrypt_job_id?: string
+    company: string
+    job_title: string
+    content: string
+    success: boolean
+    run_id?: string
+  },
 ): Promise<void> {
   try {
     await network.request({
       method: 'POST',
-      url: `${cfg.apiBase}/api/plugin/chat/mark-deleted`,
+      url: `${cfg.apiBase}/api/plugin/chat/follow-up`,
       headers: authHeaders(cfg),
       data: JSON.stringify({
-        platform: 'zhipin',
+        platform: payload.platform || 'zhipin',
+        encrypt_job_id: payload.encrypt_job_id || '',
         company: payload.company,
-        job_title: payload.job_title || '',
-        reason: payload.reason || 'plugin_delete',
+        job_title: payload.job_title,
+        content: payload.content,
+        success: payload.success,
+        run_id: payload.run_id || '',
       }),
       timeout: 20000,
     })
   } catch {
-    /* 标记失败不影响 BOSS 端已删除的事实 */
+    /* 留痕失败不影响会话继续 */
   }
+}
+
+/** POST /api/plugin/chat/outcome — 批量上报会话的 HR 侧动作（结果回填，Phase 1）。 */
+export async function reportChatOutcome(
+  cfg: PluginConfig,
+  payload: { run_id?: string; items: Array<{
+    encrypt_job_id?: string
+    company: string
+    job_title: string
+    outcome: 'unread' | 'read' | 'replied' | 'interview_invite' | 'rejected' | 'closed'
+    detail?: string
+  }> },
+): Promise<void> {
+  if (!payload.items || payload.items.length === 0) return
+  try {
+    await network.request({
+      method: 'POST',
+      url: `${cfg.apiBase}/api/plugin/chat/outcome`,
+      headers: authHeaders(cfg),
+      data: JSON.stringify({ run_id: payload.run_id || '', items: payload.items }),
+      timeout: 20000,
+    })
+  } catch {
+    /* 结果回填失败不影响会话继续 */
+  }
+}
+
+/**
+ * POST /api/plugin/chat/mark-deleted — 会话已在 BOSS 端删除，同步标记后端记录。
+ *
+ * 失败时返回 null（调用方应保留待标记队列，稍后重试），成功（即使 marked=0）
+ * 返回标记数。带一次快速重试：删除标记丢了对账是「死会话残留」的根因之一，
+ * 不能静默吞掉。
+ */
+export async function markConversationDeleted(
+  cfg: PluginConfig,
+  payload: { company: string; job_title?: string; reason?: string; encrypt_job_id?: string },
+): Promise<{ marked: number } | null> {
+  const body = JSON.stringify({
+    platform: 'zhipin',
+    company: payload.company,
+    job_title: payload.job_title || '',
+    encrypt_job_id: payload.encrypt_job_id || '',
+    reason: payload.reason || 'plugin_delete',
+  })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await network.request({
+        method: 'POST',
+        url: `${cfg.apiBase}/api/plugin/chat/mark-deleted`,
+        headers: authHeaders(cfg),
+        data: body,
+        timeout: 20000,
+      })
+      if (resp.status !== 200) {
+        diag('API', `chat/mark-deleted 返回 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      } else {
+        const data = JSON.parse(resp.responseText) as { marked?: number }
+        return { marked: Number(data.marked) || 0 }
+      }
+    } catch (e) {
+      diag('API', `chat/mark-deleted 第 ${attempt + 1} 次尝试失败: ${(e as Error).message}`)
+    }
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 800))
+  }
+  diag('API', 'chat/mark-deleted 重试后仍失败，标记已留待下次对账补发')
+  return null
 }
 
 /** POST /api/plugin/record — 记录一次投递 */

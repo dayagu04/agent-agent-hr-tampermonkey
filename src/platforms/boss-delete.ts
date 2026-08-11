@@ -281,10 +281,18 @@ function findDeleteDialog(): HTMLElement | null {
   )
 }
 
-/** 点掉「确认删除吗？」弹窗的「确定」 */
-export async function confirmDeleteDialog(): Promise<boolean> {
+/**
+ * 点掉「确认删除吗？」弹窗的「确定」。
+ *
+ * @param opts.gone 目标是否已从列表消失的判据。deleteViaRowVue 直接调组件方法时
+ *                  BOSS 往往不弹确认窗 —— 每轮先查 gone，已消失立即返回，
+ *                  不再固定空等 14 轮（约 5 秒）。
+ */
+export async function confirmDeleteDialog(opts?: { gone?: () => boolean }): Promise<boolean> {
   for (let i = 0; i < 14; i++) {
+    if (opts?.gone?.()) return true
     await delay(250, 400)
+    if (opts?.gone?.()) return true
     const dialog = findDeleteDialog()
     const scope: ParentNode = dialog || document
     const ok = (Array.from(scope.querySelectorAll('button,span,div,a')) as HTMLElement[]).find(

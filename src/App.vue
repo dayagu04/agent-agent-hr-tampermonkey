@@ -21,6 +21,7 @@ import {
 import { probeChatPage } from './platforms/boss-probe'
 import { clearChatStore, setPendingOpen, takePendingOpen } from './chat-store'
 import {
+  flushConversationDeletedMarks,
   lookupCachedJob,
   refreshChatList,
   removeMirrorByKey,
@@ -36,6 +37,17 @@ import { collectAndLogDom } from './dom-collector'
 import { startDebugCapture } from './debug'
 import { probeChatStore } from './chat-store-probe'
 import { VERSION_LABEL } from './version'
+import {
+  collectListDom,
+  getScrollListenerHit,
+  loadProbeState,
+  startProbe,
+  startScrollListener,
+  stopScrollListener,
+  stopProbe,
+  type ProbeState,
+  type ScrollListenerHit,
+} from './pagination-probe'
 
 const platform = detectPlatform()
 const config = reactive<PluginConfig>(loadConfig())
@@ -103,8 +115,11 @@ onUnmounted(() => {
   window.removeEventListener('resize', onWindowResize)
   if (resizeTimer !== undefined) clearTimeout(resizeTimer)
   if (statsTimer !== undefined) clearInterval(statsTimer)
+  if (probeTimer !== undefined) clearInterval(probeTimer)
+  stopScrollListener()
   if (hrTimer !== null) clearInterval(hrTimer)
   window.removeEventListener('aah:config-reload', onRemoteConfigReload)
+  window.removeEventListener('aah:chat-mirror-changed', onMirrorChanged)
   if (configTimer !== undefined) clearInterval(configTimer)
 })
 
@@ -418,7 +433,13 @@ function mergeChatListWithDom(backendList: HRMessageSummary[]): HRMessageSummary
     const key = threadDisplayKey(t.company, t.jobTitle)
     const b = byKey.get(key)
     if (b) {
-      next.push({ ...b, hrName: t.name || b.hrName, unread: t.unread })
+      next.push({
+        ...b,
+        hrName: t.name || b.hrName,
+        unread: t.unread,
+        // 行级 BOSS 原生标识：同公司多会话时删除定位/对账不再靠公司名猜
+        bossId: t.bossId || b.bossId,
+      })
       continue
     }
     // 岗位名缺失 → 公司名兜底：用后端记录的岗位名/内容/分数富化，
@@ -428,7 +449,13 @@ function mergeChatListWithDom(backendList: HRMessageSummary[]): HRMessageSummary
       domText.includes((m.company || '').trim().toLowerCase()),
     )
     if (fb) {
-      next.push({ ...fb, hrName: t.name || fb.hrName, company: t.company, unread: t.unread })
+      next.push({
+        ...fb,
+        hrName: t.name || fb.hrName,
+        company: t.company,
+        unread: t.unread,
+        bossId: t.bossId || fb.bossId,
+      })
       continue
     }
     next.push({
@@ -440,6 +467,7 @@ function mergeChatListWithDom(backendList: HRMessageSummary[]): HRMessageSummary
       timestamp: 0,
       unread: t.unread,
       matchScore: null,
+      bossId: t.bossId || '',
     })
   }
   // 与镜像同序（时间倒序）：会话页 / 投递页渲染同一份顺序，避免“换个页面就乱序”
@@ -449,6 +477,8 @@ function mergeChatListWithDom(backendList: HRMessageSummary[]): HRMessageSummary
 async function loadHRMessages(): Promise<void> {
   if (!ready.value) return
   lastHRFetchAt = Date.now()
+  // 补发上次网络失败遗留的「BOSS 端已删除」标记（自愈对账）
+  await flushConversationDeletedMarks(config)
   // 本地优先：先用本地镜像即时渲染（零等待），再后台增量拉服务器
   recentHRMessages.value = await renderableMirror()
   hrMessagesLoading.value = true
@@ -468,6 +498,12 @@ async function loadHRMessages(): Promise<void> {
   } finally {
     hrMessagesLoading.value = false
   }
+}
+
+/** 后台删除（超时清理/策略删除/对账补标）改完镜像后的事件回调：立即重渲染 */
+async function onMirrorChanged(): Promise<void> {
+  if (!ready.value) return
+  recentHRMessages.value = await renderableMirror()
 }
 
 /** 该会话是否会被自动回复跳过，以及原因（与后端判定保持一致）。null = 不会被跳过 */
@@ -594,11 +630,14 @@ async function deleteHRThread(msg: HRMessageSummary, event: Event): Promise<void
   deletingThread.value = msg.id
 
   try {
-    const r = await deleteThread(msg.company, msg.jobTitle)
+    // 身份（BOSS 原生 id / 后端岗位 id）随删除链路传递：定位与对账都精确到
+    // 这一条，同公司多会话不会误删误标。
+    const identity = { bossId: msg.bossId, encryptJobId: msg.encryptJobId }
+    const r = await deleteThread(msg.company, msg.jobTitle, identity)
     if (r === 'ok') {
       openThreadMsg.value = `已删除「${msg.company}」的会话`
       // 页面已删：同步从本地镜像移除，避免非聊天页再渲染出这条死会话
-      await removeMirrorByKey(msg.company, msg.jobTitle)
+      await removeMirrorByKey(msg.company, msg.jobTitle, identity)
       recentHRMessages.value = await renderableMirror()
     } else if (r === 'not-found') {
       openThreadMsg.value = `会话列表里没找到「${msg.company}」，可能需要先向下滚动加载`
@@ -719,11 +758,94 @@ async function startChat() {
 }
 
 const progress = reactive<ApplyProgress>({
-  scanned: 0, scanComplete: false, matched: 0, applied: 0, skipped: 0, failed: 0, running: false, logs: [], currentJob: null,
+  scanned: 0, scanComplete: false, matched: 0, applied: 0, skipped: 0, failed: 0, unknown: 0,
+  running: false, logs: [], currentJob: null,
 })
 
 // currentJob 的响应式副本（从 progress 中提取，便于模板引用）
 const currentJob = computed(() => progress.currentJob)
+
+// ---- 深度翻页测试（滚动加载方案，调试工具，手动控制）----
+const probeState = ref<ProbeState | null>(null)
+const probeMaxSteps = ref(20)
+const probeBusy = ref(false)
+const probeMsg = ref('')
+
+async function refreshProbe(): Promise<void> {
+  probeState.value = await loadProbeState()
+}
+
+async function doStartProbe(): Promise<void> {
+  if (orchestratorRunning.value) {
+    probeMsg.value = '智能编排运行中，请先停止编排再测翻页'
+    return
+  }
+  probeBusy.value = true
+  probeMsg.value = ''
+  try {
+    const result = await startProbe(config, '', probeMaxSteps.value)
+    if (!result.ok) probeMsg.value = result.message
+  } finally {
+    probeBusy.value = false
+  }
+}
+
+async function doStopProbe(): Promise<void> {
+  await stopProbe()
+  await refreshProbe()
+}
+
+// ---- 列表 DOM 结构采集 / 滚动容器监听（定位滚动加载可行性）----
+const listDomText = ref('')
+const scrollHit = ref<ScrollListenerHit | null>(null)
+const listeningScroll = ref(false)
+
+function doCollectListDom(): void {
+  listDomText.value = collectListDom()
+  diag('PROBE', 'LISTDOM\n' + listDomText.value)
+}
+
+function doToggleScrollListener(): void {
+  if (listeningScroll.value) {
+    stopScrollListener()
+    listeningScroll.value = false
+  } else {
+    scrollHit.value = null
+    startScrollListener()
+    listeningScroll.value = true
+  }
+}
+
+const probeTotalFresh = computed(() => {
+  const steps = probeState.value?.steps
+  return steps && steps.length ? steps.reduce((s, p) => s + p.fresh, 0) : 0
+})
+
+const probeLastCount = computed(() => {
+  const steps = probeState.value?.steps
+  return steps && steps.length ? steps[steps.length - 1].cardCount : 0
+})
+
+const probeDomText = computed(() => {
+  const c = probeState.value?.container
+  if (!c || !c.found) return ''
+  return [
+    `<${c.tag} class="${c.className}">`,
+    `  overflow-y: ${c.overflowY} | scrollHeight: ${c.scrollHeight} | clientHeight: ${c.clientHeight}`,
+    `  children: ${c.children.join('  ') || '(空)'}`,
+    `  tail: ${c.tail.join('  ') || '(空)'}`,
+  ].join('\n')
+})
+
+const scrollHitText = computed(() => {
+  const h = scrollHit.value
+  if (!h) return ''
+  return (
+    `<${h.tag}${h.id ? '#' + h.id : ''} class="${h.className}">\n` +
+    `  overflow-y: ${h.overflowY} | scrollTop: ${h.scrollTop} | ` +
+    `scrollHeight: ${h.scrollHeight} | clientHeight: ${h.clientHeight}`
+  )
+})
 
 /**
  * 进度条的分母：整轮投递目标数。
@@ -891,6 +1013,8 @@ async function stopOrchestrator() {
 
 /** 状态轮询 timer（onUnmounted 需清掉，否则组件销毁后仍在跑） */
 let statsTimer: number | undefined
+/** 深度翻页测试状态轮询（滚动采集在当前页内进行，需实时刷新面板） */
+let probeTimer: number | undefined
 /** 配置周期刷新 timer（网页端改偏好后 60s 内兜底同步） */
 let configTimer: number | undefined
 
@@ -932,6 +1056,19 @@ onMounted(() => {
     syncRouteState()
   }, 1000)
 
+  // 深度翻页测试：展示历史结果；滚动采集进行中时每 500ms 刷新面板
+  refreshProbe()
+  probeTimer = window.setInterval(() => {
+    if (probeState.value?.active) refreshProbe()
+    if (listeningScroll.value) {
+      const hit = getScrollListenerHit()
+      if (hit) {
+        scrollHit.value = hit
+        diag('PROBE', `滚动监听命中: ${hit.tag}#${hit.id} class=${hit.className} overflow=${hit.overflowY} ${hit.scrollTop}/${hit.scrollHeight}`)
+      }
+    }
+  }, 300)
+
   // HR 消息：立刻拉一次（本地镜像先渲染，再增量刷服务器），之后每 60s 一次；
   // 只在会话 Tab 可见时刷新，配合 since 增量参数，未变化时几乎零开销。
   // 定时器无条件建立、在回调里判断是否已配置 —— 若改成「已配置才建」，
@@ -954,6 +1091,7 @@ onMounted(() => {
   // 网页端「保存设置」会入队 config.reload 命令,这里监听事件即时重拉;
   // 60s 周期刷新兜底,确保网页端改的偏好最终一定生效。
   window.addEventListener('aah:config-reload', onRemoteConfigReload)
+  window.addEventListener('aah:chat-mirror-changed', onMirrorChanged)
   configTimer = window.setInterval(() => {
     if (!ready.value) return
     if (collapsed.value) return
@@ -1256,6 +1394,25 @@ watch(activeTab, (tab) => {
                 </div>
               </template>
 
+              <!-- 本批被质量拦截的岗位（岗位级判定，含原因，可复核） -->
+              <div
+                v-if="progress.blockedByQuality && progress.blockedByQuality.length"
+                class="aah-quality-blocked"
+              >
+                <div class="aah-quality-blocked-title">
+                  本批被质量拦截 {{ progress.blockedByQuality.length }} 个
+                  <span class="aah-hint">（岗位级判定，可在网页端复核）</span>
+                </div>
+                <div
+                  v-for="(b, i) in progress.blockedByQuality.slice(-8)"
+                  :key="i"
+                  class="aah-quality-blocked-item"
+                >
+                  <b>{{ b.company }}</b> · {{ b.title }}
+                  <span class="aah-quality-blocked-reason">{{ b.reason }}</span>
+                </div>
+              </div>
+
               <div class="aah-logs">
                 <div v-if="!progress.logs.length" class="aah-log-line">暂无日志</div>
                 <div v-for="(line, i) in progress.logs" :key="i" class="aah-log-line">{{ line }}</div>
@@ -1397,6 +1554,83 @@ watch(activeTab, (tab) => {
 
           <!-- ===== Tab: 调试（行为日志已迁移到服务端,这里保留 DOM 采集/调试入口） ===== -->
           <div v-else-if="activeTab === 'logs'" key="logs" class="aah-tab-pane">
+            <!-- ===== 深度翻页测试（滚动加载方案，手动控制） ===== -->
+            <div class="aah-probe-section">
+              <h3 class="aah-section-title">深度翻页测试（滚动采集）</h3>
+              <p class="aah-tip">
+                BOSS 搜索页是左侧列表滚动加载（?page=N 无效）。本测试在当前页原地向下滚动，
+                每步统计卡片总数/新增/重复，并采集滚动容器 DOM 结构。不投递、不点沟通，随时可停止。
+              </p>
+              <div class="aah-row" style="gap:8px">
+                <label class="aah-row" style="gap:6px">
+                  <span>最大步数</span>
+                  <input
+                    v-model.number="probeMaxSteps"
+                    type="number"
+                    min="2"
+                    max="60"
+                    style="width:70px"
+                  />
+                </label>
+                <button
+                  v-if="!probeState?.active"
+                  class="aah-btn-secondary"
+                  :disabled="probeBusy"
+                  @click="doStartProbe"
+                >
+                  {{ probeBusy ? '启动中...' : '开始滚动采集' }}
+                </button>
+                <button v-else class="aah-btn-danger" @click="doStopProbe">停止采集</button>
+              </div>
+              <p v-if="probeMsg" class="aah-error">{{ probeMsg }}</p>
+
+              <div class="aah-row" style="gap:8px; margin-top:8px">
+                <button class="aah-btn-secondary" @click="doCollectListDom">采集列表结构</button>
+                <button class="aah-btn-secondary" @click="doToggleScrollListener">
+                  {{ listeningScroll ? '停止滚动监听' : '滚动监听（请手动滚一下列表）' }}
+                </button>
+              </div>
+              <pre v-if="listDomText" class="aah-probe-dom-pre">{{ listDomText }}</pre>
+              <div v-if="scrollHit" class="aah-probe-dom">
+                <div class="aah-probe-dom-title">真正滚动的元素（监听命中）</div>
+                <pre class="aah-probe-dom-pre">{{ scrollHitText }}</pre>
+              </div>
+
+              <div v-if="probeState?.container" class="aah-probe-dom">
+                <div class="aah-probe-dom-title">滚动容器 DOM 结构</div>
+                <pre v-if="probeState.container.found" class="aah-probe-dom-pre">{{ probeDomText }}</pre>
+                <p v-else class="aah-tip">
+                  未找到可滚动容器（滚动加载可能由 window 滚动或新选择器驱动），已改用 window.scrollBy。
+                </p>
+              </div>
+
+              <div v-if="probeState?.steps?.length" class="aah-probe-results">
+                <div class="aah-probe-summary">
+                  已采集 {{ probeState.steps.length }}/{{ probeState.maxSteps }} 步，
+                  当前卡片 {{ probeLastCount }} 张，累计唯一岗位 {{ probeTotalFresh }} 个
+                  <span v-if="probeState.done">（{{ probeState.doneReason || '已结束' }}）</span>
+                </div>
+                <table class="aah-probe-table">
+                  <thead>
+                    <tr><th>步</th><th>卡片</th><th>新增</th><th>重复</th><th>滚动位置</th><th>到底</th><th>加载信号</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="p in probeState.steps" :key="p.step">
+                      <td>{{ p.step }}</td>
+                      <td>{{ p.cardCount }}</td>
+                      <td>{{ p.fresh }}</td>
+                      <td>{{ p.dup }}</td>
+                      <td>{{ p.scrollTop }}/{{ p.scrollHeight }}</td>
+                      <td>{{ p.atBottom ? '✓' : '' }}</td>
+                      <td class="aah-probe-signal">{{ p.signal || '-' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="aah-divider"></div>
+
             <!-- ===== DOM 采集（独立缓冲，回传日志供开发用） ===== -->
             <div class="aah-diag-head">
               <span>DOM 采集（{{ domLines.length }} 行）</span>
@@ -1634,5 +1868,24 @@ watch(activeTab, (tab) => {
 .aah-job-name { font-size:13px; font-weight:600; color:#0c4a6e; margin-bottom:4px; }
 .aah-job-company { font-size:12px; color:#0369a1; margin-bottom:4px; }
 .aah-job-score { font-size:11px; color:#0284c7; }
+
+/* 质量拦截列表（岗位级，含原因） */
+.aah-quality-blocked { margin:12px 0; padding:10px 12px; background:#fef2f2; border-radius:8px; border:1px solid #fecaca; }
+.aah-quality-blocked-title { font-size:12px; font-weight:600; color:#b91c1c; margin-bottom:6px; display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+.aah-quality-blocked-item { font-size:11px; color:#7f1d1d; padding:3px 0; border-bottom:1px dashed #fecaca; }
+.aah-quality-blocked-item:last-child { border-bottom:none; }
+.aah-quality-blocked-reason { color:#9f1239; display:block; font-size:10px; margin-top:2px; }
+
+/* 深度翻页测试（滚动采集） */
+.aah-probe-section { margin:14px 0; padding:12px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; }
+.aah-probe-results { margin-top:10px; }
+.aah-probe-summary { font-size:12px; color:#334155; margin-bottom:6px; }
+.aah-probe-table { width:100%; border-collapse:collapse; font-size:11px; }
+.aah-probe-table th, .aah-probe-table td { border:1px solid #e2e8f0; padding:3px 6px; text-align:center; }
+.aah-probe-table th { background:#f1f5f9; color:#475569; }
+.aah-probe-signal { font-size:10px; color:#64748b; }
+.aah-probe-dom { margin-top:10px; }
+.aah-probe-dom-title { font-size:12px; font-weight:600; color:#334155; margin-bottom:4px; }
+.aah-probe-dom-pre { margin:0; padding:8px 10px; background:#0f172a; color:#e2e8f0; border-radius:6px; font-size:11px; line-height:1.6; white-space:pre-wrap; word-break:break-all; }
 
 </style>

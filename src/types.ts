@@ -138,6 +138,16 @@ export interface HRMessageSummary {
   matchScore: number | null
   /** 后端 last_message_at 原文（本地镜像增量刷新比较用） */
   lastMessageAt?: string
+  /**
+   * BOSS 原生会话/用户标识（data-user-id / data-conversation-id 等，DOM 来源）。
+   * 用于精确删除定位：同公司多会话时不再靠公司名子串猜。
+   */
+  bossId?: string
+  /**
+   * 平台岗位 ID：优先取后端 Job.platform_job_id（镜像/后端列表），
+   * 用于删除后向后端精确标记 status=deleted，避免同公司多岗位全部被误标。
+   */
+  encryptJobId?: string
 }
 
 /** 左侧 Tab 导航项 */
@@ -155,8 +165,17 @@ export interface ApplyProgress {
   applied: number // 已投递数
   skipped: number // 跳过数（低分/已投）
   failed: number // 投递失败数
+  /** 未确认数（点了但平台未确认；不计入 applied/skipped/failed，也不推进投递目标） */
+  unknown: number
   running: boolean
   logs: string[] // 操作日志
   /** 当前正在投递的岗位（实时显示用） */
   currentJob?: { title: string; company: string; score: number } | null
+  /** 本批被质量判定拦截的岗位（岗位级，含原因，供面板核对） */
+  blockedByQuality?: Array<{
+    company: string
+    title: string
+    reason: string
+    confidence?: number
+  }>
 }

@@ -465,9 +465,15 @@ export class Orchestrator {
     const keyword = typeof action.keyword === 'string' && action.keyword
       ? action.keyword
       : this.state.keywords[this.state.currentKeywordIndex] || 'C++'
-    const page = typeof action.page === 'number' && action.page > 0
-      ? action.page
-      : this.state.currentPage || 1
+    // BOSS 搜索列表是滚动加载（?page=N 无效，实测单组合上限 300 张）：
+    // 始终停留在第 1 页，每次 apply_batch 由 ApplyEngine.scanJobs 滚动加载全量岗位。
+    // 组合是否完成由插件上报 scanned/skipped/count，后端据此切下一个关键词/城市。
+    const isZhipin = /zhipin\.com/.test(window.location.hostname)
+    const page = isZhipin
+      ? 1
+      : typeof action.page === 'number' && action.page > 0
+        ? action.page
+        : this.state.currentPage || 1
     const cityCode = typeof action.city_code === 'string' && action.city_code
       ? action.city_code
       : this.state.cityCode || ''
@@ -565,6 +571,7 @@ export class Orchestrator {
         failed: failedThisBatch,
         scanned: scannedThisPage,
         scanComplete: scanCompleteThisPage,
+        platform: platform.code,
       })
     } finally {
       this.busy = false

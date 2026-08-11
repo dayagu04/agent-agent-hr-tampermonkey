@@ -7,12 +7,24 @@
 // 全过程由后端 conversation_* 三表留痕（意图/回复/发送结果）供事后评判。
 import { diag } from '../logger'
 import type { PluginConfig } from '../types'
-import { markChatSent, markConversationDeleted, reportChatAudit, syncChatOne } from '../api'
+import {
+  markChatSent,
+  reportChatAudit,
+  reportChatFollowUp,
+  reportChatOutcome,
+  syncChatOne,
+} from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
-import { removeMirrorByKey } from '../ledger'
+import type { ChatPlanTarget } from '../chat-plan'
+import {
+  flushConversationDeletedMarks,
+  queueConversationDeletedMark,
+  removeMirrorByKey,
+} from '../ledger'
 import { loadConfig } from '../config'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
+import { parseThreadTimeMs } from './boss-time'
 import {
   clickDeleteInHeaderMenu,
   confirmDeleteDialog,
@@ -33,6 +45,8 @@ export interface ChatThread {
   company: string
   jobTitle: string
   unread: boolean
+  /** BOSS 原生会话/用户标识（data-user-id / data-conversation-id 等） */
+  bossId: string
 }
 
 const SEL = {
@@ -79,6 +93,20 @@ function allMatch(selectors: string[], root: ParentNode = document): HTMLElement
 const text = (el: Element | null | undefined) => (el?.textContent || '').trim()
 const delay = (min: number, max: number) =>
   new Promise((r) => setTimeout(r, min + Math.random() * (max - min)))
+
+/** 从会话行 DOM 提取 BOSS 原生唯一标识（threadKey 与删除定位共用同一来源）。 */
+function readBossId(el: HTMLElement): string {
+  return (
+    el.getAttribute('data-user-id') ||
+    el.getAttribute('data-conversation-id') ||
+    el.getAttribute('data-geek-id') ||
+    el.getAttribute('data-boss-id') ||
+    el.querySelector('[data-user-id]')?.getAttribute('data-user-id') ||
+    el.querySelector('[data-conversation-id]')?.getAttribute('data-conversation-id') ||
+    el.querySelector('[data-geek-id]')?.getAttribute('data-geek-id') ||
+    ''
+  )
+}
 
 /**
  * 记录一条会话的完整对话历史到插件日志（批量上传后端 /api/plugin/logs）。
@@ -194,7 +222,7 @@ function listThreadsQuiet(): ChatThread[] {
     const jobTitle = text(el.querySelector('[class*="job"], .source-job'))
     // 未读标记：红点/数字气泡
     const unread = !!el.querySelector('.badge-count, [class*="badge"], [class*="unread"]')
-    threads.push({ el, name, company: company || name, jobTitle, unread })
+    threads.push({ el, name, company: company || name, jobTitle, unread, bossId: readBossId(el) })
   }
   return threads
 }
@@ -319,7 +347,8 @@ let dumpedMissingJobTitle = false
  * 删除指定会话。
  *
  * 完整流程：
- *   1. 滚动找到目标会话项（虚拟列表只渲染约 40 项，窗口外的找不到）
+ *   1. 找到目标会话项：优先按身份精确匹配（encryptJobId / bossId），
+ *      身份缺失时才退回公司名子串滚动查找（虚拟列表只渲染约 40 项）
  *   2. 鼠标移到该项 → 右下角出现「···」按钮（Vue 条件渲染，非 CSS 隐藏）
  *   3. 点「···」→ 弹出浮层菜单（只有「置顶」「删除」两项）
  *   4. 点「删除」→ 弹「确认删除吗？」→ 点「确定」
@@ -333,20 +362,15 @@ let dumpedMissingJobTitle = false
 async function deleteThreadImpl(
   company: string,
   jobTitle = '',
+  identity?: { bossId?: string; encryptJobId?: string },
 ): Promise<'ok' | 'not-found' | 'failed'> {
   const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase()
   const target = norm(company)
   if (!target) return 'not-found'
-  const wanted = norm(jobTitle)
-
-  // 只按公司名匹配，不要求岗位名对上：列表项 company 是「姓名+公司+职务」
-  // 的拼接串（如"余先生新东方招聘主管"），且通常没有独立的岗位名字段，
-  // jobTitle 恒为空。同公司多会话会命中第一个，这是 DOM 信息量的限制。
-  const match = (t: ChatThread) => norm(t.company).includes(target)
-  void wanted
+  void norm(jobTitle)
 
   // 步骤 1：找到会话项（含滚动查找）
-  const hit = await findThreadByScrolling(match)
+  const hit = await findThreadForDelete(company, jobTitle, identity)
   if (!hit) {
     diag('CHAT', `deleteThread 未找到会话（含滚动查找）: ${company}`)
     return 'not-found'
@@ -355,14 +379,21 @@ async function deleteThreadImpl(
   // 删除结果校验按「身份是否还在列表里」判断：虚拟列表节点数恒定，
   // 删一条后下一条补位、长度不变，不能比长度或 isConnected。
   const wantKey = threadKey(hit)
+  const isGone = () => !listThreadsQuiet().some((t) => threadKey(t) === wantKey)
 
-  /** 点确认弹窗 + 校验会话是否真的从列表消失 */
+  /**
+   * 点确认弹窗 + 校验会话是否真的从列表消失。
+   *
+   * 弹窗探测与「目标已从列表消失」并行：deleteViaRowVue 直接调组件方法时
+   * BOSS 往往不弹确认窗，原来固定等 14 轮（约 5 秒）纯属浪费；现在
+   * confirmDeleteDialog 每轮先查 gone，会话已消失立即返回。
+   */
   const confirmAndVerify = async (label: string): Promise<boolean> => {
     await delay(300, 450)
-    const confirmed = await confirmDeleteDialog()
+    const confirmed = await confirmDeleteDialog({ gone: isGone })
     if (!confirmed) diag('CHAT', `${label}：未点到确认按钮，继续校验实际结果`)
-    for (let i = 0; i < 10; i++) {
-      if (!listThreadsQuiet().some((t) => threadKey(t) === wantKey)) {
+    for (let i = 0; i < 6; i++) {
+      if (isGone()) {
         diag('CHAT', `${label} 已删除: ${hit.company}`)
         return true
       }
@@ -440,15 +471,15 @@ async function deleteThreadImpl(
     unmarkOperateRow(hit.el) // 菜单已出，撤掉强制样式，避免留下视觉异常
     realClick(del)
     await delay(300, 450)
-    const confirmed = await confirmDeleteDialog()
+    const confirmed = await confirmDeleteDialog({ gone: isGone })
     if (!confirmed) {
       // 可能 BOSS 已改为无需确认，交给后续校验判定
       diag('CHAT', 'deleteThread 未点到确认按钮，继续校验实际结果')
     }
 
     // 步骤 5：校验
-    for (let i = 0; i < 10; i++) {
-      if (!listThreadsQuiet().some((t) => threadKey(t) === wantKey)) {
+    for (let i = 0; i < 6; i++) {
+      if (isGone()) {
         diag('CHAT', `deleteThread 已删除: ${hit.company}`)
         return 'ok'
       }
@@ -465,13 +496,92 @@ async function deleteThreadImpl(
   }
 }
 
-/** 删除会话（手动路径）：成功后同步标记后端记录 + 清本地镜像 */
+/**
+ * 定位要删除的会话行。
+ *
+ * 身份优先（encryptJobId / bossId 精确），身份缺失或没命中时退回公司名子串：
+ * - encryptJobId：从 virtual-list.dataSources 全量列表精确找（一次拿到全部会话），
+ *   命中后只滚动到该行（不切换会话），同公司多岗位也不会删错；
+ * - bossId：在已渲染行里按 data-user-id 精确找；
+ * - 兜底：公司名子串滚动查找（旧行为）。
+ */
+async function findThreadForDelete(
+  company: string,
+  jobTitle: string,
+  identity?: { bossId?: string; encryptJobId?: string },
+): Promise<ChatThread | null> {
+  const target = (company || '').replace(/\s+/g, '').toLowerCase()
+  const jobId = (identity?.encryptJobId || '').trim()
+  const bossId = identity?.bossId || ''
+  const wantJob = (jobTitle || '').replace(/\s+/g, '').toLowerCase()
+
+  // 1) 全量数据源按岗位 ID 精确定位（最稳）；inbound 虚拟 id 与 BOSS 真实
+  //    jobId 对不上，跳过精确匹配，走公司兜底。
+  if (jobId && !jobId.startsWith('inbound:')) {
+    const sources = readChatSources()
+    if (sources) {
+      const src = sources.find((s) => String(s.boss.encryptJobId || '') === jobId)
+      if (src) {
+        const t = await locateRowByIndex(src.index)
+        if (t) return t
+      }
+    }
+  }
+
+  // 2) 已渲染行按 bossId 精确定位
+  if (bossId) {
+    const hit = listThreadsQuiet().find((t) => t.bossId === bossId)
+    if (hit) return hit
+  }
+
+  // 3) 兜底：滚动查找（身份精确命中优先，否则退回公司名子串）
+  const match = (t: ChatThread): boolean => {
+    if (bossId && t.bossId && t.bossId === bossId) return true
+    if (jobId) {
+      const row = readRowJobInfo(t.el)
+      if (row.jobId && row.jobId === jobId) return true
+    }
+    const companyHit =
+      !!target && (t.company || '').replace(/\s+/g, '').toLowerCase().includes(target)
+    // 公司命中后若已知岗位名，再加一道岗位名过滤（同公司多会话时减少误删）
+    if (!companyHit || !wantJob) return companyHit
+    return (t.jobTitle || '').replace(/\s+/g, '').toLowerCase().includes(wantJob)
+  }
+  return findThreadByScrolling(match)
+}
+
+/** 渲染并返回指定下标的会话行（只滚动，不切换会话 —— 删除路径无需打开对话）。 */
+async function locateRowByIndex(index: number): Promise<ChatThread | null> {
+  const vl = findVirtualListVm()
+  if (!vl) return null
+  await scrollToSourceIndex(vl, index)
+  const threads = listThreadsQuiet()
+  let hit = threads.find(
+    (t) => (t.el as AnyVm).__vue__?.$props?.index === index,
+  )
+  if (!hit) {
+    hit = threads.find(
+      (t) => (t.el as AnyVm).__vue__?.$parent?.$props?.index === index,
+    )
+  }
+  return hit || null
+}
+
+/**
+ * 删除会话（手动路径）：成功后同步标记后端记录 + 清本地镜像。
+ *
+ * @param identity bossId（DOM 原生标识）/ encryptJobId（后端 Job.platform_job_id），
+ *                 用于精确删除定位与后端对账，避免同公司多会话误删/误标。
+ */
 export async function deleteThread(
   company: string,
   jobTitle = '',
+  identity?: { bossId?: string; encryptJobId?: string },
 ): Promise<'ok' | 'not-found' | 'failed'> {
-  const r = await deleteThreadImpl(company, jobTitle)
-  if (r === 'ok') afterConversationDeleted(company, jobTitle, 'manual')
+  const r = await deleteThreadImpl(company, jobTitle, identity)
+  if (r === 'ok') {
+    await afterConversationDeleted(company, jobTitle, 'manual', identity)
+  }
   return r
 }
 
@@ -641,11 +751,32 @@ const SYSTEM_MSG_RE = /对方已(查看|同意|接受|拒绝)|附件简历已(�
 /**
  * 会话已在 BOSS 端删除：同步标记后端记录（status=deleted，跨轮次不再残留）
  * 并清本地镜像。三个删除路径（超时清理/被拒删除/手动删除）共用。
+ *
+ * 标记走「入队 + 补发」：网络失败留在队列，下次刷新/托管轮次自动补发，
+ * 不再 fire-and-forget 静默丢失（丢失的后果是后端死会话残留、每轮重试）。
+ * identity.encryptJobId 是后端 Job.platform_job_id，供精确标记。
  */
-function afterConversationDeleted(company: string, jobTitle: string, reason: string): void {
+async function afterConversationDeleted(
+  company: string,
+  jobTitle: string,
+  reason: string,
+  identity?: { encryptJobId?: string },
+): Promise<void> {
   const cfg = loadConfig()
-  void markConversationDeleted(cfg, { company, job_title: jobTitle, reason })
-  void removeMirrorByKey(company, jobTitle)
+  await queueConversationDeletedMark({
+    company,
+    job_title: jobTitle,
+    reason,
+    encrypt_job_id: identity?.encryptJobId || '',
+  })
+  await flushConversationDeletedMarks(cfg)
+  await removeMirrorByKey(company, jobTitle, identity)
+  // 通知面板：自动删除后镜像已变，立即重渲染，不再等 60s 轮询
+  try {
+    window.dispatchEvent(new CustomEvent('aah:chat-mirror-changed'))
+  } catch {
+    /* 事件派发失败不影响删除结果 */
+  }
 }
 
 async function readMessages(): Promise<Array<{ sender: 'hr' | 'me' | 'system'; content: string }>> {
@@ -1538,15 +1669,7 @@ let warnedThreadKeyFallback = false
 
 function threadKey(t: ChatThread): string {
   // 尝试从 DOM 元素及其子节点提取 BOSS 的唯一标识
-  const el = t.el
-  const bossId =
-    el.getAttribute('data-user-id') ||
-    el.getAttribute('data-conversation-id') ||
-    el.getAttribute('data-geek-id') ||
-    el.getAttribute('data-boss-id') ||
-    el.querySelector('[data-user-id]')?.getAttribute('data-user-id') ||
-    el.querySelector('[data-conversation-id]')?.getAttribute('data-conversation-id') ||
-    el.querySelector('[data-geek-id]')?.getAttribute('data-geek-id')
+  const bossId = t.bossId || readBossId(t.el)
 
   if (bossId) {
     diag('CHAT', `threadKey 使用原生ID: ${bossId}`, { company: t.company })
@@ -1654,6 +1777,28 @@ function bossRowInfo(boss: AnyVm): { encryptJobId: string; company: string; jobT
     company: boss.brandName || boss.company || '',
     jobTitle: boss.positionName || boss.title || '',
   }
+}
+
+const normText = (s: string) => (s || '').replace(/\s+/g, '').toLowerCase()
+
+/**
+ * 计划目标是否存在于 BOSS 全量会话列表（virtual-list.dataSources）。
+ *
+ * 真实岗位按 encryptJobId 精确比对；inbound 会话（HR 主动打招呼建档）的
+ * platform_job_id 是后端虚构的 `inbound:公司:岗位`，与 BOSS 真实 jobId 对不上，
+ * 只能按公司名模糊判定存在性（与 chat-plan.findPlanTarget 同容忍度）。
+ */
+function planTargetInSources(p: ChatPlanTarget, sources: ChatSourceItem[]): boolean {
+  const jobId = (p.encrypt_job_id || '').trim()
+  if (jobId && !jobId.startsWith('inbound:')) {
+    return sources.some((s) => String(s.boss.encryptJobId || '') === jobId)
+  }
+  const cc = normText(p.company || '')
+  if (!cc) return false
+  return sources.some((s) => {
+    const bc = normText(String(s.boss.brandName || s.boss.company || ''))
+    return !!bc && (bc.includes(cc) || cc.includes(bc))
+  })
 }
 
 /**
@@ -1824,41 +1969,7 @@ function findThreadScrollContainer(): HTMLElement | null {
   return fallback
 }
 
-/** BOSS 会话行时间文本 → epoch 毫秒（"刚刚"/"昨天"/"HH:mm"/"MM-DD"/"YYYY-MM-DD"）。 */
-function parseThreadTimeMs(text: string, now: number): number | null {
-  const t = (text || '').trim()
-  if (!t) return null
-  if (t === '刚刚') return now
-  const num = Number(t)
-  if (!Number.isNaN(num)) {
-    // 纯数字：可能是 epoch 秒/毫秒，也可能是"3分钟前"这类被解析成数字
-    return num > 1e12 ? num : now - num * 1000
-  }
-  const nowDate = new Date(now)
-  const y = nowDate.getFullYear()
-  if (t === '昨天') return now - 24 * 3600 * 1000
-  const full = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/)
-  if (full) {
-    return new Date(
-      Number(full[1]), Number(full[2]) - 1, Number(full[3]),
-      full[4] ? Number(full[4]) : 0, full[5] ? Number(full[5]) : 0,
-    ).getTime()
-  }
-  const md = t.match(/^(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/)
-  if (md) {
-    return new Date(
-      y, Number(md[1]) - 1, Number(md[2]),
-      md[3] ? Number(md[3]) : 0, md[4] ? Number(md[4]) : 0,
-    ).getTime()
-  }
-  const hm = t.match(/^(\d{1,2}):(\d{2})$/)
-  if (hm) {
-    const d = new Date(now)
-    d.setHours(Number(hm[1]), Number(hm[2]), 0, 0)
-    return d.getTime()
-  }
-  return null
-}
+// 时间解析见 boss-time.ts（跨天边界修正 + 相对时间，独立可测）。
 
 /** 删除当前已打开的会话（头部菜单 → 确认弹窗）。 */
 async function deleteCurrentThread(): Promise<boolean> {
@@ -1882,12 +1993,64 @@ async function deleteCurrentThread(): Promise<boolean> {
   return confirmed
 }
 
+// ---------- 用户活跃检测：自动删除不打扰正在手动操作的用户 ----------
+let lastUserActivityAt = 0
+let userActivityTracked = false
+
+function trackUserActivity(): void {
+  lastUserActivityAt = Date.now()
+}
+
+/**
+ * 用户最近是否有真实交互（点击/按键/滚轮/触摸）。
+ *
+ * 只认「刻意的输入事件」，不监听 mousemove（用户只是握着鼠标不动也会触发，
+ * 会把自动清理永久挡住）。会话托管轮内自动删除前检查：用户正在手动操作时
+ * 跳过本轮删除，宁可慢一轮也不抢用户正在看的会话。
+ */
+function userRecentlyActive(withinMs = 10_000): boolean {
+  if (!userActivityTracked) {
+    userActivityTracked = true
+    for (const ev of ['mousedown', 'keydown', 'wheel', 'touchstart'] as const) {
+      document.addEventListener(ev, trackUserActivity, { passive: true })
+    }
+  }
+  return Date.now() - lastUserActivityAt < withinMs
+}
+
+/** 读会话行 boss 对象里的完整时间戳（虚拟列表数据源带 lastTS，比文本解析准）。 */
+function readRowLastTS(li: HTMLElement): number | null {
+  const hosts = [
+    li.querySelector('.gray.last-msg'),
+    li.querySelector('.last-msg'),
+    li.querySelector('.friend-content'),
+    li,
+  ].filter(Boolean) as HTMLElement[]
+  for (const host of hosts) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const vm = (host as any).__vue__
+    if (!vm) continue
+    const boss = findBossObject(vm)
+    if (!boss?.obj) continue
+    for (const k of ['lastTS', 'lastMsgTime', 'lastMessageTime', 'lastTime', 'lastMsgTs']) {
+      const v = boss.obj[k]
+      const n = typeof v === 'number' ? v : typeof v === 'string' && v ? Number(v) : NaN
+      if (Number.isFinite(n) && n > 0) return n > 1e12 ? n : n * 1000
+    }
+  }
+  return null
+}
+
 /**
  * 清理目标会话（后端 plan 已判「最后一条是我方 + 超时」）：
  * - 先用列表行真实时间再次校验（BOSS 时间优先，DB 时间兜底），未超时跳过；
  * - 打开确认最后一条确实是「我方发送」（HR 长时间未回 → 流程结束可删）；
  *   若最后一条是 HR（DB 滞后），不删，留待回复流程处理。
  * 只打开计划命中的行，不再整列表逐个翻。
+ *
+ * 不打扰用户：删除前检查最近是否有手动操作；需要打开会话时直接切换「本行」
+ * （switchThreadViaVue(t.el)），不再用公司名文本匹配 —— 同公司多会话时
+ * 文本匹配可能打开另一条，既打扰用户又会删错。
  */
 async function maybeCleanupThread(
   cfg: PluginConfig,
@@ -1895,25 +2058,48 @@ async function maybeCleanupThread(
   log: (m: string) => void,
   dbLastMessageAt: number | null,
   opened = false,
+  planJobId = '',
 ): Promise<number> {
+  if (userRecentlyActive()) {
+    diag('CHAT', `清理跳过：用户正在手动操作（${t.company}）`)
+    log(`  ↳ 检测到用户正在操作，本轮不删除 ${t.company || t.name}`)
+    return 0
+  }
   const hours = Math.max(1, cfg.cleanReadAfterHours || 16)
   const agedMs = hours * 3600 * 1000
   const now = Date.now()
   let aged = false
   const timeEl = t.el.querySelector('span.time, .time')
-  if (timeEl) {
-    const age = parseThreadTimeMs((timeEl.textContent || '').trim(), now)
-    aged = age !== null && now - age >= agedMs
+  // 完整时间戳优先（虚拟列表 boss 对象的 lastTS），文本解析次之 ——
+  // 文本在跨天边界会失真（"HH:mm" 凌晨被当今天），宁可多留一轮。
+  let ageMs: number | null = null
+  const rowTs = readRowLastTS(t.el)
+  if (rowTs) ageMs = now - rowTs
+  if (ageMs === null || ageMs < 0) {
+    if (timeEl) {
+      const parsed = parseThreadTimeMs((timeEl.textContent || '').trim(), now)
+      if (parsed !== null && parsed <= now) ageMs = now - parsed
+    }
   }
-  if (!aged && dbLastMessageAt) {
+  aged = ageMs !== null && ageMs >= agedMs
+  // 行级精确时间戳拿到后就以 BOSS 时间为准，不再让滞后的 DB 时间触发删除：
+  // DB 是上次同步的快照，可能比 BOSS 旧得多，会让刚聊过的会话被误删。
+  if (ageMs === null && !aged && dbLastMessageAt) {
     aged = now - dbLastMessageAt * 1000 >= agedMs
   }
   if (!aged) return 0
 
   if (!opened) {
-    const ok = await openThread(t.company, t.jobTitle)
+    // 切「本行」而非按公司名文本匹配：文本匹配可能打开同公司的另一条会话
+    let ok = false
+    try {
+      if (!switchThreadViaVue(t.el)) realClick(t.el)
+      ok = true
+    } catch (e) {
+      diag('CHAT', `清理打开会话异常: ${(e as Error).message}`)
+    }
     await delay(250, 450)
-    if (ok !== 'ok') return 0
+    if (!ok) return 0
   }
   const messages = await readMessages()
   // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
@@ -1931,10 +2117,87 @@ async function maybeCleanupThread(
   })
   log(`  ↳ 删除已读超时会话：${t.company || t.name}`)
   if (await deleteCurrentThread()) {
-    afterConversationDeleted(t.company, t.jobTitle, 'aged_cleanup')
+    await afterConversationDeleted(t.company, t.jobTitle, 'aged_cleanup', {
+      encryptJobId: planJobId,
+    })
     return 1
   }
   return 0
+}
+
+/**
+ * 主动跟进（Phase 1）：我方最后发言后 HR 超时未回，后端在计划里下发 follow_up
+ * 目标（含文案）。这里打开会话 → 确认最后一条确实是我方 → 发送跟进文案 → 回报后端。
+ *
+ * 与清理同级别的守卫：用户正在手动操作时跳过；最后一条非我方（HR 已回）时跳过，
+ * 避免在 HR 已经回复的会话上重复打扰。
+ */
+async function processFollowUpThread(
+  cfg: PluginConfig,
+  t: ChatThread,
+  target: ChatPlanTarget,
+  log: (m: string) => void,
+  opened = false,
+): Promise<boolean> {
+  if (userRecentlyActive()) {
+    diag('CHAT', `跟进跳过：用户正在手动操作（${t.company}）`)
+    return false
+  }
+  const text = (target.follow_up_text || '').trim()
+  if (!text) return false
+
+  if (!opened) {
+    // 切「本行」而非按公司名文本匹配：同公司多会话时文本匹配可能打开另一条
+    try {
+      if (!switchThreadViaVue(t.el)) realClick(t.el)
+    } catch (e) {
+      diag('CHAT', `跟进打开会话异常: ${(e as Error).message}`)
+      return false
+    }
+    await delay(250, 450)
+  }
+  const threadId = currentThreadId()
+  const messages = await readMessages()
+  const last = messages[messages.length - 1]
+  if (!last || last.sender !== 'me') {
+    diag('CHAT', `跟进跳过（最后一条不是我方）: ${t.company}`)
+    return false
+  }
+  log(`  [${t.company}] 主动跟进: ${text}`)
+  const ok = await sendText(text, threadId)
+  if (ok) {
+    await reportChatFollowUp(cfg, {
+      platform: 'zhipin',
+      encrypt_job_id: target.encrypt_job_id || '',
+      company: t.company,
+      job_title: t.jobTitle,
+      content: text,
+      success: true,
+    })
+    await delay(800, 1600) // 会话间间隔
+    return true
+  }
+  return false
+}
+
+/** 策略删除当前已打开的会话：用户活跃守卫 + 删除 + 后端对账 + 面板刷新。 */
+async function strategyDeleteCurrent(
+  company: string,
+  jobTitle: string,
+  reason: string,
+  log: (m: string) => void,
+): Promise<boolean> {
+  if (userRecentlyActive()) {
+    diag('CHAT', `策略删除跳过：用户正在手动操作（${company}）`)
+    log(`  ↳ 检测到用户正在操作，本轮不删除 ${company || jobTitle}`)
+    return false
+  }
+  if (!(await deleteCurrentThread())) {
+    log('  ↳ 会话删除未确认（BOSS 端可能已无此会话）')
+    return false
+  }
+  await afterConversationDeleted(company, jobTitle, reason)
+  return true
 }
 
 /**
@@ -2029,6 +2292,22 @@ async function processOpenedThread(
     hasReply: !!res.reply,
     message: (res.message || '').slice(0, 80),
   })
+
+  // 结果回填（Phase 1）：意图明确时把 HR 侧动作回传后端（面试邀约 / 被拒），
+  // 供行为学习与推荐融合使用；失败静默，不影响主流程。
+  if (res.intent === 'interview_invite' || res.intent === 'rejection') {
+    await reportChatOutcome(cfg, {
+      run_id: opts.runId || '',
+      items: [{
+        encrypt_job_id: '',
+        company: company || t.company,
+        job_title: jobTitle || t.jobTitle,
+        outcome: res.intent === 'interview_invite' ? 'interview_invite' : 'rejected',
+        detail: res.intent,
+      }],
+    })
+  }
+
   let replied = 0
   let resumesSent = 0
   let cleaned = 0
@@ -2038,10 +2317,7 @@ async function processOpenedThread(
     // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
     if (res.delete_after_send) {
       log(`  ↳ 策略删除会话（${res.message || ''}）`)
-      if (await deleteCurrentThread()) {
-        cleaned++
-        afterConversationDeleted(company || t.company, jobTitle, 'low_quality')
-      }
+      if (await strategyDeleteCurrent(company || t.company, jobTitle, 'low_quality', log)) cleaned++
     }
     return { synced: 1, replied: 0, resumesSent: 0, cleaned }
   }
@@ -2067,12 +2343,7 @@ async function processOpenedThread(
     // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
     if (res.delete_after_send) {
       log(`  [${company || t.company}] 策略删除会话`)
-      if (await deleteCurrentThread()) {
-        cleaned++
-        afterConversationDeleted(company || t.company, jobTitle, 'rejection')
-      } else {
-        log('  ↳ 会话删除未确认（BOSS 端可能已无此会话）')
-      }
+      if (await strategyDeleteCurrent(company || t.company, jobTitle, 'rejection', log)) cleaned++
     }
   } else {
     log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
@@ -2131,13 +2402,17 @@ async function runChatRoundInner(
   // 1) 拿后端计划：哪些会话要回复 / 要清理。失败时降级为只处理未读行，
   //    绝不回退到「逐个打开全部会话」（2026-08-06 卡聊天页 14 分钟的根因）。
   const { pending: planPending, targets: planTargets } = await loadChatPlan(cfg, { replyScope })
+  // 补发上次网络失败遗留的「BOSS 端已删除」标记（自愈，避免死会话跨轮残留）
+  await flushConversationDeletedMarks(cfg)
   let planReply = 0
   let planCleanup = 0
+  let planFollowUp = 0
   for (const t of planTargets) {
     if (t.action === 'reply') planReply++
     else if (t.action === 'cleanup') planCleanup++
+    else if (t.action === 'follow_up') planFollowUp++
   }
-  diag('CHAT', `后端计划 pending=${planPending} reply=${planReply} cleanup=${planCleanup}`)
+  diag('CHAT', `后端计划 pending=${planPending} reply=${planReply} cleanup=${planCleanup} follow_up=${planFollowUp}`)
 
   if (mode === 'snapshot') {
     // 快照不再滚动整个列表数未读：待回复数以后端 DB 决策为准（DOM 未读兜底
@@ -2147,7 +2422,7 @@ async function runChatRoundInner(
     return { handled: 0, replied: 0, pending: planPending }
   }
 
-  log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup}，回复预算 ${maxThreads}）...`)
+  log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup} follow_up=${planFollowUp}，回复预算 ${maxThreads}）...`)
   let synced = 0
   let storeMode = false
 
@@ -2160,6 +2435,26 @@ async function runChatRoundInner(
   if (sources && sources.length > 0) {
     storeMode = true
     diag('CHAT', `零滚动数据源命中：${sources.length} 条（全量打开核对，前端实测为准）`)
+
+    // 全量列表在手：后端计划里有、BOSS 全量列表里完全没有的目标 → BOSS 端已删，
+    // 直接补标记（防止死会话残留 + 每轮重复寻找）。inbound 虚拟 jobId 用公司兜底。
+    const current0 = readChatSources()
+    if (current0) {
+      for (const p of planTargets) {
+        if (planTargetInSources(p, current0)) continue
+        diag('CHAT', '计划目标在 BOSS 全量列表中不存在，按已删除补标记', {
+          company: p.company,
+          job_title: p.job_title,
+          action: p.action,
+          encrypt_job_id: p.encrypt_job_id,
+        })
+        await afterConversationDeleted(p.company, p.job_title, 'boss_side_deleted', {
+          encryptJobId: p.encrypt_job_id,
+        })
+        cleaned++
+      }
+    }
+
     for (const item of sources) {
       if (replied >= maxThreads) break   // 回复预算：限制实际发送条数
       if (shouldAbortChatRound()) break
@@ -2192,7 +2487,13 @@ async function runChatRoundInner(
           skipped++
           continue
         }
-        cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at, true)
+        cleaned += await maybeCleanupThread(
+          cfg, t, log, target.last_message_at, true, target.encrypt_job_id,
+        )
+        continue
+      }
+      if (target?.action === 'follow_up' && !unread) {
+        if (await processFollowUpThread(cfg, t, target, log, true)) replied++
         continue
       }
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
@@ -2239,7 +2540,13 @@ async function runChatRoundInner(
         skipped++
         return 'ok'
       }
-      cleaned += await maybeCleanupThread(cfg, t, log, target.last_message_at, false)
+      cleaned += await maybeCleanupThread(
+        cfg, t, log, target.last_message_at, false, target.encrypt_job_id,
+      )
+      return 'ok'
+    }
+    if (target?.action === 'follow_up' && !t.unread) {
+      if (await processFollowUpThread(cfg, t, target, log, false)) replied++
       return 'ok'
     }
 

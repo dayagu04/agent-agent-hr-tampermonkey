@@ -60,6 +60,7 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     version: VERSION,
     phase,
     running,
+    visibility: document.visibilityState,
     applied_total: live?.stats.appliedTotal ?? snap?.appliedTotal ?? 0,
     replied_total: live?.stats.hrRepliesTotal ?? snap?.hrRepliesTotal ?? 0,
     send_resume_total: live?.stats.sendResumeTotal ?? snap?.sendResumeTotal ?? 0,
@@ -222,4 +223,16 @@ export function startRemoteLoop(intervalMs = 5000): void {
     void reportHeartbeatAndPoll()
   }, intervalMs)
   void reportHeartbeatAndPoll()
+
+  // 休眠唤醒恢复：浏览器后台标签页的定时器会被节流（可能 1 分钟才一跳），
+  // 切回标签页/获得焦点/bfcache 恢复时立即补一次心跳，网页端状态马上回连。
+  // 运行中的编排在冻结恢复后 JS 会自行继续，这里只补心跳、不重复 resume。
+  const onWake = (): void => {
+    if (document.visibilityState === 'visible') {
+      void reportHeartbeatAndPoll()
+    }
+  }
+  document.addEventListener('visibilitychange', onWake)
+  window.addEventListener('focus', onWake)
+  window.addEventListener('pageshow', onWake)
 }
