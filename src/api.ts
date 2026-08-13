@@ -271,8 +271,7 @@ export interface ChatPlanTarget {
   company: string
   job_title: string
   encrypt_job_id: string
-  action: 'reply' | 'cleanup' | 'follow_up'
-  follow_up_text?: string
+  action: 'reply' | 'cleanup'
   last_message_at: number | null
 }
 
@@ -471,39 +470,7 @@ export async function markChatSent(
   }
 }
 
-/** POST /api/plugin/chat/follow-up — 回报一次主动跟进的真实发送结果（Phase 1）。 */
-export async function reportChatFollowUp(
-  cfg: PluginConfig,
-  payload: {
-    platform?: string
-    encrypt_job_id?: string
-    company: string
-    job_title: string
-    content: string
-    success: boolean
-    run_id?: string
-  },
-): Promise<void> {
-  try {
-    await network.request({
-      method: 'POST',
-      url: `${cfg.apiBase}/api/plugin/chat/follow-up`,
-      headers: authHeaders(cfg),
-      data: JSON.stringify({
-        platform: payload.platform || 'zhipin',
-        encrypt_job_id: payload.encrypt_job_id || '',
-        company: payload.company,
-        job_title: payload.job_title,
-        content: payload.content,
-        success: payload.success,
-        run_id: payload.run_id || '',
-      }),
-      timeout: 20000,
-    })
-  } catch {
-    /* 留痕失败不影响会话继续 */
-  }
-}
+// reportChatFollowUp 已删除（2026-08-14）：主动跟进整体移除，后端端点同步下线。
 
 /** POST /api/plugin/chat/outcome — 批量上报会话的 HR 侧动作（结果回填，Phase 1）。 */
 export async function reportChatOutcome(

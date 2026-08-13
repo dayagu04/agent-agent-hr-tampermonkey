@@ -10,7 +10,6 @@ import type { PluginConfig } from '../types'
 import {
   markChatSent,
   reportChatAudit,
-  reportChatFollowUp,
   reportChatOutcome,
   syncChatOne,
 } from '../api'
@@ -2136,86 +2135,9 @@ async function maybeCleanupThread(
   return 0
 }
 
-/**
- * 主动跟进（Phase 1）：我方最后发言后 HR 超时未回，后端在计划里下发 follow_up
- * 目标（含文案）。这里打开会话 → 确认最后一条确实是我方 → 发送跟进文案 → 回报后端。
- *
- * 与清理同级别的守卫：用户正在手动操作时跳过；最后一条非我方（HR 已回）时跳过，
- * 避免在 HR 已经回复的会话上重复打扰。
- */
-async function processFollowUpThread(
-  cfg: PluginConfig,
-  t: ChatThread,
-  target: ChatPlanTarget,
-  log: (m: string) => void,
-  opened = false,
-): Promise<boolean> {
-  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
-    diag('CHAT', `跟进跳过：用户正在手动操作（${t.company}）`)
-    return false
-  }
-  const text = (target.follow_up_text || '').trim()
-  if (!text) return false
-
-  if (!opened) {
-    // 切「本行」而非按公司名文本匹配：同公司多会话时文本匹配可能打开另一条
-    try {
-      if (!switchThreadViaVue(t.el)) realClick(t.el)
-    } catch (e) {
-      diag('CHAT', `跟进打开会话异常: ${(e as Error).message}`)
-      return false
-    }
-    await delay(250, 450)
-  }
-  const threadId = currentThreadId()
-  const messages = await readMessages()
-  const last = messages[messages.length - 1]
-  if (!last || last.sender !== 'me') {
-    diag('CHAT', `跟进跳过（最后一条不是我方）: ${t.company}`)
-    return false
-  }
-  // 先把本轮读到的消息同步到后端（嵌入用户手动对话历史 + 意图分类），
-  // auto_reply=false 只落库不生成回复；再发跟进，保证上下文完整。
-  const info = currentThreadInfo()
-  try {
-    await syncChatOne(cfg, {
-      platform: 'zhipin',
-      platform_job_id: target.encrypt_job_id || '',
-      company: t.company,
-      job_title: t.jobTitle,
-      messages: messages
-        .filter((m) => m.sender !== 'system')
-        .map((m) => ({
-          sender: m.sender === 'hr' ? 'hr' : 'me',
-          content: m.content,
-          timestamp: '',
-        })),
-      auto_reply: false,
-      min_reply_score: 0,
-      salary: info.salary || '',
-      city: info.city || '',
-      run_id: '',
-      reply_scope: 'all',
-    })
-  } catch {
-    diag('CHAT', `跟进前同步消息失败（不阻断发送）: ${t.company}`)
-  }
-  log(`  [${t.company}] 主动跟进: ${text}`)
-  const ok = await sendText(text, threadId)
-  if (ok) {
-    await reportChatFollowUp(cfg, {
-      platform: 'zhipin',
-      encrypt_job_id: target.encrypt_job_id || '',
-      company: t.company,
-      job_title: t.jobTitle,
-      content: text,
-      success: true,
-    })
-    await delay(800, 1600) // 会话间间隔
-    return true
-  }
-  return false
-}
+// processFollowUpThread 已删除（2026-08-14）：主动跟进整体移除。
+// HR 已读不回本身就是答案，追问「岗位还在招吗」拿不到信息且构成骚扰；
+// 后端不再下发 follow_up 目标，此函数无调用方。
 
 /** 策略删除当前已打开的会话：用户活跃守卫 + 删除 + 后端对账 + 面板刷新。
  *
@@ -2465,13 +2387,11 @@ async function runChatRoundInner(
   await flushConversationDeletedMarks(cfg)
   let planReply = 0
   let planCleanup = 0
-  let planFollowUp = 0
   for (const t of planTargets) {
     if (t.action === 'reply') planReply++
     else if (t.action === 'cleanup') planCleanup++
-    else if (t.action === 'follow_up') planFollowUp++
   }
-  diag('CHAT', `后端计划 pending=${planPending} reply=${planReply} cleanup=${planCleanup} follow_up=${planFollowUp}`)
+  diag('CHAT', `后端计划 pending=${planPending} reply=${planReply} cleanup=${planCleanup}`)
 
   if (mode === 'snapshot') {
     // 快照不再滚动整个列表数未读：待回复数以后端 DB 决策为准（DOM 未读兜底
@@ -2481,7 +2401,7 @@ async function runChatRoundInner(
     return { handled: 0, replied: 0, pending: planPending }
   }
 
-  log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup} follow_up=${planFollowUp}，回复预算 ${maxThreads}）...`)
+  log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup}，回复预算 ${maxThreads}）...`)
   let synced = 0
   let storeMode = false
 
@@ -2562,10 +2482,6 @@ async function runChatRoundInner(
         )
         continue
       }
-      if (target?.action === 'follow_up' && !unread) {
-        if (await processFollowUpThread(cfg, t, target, log, true)) replied++
-        continue
-      }
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
       synced += r.synced
       replied += r.replied
@@ -2615,11 +2531,6 @@ async function runChatRoundInner(
       )
       return 'ok'
     }
-    if (target?.action === 'follow_up' && !t.unread) {
-      if (await processFollowUpThread(cfg, t, target, log, false)) replied++
-      return 'ok'
-    }
-
     // 计划命中 reply 或未读兜底 → 打开并走完整回复流程
     const r = await processReplyThread(cfg, t, seq, log, { runId: opts.runId }, replyScope)
     synced += r.synced
