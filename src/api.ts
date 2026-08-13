@@ -582,6 +582,7 @@ export async function recordApplication(
   error = '',
   greetingSent = false,
   runId = '',
+  keyword = '',
 ): Promise<{ success: boolean; duplicate: boolean; message: string }> {
   const payload = {
     platform,
@@ -598,6 +599,7 @@ export async function recordApplication(
     error,
     greeting_sent: greetingSent,
     run_id: runId || null,
+    keyword,
   }
   const resp = await network.request({
     method: 'POST',

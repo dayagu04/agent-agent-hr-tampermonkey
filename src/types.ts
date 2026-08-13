@@ -100,6 +100,9 @@ export interface PluginConfig {
    */
   cleanReadConversations: boolean
   cleanReadAfterHours: number
+  /** 清理/跟进前的「用户正在操作」守卫窗口（秒）。默认 3：挂机时偶尔滚动/点击
+   *  不至于整轮删除全部被挡；仍能在用户连续操作时保护会话。 */
+  cleanupGuardSeconds?: number
   /** 默认发送的简历 ID（网页端可设置；null=用 BOSS 弹窗默认第一份） */
   defaultSendResumeId: number | null
   /** 简历 id → 名称（从 /api/plugin/config 同步，简历选择弹窗里按名字匹配） */

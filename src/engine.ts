@@ -411,6 +411,7 @@ export class ApplyEngine {
             await recordApplication(
               this.config, this.platform.code, job, score,
               'applied', message, false, this.orchestratorRunId,
+              new URLSearchParams(location.search).get('query') || '',
             )
           } catch (e) {
             log(`  ↳ 记账失败: ${(e as Error).message}`)
@@ -441,6 +442,7 @@ export class ApplyEngine {
           const rec = await recordApplication(
             this.config, this.platform.code, job, score, outcome, message, greetingSent,
             this.orchestratorRunId,
+            new URLSearchParams(location.search).get('query') || '',
           )
           if (rec.duplicate) log(`  ↳ 该岗位之前已投递过`)
         } catch (e) {

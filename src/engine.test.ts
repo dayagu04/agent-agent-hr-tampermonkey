@@ -115,6 +115,7 @@ describe('ApplyEngine 投递结果口径', () => {
       expect.any(String),
       false,
       'run-test',
+      '',
     )
   })
 
@@ -132,6 +133,7 @@ describe('ApplyEngine 投递结果口径', () => {
     expect(recordApplication).toHaveBeenCalledWith(
       expect.anything(), 'zhipin', expect.anything(), expect.any(Number),
       'unknown', expect.any(String), false, 'run-test',
+      '',
     )
   })
 

@@ -1,7 +1,7 @@
 // 网页端远程管理：心跳上报 + 命令轮询执行
 //
 // 设计：网页端「我的助手」是插件的远程管理台（二者共用同一套后端）。
-// - 插件每 5s 向后端 POST 一次心跳（平台/版本/阶段/统计），
+// - 插件每 1s 向后端 POST 一次心跳（平台/版本/阶段/统计），
 //   顺手取回网页端入队的远程命令并执行；
 // - 网页端通过 /api/plugin/commands 入队 orchestrator.* 命令，
 //   插件下次心跳时消费，实现「网页控制插件」。
@@ -216,9 +216,10 @@ async function executeCommand(
 }
 
 /** 启动远程管理循环（心跳 + 命令轮询），页面挂载后调用一次 */
-// 心跳间隔即"网页端指令生效延迟"上限：5s 一跳，指令最坏 5s 内执行。
-// 如需更快可下调，但注意 POST 频率与后端日志量成正比。
-export function startRemoteLoop(intervalMs = 5000): void {
+// 心跳间隔即"网页端指令生效延迟"上限：1s 一跳，指令最坏 1s 内执行。
+// 后端 heartbeat 端点是纯内存操作（无 DB 写），1s 频率无数据库风险；
+// 访问日志已对 heartbeat/status/config 降噪（server/main.py），日志量可控。
+export function startRemoteLoop(intervalMs = 1000): void {
   window.setInterval(() => {
     void reportHeartbeatAndPoll()
   }, intervalMs)

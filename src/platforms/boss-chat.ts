@@ -2060,7 +2060,7 @@ async function maybeCleanupThread(
   opened = false,
   planJobId = '',
 ): Promise<number> {
-  if (userRecentlyActive()) {
+  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
     diag('CHAT', `清理跳过：用户正在手动操作（${t.company}）`)
     log(`  ↳ 检测到用户正在操作，本轮不删除 ${t.company || t.name}`)
     return 0
@@ -2139,7 +2139,7 @@ async function processFollowUpThread(
   log: (m: string) => void,
   opened = false,
 ): Promise<boolean> {
-  if (userRecentlyActive()) {
+  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
     diag('CHAT', `跟进跳过：用户正在手动操作（${t.company}）`)
     return false
   }
@@ -2162,6 +2162,32 @@ async function processFollowUpThread(
   if (!last || last.sender !== 'me') {
     diag('CHAT', `跟进跳过（最后一条不是我方）: ${t.company}`)
     return false
+  }
+  // 先把本轮读到的消息同步到后端（嵌入用户手动对话历史 + 意图分类），
+  // auto_reply=false 只落库不生成回复；再发跟进，保证上下文完整。
+  const info = currentThreadInfo()
+  try {
+    await syncChatOne(cfg, {
+      platform: 'zhipin',
+      platform_job_id: target.encrypt_job_id || '',
+      company: t.company,
+      job_title: t.jobTitle,
+      messages: messages
+        .filter((m) => m.sender !== 'system')
+        .map((m) => ({
+          sender: m.sender === 'hr' ? 'hr' : 'me',
+          content: m.content,
+          timestamp: '',
+        })),
+      auto_reply: false,
+      min_reply_score: 0,
+      salary: info.salary || '',
+      city: info.city || '',
+      run_id: '',
+      reply_scope: 'all',
+    })
+  } catch {
+    diag('CHAT', `跟进前同步消息失败（不阻断发送）: ${t.company}`)
   }
   log(`  [${t.company}] 主动跟进: ${text}`)
   const ok = await sendText(text, threadId)
@@ -2322,13 +2348,27 @@ async function processOpenedThread(
     return { synced: 1, replied: 0, resumesSent: 0, cleaned }
   }
 
+  // 简历卡优先处理（2026-08-11 实测修复）：
+  // BOSS 索要简历用「同意/拒绝」卡片。若先发文字，卡片下方出现我方消息，
+  // isCardAnswered 会把卡片误判为「已答过」而跳过 → 简历永远发不出去。
+  // 因此先点卡片发简历，再发文字回复。
+  let resumeCardHandled = false
+  if (res.send_resume) {
+    const resumeCard = findPendingCards().find((c) => c.kind === 'resume_request')
+    if (resumeCard) {
+      resumeCardHandled = await handleCard(resumeCard, cfg, threadId, log)
+    }
+  }
+
   // 发送回复（当前会话已打开，直接发，无需重开）
   log(`  [${company || t.company}] 回复: ${res.reply}`)
   const ok = await sendText(res.reply, threadId)
   if (ok) {
     replied++
     if (res.send_resume) {
-      const resumeOk = await sendResume()
+      // 卡片路径已发简历则跳过；否则退回输入区「发简历」按钮路径
+      let resumeOk = resumeCardHandled
+      if (!resumeOk) resumeOk = await sendResume()
       if (!resumeOk) log('  ↳ 简历未发出，需手动处理')
       else resumesSent++
       // 简历未发出时不得标记 sent：否则后端统计会把「文本已发、简历没发」
@@ -2352,8 +2392,10 @@ async function processOpenedThread(
     }
   }
 
-  // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）
+  // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
+  // 简历卡已在上方优先处理，这里只处理其余卡片（联系方式仍不自动点）。
   for (const card of findPendingCards()) {
+    if (card.kind === 'resume_request') continue
     await handleCard(card, cfg, threadId, log)
   }
 
@@ -2494,6 +2536,14 @@ async function runChatRoundInner(
       }
       if (target?.action === 'follow_up' && !unread) {
         if (await processFollowUpThread(cfg, t, target, log, true)) replied++
+        continue
+      }
+      // 计划未命中且行无未读 → 跳过，不打开（与滚动路径一致）。
+      // 2026-08-11 实测：零滚动全量打开会让每轮把 150+ 个老会话逐个
+      // 打开读取，一轮光扫描就几分钟；HR 新消息会置未读、计划也覆盖
+      // 已回复目标，跳过不会漏掉真实待回复。
+      if (!target && !unread) {
+        skipped++
         continue
       }
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)

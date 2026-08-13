@@ -31,6 +31,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   maxRepliesPerRound: 10,
   cleanReadConversations: true,
   cleanReadAfterHours: 16,
+  cleanupGuardSeconds: 3,
   defaultSendResumeId: null,
   resumeNames: {},
   qualityJudge: true,
