@@ -273,9 +273,9 @@ export interface ChatPlanTarget {
   encrypt_job_id: string
   action: 'reply' | 'cleanup'
   last_message_at: number | null
-  /** 后端已判「明确终结」（HR 收尾语/纯通知/已被拒，有意图分类背书）。
-   *  true 时清理不再要求「最后一条是我方」—— 否则 HR 收尾结尾的会话删不掉。 */
-  terminal?: boolean
+  /** 后端给出的决策依据（aged_no_reply / hr_closed / rejected / low_quality）。
+   *  插件只用于日志与删除对账，不据此改变行为 —— 业务判断已在后端完成。 */
+  reason?: string
 }
 
 export interface ChatPlan {

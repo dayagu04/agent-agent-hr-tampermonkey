@@ -23,7 +23,6 @@ import {
 import { loadConfig } from '../config'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
-import { parseThreadTimeMs } from './boss-time'
 import {
   clickDeleteInHeaderMenu,
   confirmDeleteDialog,
@@ -2052,23 +2051,24 @@ function readRowLastTS(li: HTMLElement): number | null {
 }
 
 /**
- * 清理目标会话（后端 plan 判定的清理目标）：
- * - 先用列表行真实时间再次校验（BOSS 时间优先，DB 时间兜底），未超时跳过；
- * - terminal=false（后端仅凭超时推断）：打开确认最后一条确实是「我方发送」，
- *   若最后一条是 HR（可能 DB 滞后、HR 刚回了新消息），不删，留给回复流程；
- * - terminal=true（后端已判明确终结：HR 收尾语/纯通知/已被拒，有 LLM 意图
- *   分类背书）：直接删，不做上述校验。
+ * 执行后端下发的清理目标。
  *
- *   为什么要区分（2026-08-13 实测）：原实现一律要求「最后一条是我方」，
- *   而 HR 说完「好的，我这边先筛选一下」就没下文时最后一条是 HR，
- *   于是这类会话永远删不掉 —— 285 个会话里 279 个卡在这条规则上，
- *   后端明明已标 status=ended 并下发了 cleanup。
+ * 职责边界（2026-08-14 解耦）：**业务判断全部在后端**，本函数只做两件
+ * 后端无法做的执行前校验 ——
  *
- * 只打开计划命中的行，不再整列表逐个翻。
+ *   1. 数据新鲜度：后端的判断基于 DB（插件上一轮同步的快照）。从下发计划
+ *      到此刻执行之间，HR 可能又发了新消息，后端无从得知。这里比对列表行
+ *      的真实时间戳与 target.last_message_at：行时间更新则说明快照已过时，
+ *      本轮跳过，等下一轮后端拿到新消息重新决策。
+ *   2. 用户活跃：用户正在手动操作时不抢他正在看的会话。
  *
- * 不打扰用户：删除前检查最近是否有手动操作；需要打开会话时直接切换「本行」
- * （switchThreadViaVue(t.el)），不再用公司名文本匹配 —— 同公司多会话时
- * 文本匹配可能打开另一条，既打扰用户又会删错。
+ * 这两条都不含业务语义（不判断 HR 说了什么、该不该删）。
+ *
+ * 此前这里有一道「最后一条必须是我方」的校验 —— 那是业务判断，放在插件端
+ * 会推翻后端结论：HR 说完「好的，我这边先筛选一下」就没下文时最后一条是 HR，
+ * 于是这类会话永远删不掉（实测 285 个会话 279 个卡在该规则，后端明明已判
+ * status=ended 并下发 cleanup）。它已被上面的新鲜度校验取代 —— 后者能覆盖
+ * 原本要防的「HR 刚回了新消息」，且不会误伤 HR 收尾的会话。
  */
 async function maybeCleanupThread(
   cfg: PluginConfig,
@@ -2077,36 +2077,28 @@ async function maybeCleanupThread(
   dbLastMessageAt: number | null,
   opened = false,
   planJobId = '',
-  terminal = false,
+  reason = 'aged_no_reply',
 ): Promise<number> {
   if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
     diag('CHAT', `清理跳过：用户正在手动操作（${t.company}）`)
     log(`  ↳ 检测到用户正在操作，本轮不删除 ${t.company || t.name}`)
     return 0
   }
-  const hours = Math.max(1, cfg.cleanReadAfterHours || 16)
-  const agedMs = hours * 3600 * 1000
-  const now = Date.now()
-  let aged = false
-  const timeEl = t.el.querySelector('span.time, .time')
-  // 完整时间戳优先（虚拟列表 boss 对象的 lastTS），文本解析次之 ——
-  // 文本在跨天边界会失真（"HH:mm" 凌晨被当今天），宁可多留一轮。
-  let ageMs: number | null = null
+
+  // 数据新鲜度校验：行时间戳晚于后端决策依据 → DB 快照已过时，本轮不删。
+  // 容差 60s：BOSS 行时间与 DB 落库时间本身有秒级偏差，不算「新消息」。
   const rowTs = readRowLastTS(t.el)
-  if (rowTs) ageMs = now - rowTs
-  if (ageMs === null || ageMs < 0) {
-    if (timeEl) {
-      const parsed = parseThreadTimeMs((timeEl.textContent || '').trim(), now)
-      if (parsed !== null && parsed <= now) ageMs = now - parsed
+  if (rowTs && dbLastMessageAt) {
+    const driftMs = rowTs - dbLastMessageAt * 1000
+    if (driftMs > 60_000) {
+      diag('CHAT', `清理跳过：列表行有更新的消息（后端快照已过时）`, {
+        company: t.company,
+        driftSeconds: Math.round(driftMs / 1000),
+      })
+      log(`  ↳ ${t.company || t.name} 有新消息，本轮不删除（等后端重新判定）`)
+      return 0
     }
   }
-  aged = ageMs !== null && ageMs >= agedMs
-  // 行级精确时间戳拿到后就以 BOSS 时间为准，不再让滞后的 DB 时间触发删除：
-  // DB 是上次同步的快照，可能比 BOSS 旧得多，会让刚聊过的会话被误删。
-  if (ageMs === null && !aged && dbLastMessageAt) {
-    aged = now - dbLastMessageAt * 1000 >= agedMs
-  }
-  if (!aged) return 0
 
   if (!opened) {
     // 切「本行」而非按公司名文本匹配：文本匹配可能打开同公司的另一条会话
@@ -2120,27 +2112,16 @@ async function maybeCleanupThread(
     await delay(250, 450)
     if (!ok) return 0
   }
-  const messages = await readMessages()
   // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
-  logChatHistory(t, messages)
-  const last = messages[messages.length - 1]
-  // 「最后一条必须是我方」只在后端仅凭超时推断时作为防误删的兜底。
-  // 后端已判明确终结（terminal）时信任其结论 —— 否则 HR 收尾语结尾的
-  // 会话永远删不掉（见函数顶部注释的实测数据）。
-  if (!terminal && (!last || last.sender !== 'me')) {
-    diag('CHAT', `清理候选 ${t.company} 最后一条非我方且后端未判终结，跳过删除`)
-    return 0
-  }
-  diag('CHAT', `清理超时会话`, {
+  logChatHistory(t, await readMessages())
+  diag('CHAT', `清理会话`, {
     company: t.company,
     jobTitle: t.jobTitle,
-    terminal,
-    timeText: (timeEl?.textContent || '').trim(),
-    lastMsg: (last?.content || '').slice(0, 30),
+    reason,
   })
-  log(`  ↳ 删除已读超时会话：${t.company || t.name}`)
+  log(`  ↳ 删除会话：${t.company || t.name}（${reason}）`)
   if (await deleteCurrentThread()) {
-    await afterConversationDeleted(t.company, t.jobTitle, 'aged_cleanup', {
+    await afterConversationDeleted(t.company, t.jobTitle, reason, {
       encryptJobId: planJobId,
     })
     return 1
@@ -2492,7 +2473,7 @@ async function runChatRoundInner(
         }
         cleaned += await maybeCleanupThread(
           cfg, t, log, target.last_message_at, true, target.encrypt_job_id,
-          target.terminal === true,
+          target.reason || 'aged_no_reply',
         )
         continue
       }
@@ -2542,7 +2523,7 @@ async function runChatRoundInner(
       }
       cleaned += await maybeCleanupThread(
         cfg, t, log, target.last_message_at, false, target.encrypt_job_id,
-        target.terminal === true,
+        target.reason || 'aged_no_reply',
       )
       return 'ok'
     }
