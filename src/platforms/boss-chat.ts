@@ -2052,10 +2052,18 @@ function readRowLastTS(li: HTMLElement): number | null {
 }
 
 /**
- * 清理目标会话（后端 plan 已判「最后一条是我方 + 超时」）：
+ * 清理目标会话（后端 plan 判定的清理目标）：
  * - 先用列表行真实时间再次校验（BOSS 时间优先，DB 时间兜底），未超时跳过；
- * - 打开确认最后一条确实是「我方发送」（HR 长时间未回 → 流程结束可删）；
- *   若最后一条是 HR（DB 滞后），不删，留待回复流程处理。
+ * - terminal=false（后端仅凭超时推断）：打开确认最后一条确实是「我方发送」，
+ *   若最后一条是 HR（可能 DB 滞后、HR 刚回了新消息），不删，留给回复流程；
+ * - terminal=true（后端已判明确终结：HR 收尾语/纯通知/已被拒，有 LLM 意图
+ *   分类背书）：直接删，不做上述校验。
+ *
+ *   为什么要区分（2026-08-13 实测）：原实现一律要求「最后一条是我方」，
+ *   而 HR 说完「好的，我这边先筛选一下」就没下文时最后一条是 HR，
+ *   于是这类会话永远删不掉 —— 285 个会话里 279 个卡在这条规则上，
+ *   后端明明已标 status=ended 并下发了 cleanup。
+ *
  * 只打开计划命中的行，不再整列表逐个翻。
  *
  * 不打扰用户：删除前检查最近是否有手动操作；需要打开会话时直接切换「本行」
@@ -2069,6 +2077,7 @@ async function maybeCleanupThread(
   dbLastMessageAt: number | null,
   opened = false,
   planJobId = '',
+  terminal = false,
 ): Promise<number> {
   if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
     diag('CHAT', `清理跳过：用户正在手动操作（${t.company}）`)
@@ -2115,15 +2124,19 @@ async function maybeCleanupThread(
   // 记录对话历史：删除是策略终点，保留删除前的完整会话供回溯
   logChatHistory(t, messages)
   const last = messages[messages.length - 1]
-  if (!last || last.sender !== 'me') {
-    diag('CHAT', `清理候选 ${t.company} 最后一条非我方，跳过删除`)
+  // 「最后一条必须是我方」只在后端仅凭超时推断时作为防误删的兜底。
+  // 后端已判明确终结（terminal）时信任其结论 —— 否则 HR 收尾语结尾的
+  // 会话永远删不掉（见函数顶部注释的实测数据）。
+  if (!terminal && (!last || last.sender !== 'me')) {
+    diag('CHAT', `清理候选 ${t.company} 最后一条非我方且后端未判终结，跳过删除`)
     return 0
   }
-  diag('CHAT', `清理已读超时未回会话`, {
+  diag('CHAT', `清理超时会话`, {
     company: t.company,
     jobTitle: t.jobTitle,
+    terminal,
     timeText: (timeEl?.textContent || '').trim(),
-    lastMsg: (last.content || '').slice(0, 30),
+    lastMsg: (last?.content || '').slice(0, 30),
   })
   log(`  ↳ 删除已读超时会话：${t.company || t.name}`)
   if (await deleteCurrentThread()) {
@@ -2479,6 +2492,7 @@ async function runChatRoundInner(
         }
         cleaned += await maybeCleanupThread(
           cfg, t, log, target.last_message_at, true, target.encrypt_job_id,
+          target.terminal === true,
         )
         continue
       }
@@ -2528,6 +2542,7 @@ async function runChatRoundInner(
       }
       cleaned += await maybeCleanupThread(
         cfg, t, log, target.last_message_at, false, target.encrypt_job_id,
+        target.terminal === true,
       )
       return 'ok'
     }

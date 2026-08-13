@@ -273,6 +273,9 @@ export interface ChatPlanTarget {
   encrypt_job_id: string
   action: 'reply' | 'cleanup'
   last_message_at: number | null
+  /** 后端已判「明确终结」（HR 收尾语/纯通知/已被拒，有意图分类背书）。
+   *  true 时清理不再要求「最后一条是我方」—— 否则 HR 收尾结尾的会话删不掉。 */
+  terminal?: boolean
 }
 
 export interface ChatPlan {
