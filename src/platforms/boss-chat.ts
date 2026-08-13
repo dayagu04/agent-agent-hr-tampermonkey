@@ -1997,16 +1997,27 @@ async function deleteCurrentThread(): Promise<boolean> {
 let lastUserActivityAt = 0
 let userActivityTracked = false
 
-function trackUserActivity(): void {
+function trackUserActivity(e: Event): void {
+  // 只认浏览器派发的真实用户事件。
+  //
+  // 修复（2026-08-14）：插件自己切会话走 realClick() 派发合成 mousedown，
+  // 而本函数监听的正是 mousedown —— 于是插件把自己标记成「用户正在操作」，
+  // 之后 10s 窗口内每一条删除都被守卫挡掉（实测整轮 cleaned=0，日志刷
+  // 「检测到用户正在操作，本轮不删除 …」）。合成事件 isTrusted=false，
+  // 据此过滤即可区分「真人操作」与「插件自动化」。
+  if (!e.isTrusted) return
   lastUserActivityAt = Date.now()
 }
 
 /**
  * 用户最近是否有真实交互（点击/按键/滚轮/触摸）。
  *
- * 只认「刻意的输入事件」，不监听 mousemove（用户只是握着鼠标不动也会触发，
- * 会把自动清理永久挡住）。会话托管轮内自动删除前检查：用户正在手动操作时
- * 跳过本轮删除，宁可慢一轮也不抢用户正在看的会话。
+ * 只认「刻意的、且由真人触发的输入事件」：
+ * - 不监听 mousemove（握着鼠标不动也会触发，会把自动清理永久挡住）；
+ * - 不认 isTrusted=false 的合成事件（插件自身的 realClick，见 trackUserActivity）。
+ *
+ * 会话托管轮内自动删除前检查：用户正在手动操作时跳过本轮删除，
+ * 宁可慢一轮也不抢用户正在看的会话。
  */
 function userRecentlyActive(withinMs = 10_000): boolean {
   if (!userActivityTracked) {
@@ -2206,14 +2217,20 @@ async function processFollowUpThread(
   return false
 }
 
-/** 策略删除当前已打开的会话：用户活跃守卫 + 删除 + 后端对账 + 面板刷新。 */
+/** 策略删除当前已打开的会话：用户活跃守卫 + 删除 + 后端对账 + 面板刷新。
+ *
+ * 守卫窗口取 cfg.cleanupGuardSeconds（默认 3s），与 maybeCleanupThread /
+ * processFollowUpThread 一致。此前这里漏传参数、退化成默认 10s，
+ * 是删除被过度拦截的次要原因（主因见 trackUserActivity 的合成事件过滤）。
+ */
 async function strategyDeleteCurrent(
+  cfg: PluginConfig,
   company: string,
   jobTitle: string,
   reason: string,
   log: (m: string) => void,
 ): Promise<boolean> {
-  if (userRecentlyActive()) {
+  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
     diag('CHAT', `策略删除跳过：用户正在手动操作（${company}）`)
     log(`  ↳ 检测到用户正在操作，本轮不删除 ${company || jobTitle}`)
     return false
@@ -2343,7 +2360,7 @@ async function processOpenedThread(
     // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
     if (res.delete_after_send) {
       log(`  ↳ 策略删除会话（${res.message || ''}）`)
-      if (await strategyDeleteCurrent(company || t.company, jobTitle, 'low_quality', log)) cleaned++
+      if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'low_quality', log)) cleaned++
     }
     return { synced: 1, replied: 0, resumesSent: 0, cleaned }
   }
@@ -2383,7 +2400,7 @@ async function processOpenedThread(
     // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
     if (res.delete_after_send) {
       log(`  [${company || t.company}] 策略删除会话`)
-      if (await strategyDeleteCurrent(company || t.company, jobTitle, 'rejection', log)) cleaned++
+      if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'rejection', log)) cleaned++
     }
   } else {
     log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
@@ -2519,6 +2536,17 @@ async function runChatRoundInner(
         const loose = findPlanTarget(planTargets, bossRowInfo(boss), { lenient: true })
         if (loose?.action === 'reply') target = loose
       }
+      // 计划未命中且行无未读 → 跳过，且**不打开**会话。
+      //
+      // 修复（2026-08-14）：此前这个判断写在 openThreadByIndex 之后，
+      // 于是每轮把全部会话逐个打开、再跳过绝大多数（实测 handled=100
+      // / skipped=79，一轮几分钟且常中途结束）。判断只依赖列表数据源里的
+      // unreadCount 与后端计划，无需打开会话即可完成 —— 移到打开之前。
+      // HR 新消息会置未读、计划也覆盖已回复目标，跳过不会漏真实待回复。
+      if (!target && !unread) {
+        skipped++
+        continue
+      }
       const t = await openThreadByIndex(live.index)
       if (!t) {
         diag('CHAT', `索引跳转失败 idx=${live.index} ${boss.brandName || boss.name}`)
@@ -2536,14 +2564,6 @@ async function runChatRoundInner(
       }
       if (target?.action === 'follow_up' && !unread) {
         if (await processFollowUpThread(cfg, t, target, log, true)) replied++
-        continue
-      }
-      // 计划未命中且行无未读 → 跳过，不打开（与滚动路径一致）。
-      // 2026-08-11 实测：零滚动全量打开会让每轮把 150+ 个老会话逐个
-      // 打开读取，一轮光扫描就几分钟；HR 新消息会置未读、计划也覆盖
-      // 已回复目标，跳过不会漏掉真实待回复。
-      if (!target && !unread) {
-        skipped++
         continue
       }
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
