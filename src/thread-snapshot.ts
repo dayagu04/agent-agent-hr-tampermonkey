@@ -7,6 +7,8 @@
 import type { PluginConfig } from './types'
 import { diag } from './logger'
 import { reportThreadSnapshot } from './api'
+import { readRowLastTS, readRowJobInfo } from './platforms/boss-chat'
+import { chatRowKey } from './chat-plan'
 
 const THREAD_SELECTORS = [
   '.geek-item',
@@ -31,6 +33,8 @@ export interface ThreadRowSnapshot {
   unread: boolean
   timeText: string
   lastMsgPreview: string
+  /** 精确时间戳（epoch 毫秒），后端据此判超时；timeText 只是展示用 */
+  lastTS: number | null
   /** 行内所有短文本叶子节点（含 class/attr），用于盘点「送达/已读」等标签的载体 */
   leafTexts: LeafTextNode[]
   rowText: string
@@ -98,11 +102,21 @@ function readRow(row: HTMLElement): ThreadRowSnapshot | null {
   const timeText = (row.querySelector('span.time, .time')?.textContent || '').trim()
   const lastMsgPreview = (row.querySelector('.last-msg, .gray.last-msg, .friend-content, .text')?.textContent || '')
     .replace(/\s+/g, ' ').trim().slice(0, 60)
-  const key = `${name}|${company}|${jobTitle}`
+  const keyBase = readRowJobInfo(row)
+  // 会话 key 统一走 chatRowKey（与回复/清理侧 chatTargetKey 同格式），
+  // jobId 优先、退化为 公司|岗位 文本 —— 修复对账 to_delete 因格式不一致永不匹配的问题。
+  const key = chatRowKey({
+    encryptJobId: keyBase.jobId,
+    company: keyBase.brandName,
+    jobTitle: keyBase.title,
+  })
+  if (!key || key === 'text:|') return null
   if (!name && !company && !jobTitle) return null
 
   const rowText = (row.textContent || '').replace(/\s+/g, ' ').trim()
   const leaves = leafTextsOf(row)
+  // 读取精确时间戳（epoch 毫秒）—— 后端据此判超时，timeText 只是展示用
+  const lastTS = readRowLastTS(row) || null
   return {
     key,
     name,
@@ -111,6 +125,7 @@ function readRow(row: HTMLElement): ThreadRowSnapshot | null {
     unread,
     timeText,
     lastMsgPreview,
+    lastTS,
     leafTexts: leaves,
     rowText: rowText.slice(0, 200),
     dom: domDigest(row),

@@ -641,3 +641,30 @@ export async function reportThreadSnapshot(
     diag('API', `chat/snapshot 上报异常: ${(e as Error).message}`)
   }
 }
+
+/** POST /api/plugin/chat/reconcile — 对账：上报实际会话列表，返回该删除的 key */
+export async function reconcileThreads(
+  cfg: PluginConfig,
+  payload: {
+    threads: Array<{
+      key: string
+      company: string
+      job_title: string
+      unread: boolean
+      last_ts: number | null
+      last_msg_preview: string
+    }>
+  },
+): Promise<{ to_delete: string[]; reconciled: number; created: number; marked_deleted: number }> {
+  const resp = await network.request({
+    method: 'POST',
+    url: `${cfg.apiBase}/api/plugin/chat/reconcile`,
+    headers: authHeaders(cfg),
+    data: JSON.stringify(payload),
+    timeout: 60000,
+  })
+  if (resp.status !== 200) {
+    throw new Error(`reconcile HTTP ${resp.status}: ${(resp.responseText || '').slice(0, 200)}`)
+  }
+  return JSON.parse(resp.responseText)
+}

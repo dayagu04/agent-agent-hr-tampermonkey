@@ -12,9 +12,11 @@ import {
   reportChatAudit,
   reportChatOutcome,
   syncChatOne,
+  reconcileThreads,
 } from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
 import type { ChatPlanTarget } from '../chat-plan'
+import { collectThreadSnapshot } from '../thread-snapshot'
 import {
   flushConversationDeletedMarks,
   queueConversationDeletedMark,
@@ -1995,6 +1997,11 @@ async function deleteCurrentThread(): Promise<boolean> {
 let lastUserActivityAt = 0
 let userActivityTracked = false
 
+// ---------- 对账节流：collectThreadSnapshot 会滚动整份会话列表（最多 80 屏 × 500ms），
+// 每轮都对账会拖慢轮询。5 分钟节流一次，既修复 DB 记账失真，又不每轮全量滚动。 ----------
+const RECONCILE_INTERVAL_MS = 5 * 60_000
+let lastReconcileAt = 0
+
 function trackUserActivity(e: Event): void {
   // 只认浏览器派发的真实用户事件。
   //
@@ -2028,7 +2035,7 @@ function userRecentlyActive(withinMs = 10_000): boolean {
 }
 
 /** 读会话行 boss 对象里的完整时间戳（虚拟列表数据源带 lastTS，比文本解析准）。 */
-function readRowLastTS(li: HTMLElement): number | null {
+export function readRowLastTS(li: HTMLElement): number | null {
   const hosts = [
     li.querySelector('.gray.last-msg'),
     li.querySelector('.last-msg'),
@@ -2374,6 +2381,32 @@ async function runChatRoundInner(
   )
   diag('CHAT', `本轮开始 ${mode}，replyScope=${replyScope} 预算 ${maxThreads}`)
 
+  // 0) 对账：采集当前实际列表，上报后端对账并拿到该删除的 key。
+  //    采集会滚动整份列表（慢），按 RECONCILE_INTERVAL_MS 节流，避免每轮全量滚动。
+  let keysToDelete: string[] = []
+  const now = Date.now()
+  if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
+    try {
+      const snapshot = await collectThreadSnapshot()
+      if (snapshot.length > 0) {
+        const reconcilePayload = snapshot.map((s) => ({
+          key: s.key,
+          company: s.company,
+          job_title: s.jobTitle,
+          unread: s.unread,
+          last_ts: s.lastTS,
+          last_msg_preview: s.lastMsgPreview,
+        }))
+        const reconcileResult = await reconcileThreads(cfg, { threads: reconcilePayload })
+        keysToDelete = reconcileResult.to_delete
+        diag('CHAT', `对账完成：to_delete=${keysToDelete.length} created=${reconcileResult.created} marked_deleted=${reconcileResult.marked_deleted}`)
+      }
+    } catch (e) {
+      diag('CHAT', `对账失败，继续执行: ${(e as Error).message}`)
+    }
+    lastReconcileAt = Date.now()
+  }
+
   // 1) 拿后端计划：哪些会话要回复 / 要清理。失败时降级为只处理未读行，
   //    绝不回退到「逐个打开全部会话」（2026-08-06 卡聊天页 14 分钟的根因）。
   const { pending: planPending, targets: planTargets } = await loadChatPlan(cfg, { replyScope })
@@ -2466,6 +2499,20 @@ async function runChatRoundInner(
         diag('CHAT', `索引跳转失败 idx=${live.index} ${boss.brandName || boss.name}`)
         continue
       }
+      // 对账删除：优先级最高（reconcile 返回的是精确时间戳判定后的结果）
+      const key = chatTargetKey({ company: t.company, job_title: t.jobTitle, encrypt_job_id: boss.encryptJobId || '' })
+      if (keysToDelete.includes(key)) {
+        if (!cfg.cleanReadConversations) {
+          skipped++
+          continue
+        }
+        cleaned += await maybeCleanupThread(
+          cfg, t, log, target?.last_message_at ?? null, true, boss.encryptJobId || '',
+          'reconcile_timeout',
+        )
+        continue
+      }
+      // 后端计划清理（保留原有逻辑，reconcile 未覆盖的场景）
       if (target?.action === 'cleanup' && !unread) {
         if (!cfg.cleanReadConversations) {
           skipped++
@@ -2515,7 +2562,25 @@ async function runChatRoundInner(
       return 'ok'
     }
 
-    // 计划命中清理：行时间校验 + 打开确认最后一条是我方 → 删除
+    // 对账删除：优先级最高（reconcile 返回的是精确时间戳判定后的结果）
+    const key = chatTargetKey({
+      company: row.brandName || t.company,
+      job_title: row.title || t.jobTitle,
+      encrypt_job_id: row.jobId || '',
+    })
+    if (keysToDelete.includes(key)) {
+      if (!cfg.cleanReadConversations) {
+        skipped++
+        return 'ok'
+      }
+      cleaned += await maybeCleanupThread(
+        cfg, t, log, target?.last_message_at ?? null, false, row.jobId || '',
+        'reconcile_timeout',
+      )
+      return 'ok'
+    }
+
+    // 计划命中清理：行时间校验 + 打开确认最后一条是我方 → 删除（保留原有逻辑）
     if (target?.action === 'cleanup' && !t.unread) {
       if (!cfg.cleanReadConversations) {
         skipped++
