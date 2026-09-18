@@ -2,8 +2,6 @@
 """油猴插件选择器自动化验证工具。
 
 用 Playwright 打开四平台搜索页，验证油猴插件中的 DOM 选择器是否能找到目标元素。
-（原为主项目 tools/verify_tampermonkey_selectors.py，随插件拆分为独立仓库迁移至此）
-
 使用方法：
     python tools/verify-selectors.py --platforms zhaopin qiancheng
     python tools/verify-selectors.py --all  # 验证所有平台

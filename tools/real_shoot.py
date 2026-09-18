@@ -1,31 +1,9 @@
-"""在**真实** www.zhipin.com 页面上验证面板交互（未登录态）。
+"""Check userscript panel injection on a public BOSS page without login.
 
-与 shoot.py 的区别：shoot.py 喂的是本地静态替身页；本脚本加载真实 BOSS 页面，
-把构建产物注入进去跑。因此能验证「面板与真实 BOSS DOM/CSS/页面脚本是否冲突」——
-这是替身页证明不了的那部分。
-
-⚠ 实测结论（2026-07-31）：本机 IP 已被 BOSS 标记，`/`、`/shenzhen/`、
-`/web/geek/jobs`、`/job_detail/` **全部**返回「安全验证 - 当前 IP 地址可能存在
-异常访问行为」墙页（body 仅 101 字，职位卡片 0 个）。所以本脚本实际截到的是
-**真实 zhipin.com 域下的验证墙页**，不是职位列表页。
-
-这仍有价值：页面由 BOSS 真实下发（真实 CSS/字体/页面脚本/CSP），能证明面板注入
-不被拦、样式不被宿主污染、交互正常。但**不能**证明与职位列表 DOM 的集成
-（选择器命中率等）——那需要能过验证的真实浏览器。
-
-绕过验证码属于「反检测规避」，不做。若要在真实职位页截图，需你本人在已登录、
-未被风控的浏览器里手动装 Tampermonkey 操作。
-
-安全边界（有意为之，勿放宽）：
-  * 不使用 data/zhipin_profiles/ 里的任何登录态。BOSS 有自动化检测，用真实求职
-    账号跑 Playwright 有被风控的风险，且不可逆。故本脚本全程**未登录**。
-  * 只点击面板自身的元素（Tab / ⚙ / 拖球）。绝不点 BOSS 的「立即沟通」「投递」
-    等按钮，不触发任何投递动作。
-  * 种子配置里 autoResume=false，避免挂载时恢复出一个跨页任务。
-
-仍不能替代的：登录态下的真机手测（会话列表、招呼语发送等需登录才能验证）。
-
-用法：npm run build && C:/Python311/python.exe tools/real_shoot.py
+Only the plugin's own controls are exercised; no application or chat action is
+triggered. The page may show a login or verification screen, so this does not
+validate selectors against real job cards or authenticated conversations.
+Build the userscript first, then run ``python tools/real_shoot.py``.
 """
 import asyncio
 from pathlib import Path
