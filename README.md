@@ -3,7 +3,7 @@
 基于匹配度模型，在招聘平台自动筛选投递岗位、托管 HR 会话的油猴（Tampermonkey）插件。
 
 是 `agent-agent-hr` 主项目的子模块，复用主项目的匹配引擎（规则 + 语义 + LLM），
-通过 `/api/plugin/*` HTTP 接口与后端解耦（契约见 [API.md](./API.md)）。
+通过 `/api/plugin/*` HTTP 接口与后端通信；请求入口见 [src/api.ts](src/api.ts) 和 [src/remote.ts](src/remote.ts)。
 
 ## 功能
 
