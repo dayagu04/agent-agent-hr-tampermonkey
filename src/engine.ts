@@ -189,12 +189,18 @@ export class ApplyEngine {
       }
 
       // 2. 批量匹配（分批提交，避免大批量走 LLM 精排超时）。
-      //    设置里可关闭匹配度：跳过 match 接口，规则过滤通过后全部投递
-      const results = this.config.matchEnabled
-        ? await matchJobs(this.config, this.platform.code, jobs, (done, total) => {
-            log(`匹配进度 ${done}/${total}`)
-          })
-        : []
+      //    设置里可关闭匹配度计算，但后端投递护栏仍必须执行。
+      // 即使关闭匹配度，也必须调用后端做黑名单、冷静期、公司频率和
+      // 重复投递护栏；evaluateMatch=false 只跳过昂贵的匹配评分。
+      const results = await matchJobs(
+        this.config,
+        this.platform.code,
+        jobs,
+        (done, total) => {
+          log(`${this.config.matchEnabled ? '匹配' : '护栏'}进度 ${done}/${total}`)
+        },
+        this.config.matchEnabled,
+      )
       const scoreMap = new Map(results.map((r) => [r.platform_job_id, r]))
       if (this.config.matchEnabled) {
         log(`后端返回 ${results.length} 条评分`)
@@ -205,7 +211,7 @@ export class ApplyEngine {
           log(`评分：最高 ${top}，平均 ${avg}（阈值 ${this.config.threshold}）`)
         }
       } else {
-        log('已关闭匹配度计算：跳过后端匹配，规则过滤通过后全部投递')
+        log('已关闭匹配度计算：仍执行后端投递护栏，安全检查通过后全部投递')
       }
 
       // LLM 低质量岗位判定：外包/批量招聘等（公司维度缓存，命中不重复判）
@@ -260,6 +266,22 @@ export class ApplyEngine {
             reason: `命中规则 ${hitRule.rule_type}=${hitRule.value}`,
             match_score: r?.score,
             details: { title: job.title, company: job.company, rule_id: hitRule.id },
+          })
+          continue
+        }
+
+        // 后端漏回任一岗位时不允许在“关闭匹配”模式下直接放行，否则一次
+        // 部分响应就会绕过重复投递/公司频率护栏。
+        if (!r) {
+          progress.skipped++
+          this.platform.markCard(job, '#f59e0b')
+          void logDecision(this.config, {
+            run_id: this.runId,
+            platform: this.platform.code,
+            platform_job_id: job.platformJobId,
+            decision: 'blocked_guard_unavailable',
+            reason: '后端未返回该岗位的投递护栏结果',
+            details: { title: job.title, company: job.company },
           })
           continue
         }
@@ -320,7 +342,7 @@ export class ApplyEngine {
           // 关闭匹配：不过滤分数，规则通过即投（score 记 0，账本里可区分）
           recommended.push({ job, score: 0 })
           this.platform.markCard(job, '#22c55e') // 绿色=全部投递
-        } else if (r && r.recommend) {
+        } else if (r.recommend) {
           recommended.push({ job, score: r.score })
           this.platform.markCard(job, '#22c55e') // 绿色=推荐
         } else {

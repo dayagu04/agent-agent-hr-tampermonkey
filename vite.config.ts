@@ -8,13 +8,12 @@ const matchUrls = [
   // 智联招聘
   'https://sou.zhaopin.com/*',
   'https://www.zhaopin.com/*',
-  // 51前程无忧
-  'https://we.51job.com/pc/search*',
-  'https://search.51job.com/*',
   // BOSS 直聘（整域名：首页/列表页/聊天页都可注入，智能编排可从首页启动）
   'https://www.zhipin.com/*',
 
-  // 猎聘选择器未验证，暂不启用
+  // 51前程无忧、猎聘选择器未在真实页面验证，暂不启用真实投递
+  // 'https://we.51job.com/pc/search*',
+  // 'https://search.51job.com/*',
   // 'https://www.liepin.com/zhaopin/*',
   // 'https://m.liepin.com/*',
 ]
