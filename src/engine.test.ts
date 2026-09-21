@@ -84,9 +84,12 @@ async function runEngine(platform: BasePlatform, cfg: PluginConfig): Promise<App
 }
 
 beforeEach(() => {
+  vi.clearAllMocks()
   vi.mocked(fetchRules).mockResolvedValue([])
   vi.mocked(judgeJobs).mockResolvedValue([])
-  vi.mocked(matchJobs).mockResolvedValue([])
+  vi.mocked(matchJobs).mockResolvedValue([{
+    platform_job_id: 'j1', score: 0, recommend: true, reason: '仅执行投递护栏',
+  }])
   vi.mocked(recordApplication).mockResolvedValue({
     success: true,
     duplicate: false,
@@ -165,6 +168,7 @@ describe('ApplyEngine 规则/质量降级', () => {
 
   it('规则拉取失败但匹配开启 → 继续跑并提示本地规则未生效', async () => {
     vi.mocked(fetchRules).mockResolvedValue(null)
+    vi.mocked(matchJobs).mockResolvedValue([])
     const platform = new FakePlatform()
     platform.setJobs([job])
 
@@ -174,6 +178,24 @@ describe('ApplyEngine 规则/质量降级', () => {
     // 匹配开启且后端未返回评分 → 该岗位被低分跳过，但引擎没有中止
     expect(progress.running).toBe(false)
     expect(progress.skipped).toBe(1)
+  })
+
+  it('匹配关闭仍请求后端护栏，并拦截已投岗位', async () => {
+    vi.mocked(matchJobs).mockResolvedValue([{
+      platform_job_id: 'j1', score: 0, recommend: false,
+      reason: '', blocked_reason: 'already_applied',
+    }])
+    const platform = new FakePlatform()
+    platform.setJobs([job])
+
+    const progress = await runEngine(platform, makeConfig({ matchEnabled: false }))
+
+    expect(matchJobs).toHaveBeenCalledWith(
+      expect.anything(), 'zhipin', [job], expect.any(Function), false,
+    )
+    expect(progress.applied).toBe(0)
+    expect(progress.skipped).toBe(1)
+    expect(recordApplication).not.toHaveBeenCalled()
   })
 
   it('低质量判定接口失败 → 提示降级但仍正常投递', async () => {

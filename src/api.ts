@@ -83,13 +83,14 @@ export async function matchJobs(
   platform: PlatformCode,
   jobs: JobCard[],
   onBatch?: (done: number, total: number) => void,
+  evaluateMatch = true,
 ): Promise<MatchResultItem[]> {
   // 分批：一次几十个岗位走 LLM 精排极易超时，切成小批稳定得多
   if (jobs.length > MATCH_BATCH_SIZE) {
     const all: MatchResultItem[] = []
     for (let i = 0; i < jobs.length; i += MATCH_BATCH_SIZE) {
       const chunk = jobs.slice(i, i + MATCH_BATCH_SIZE)
-      const part = await matchJobs(cfg, platform, chunk)
+      const part = await matchJobs(cfg, platform, chunk, undefined, evaluateMatch)
       all.push(...part)
       onBatch?.(Math.min(i + MATCH_BATCH_SIZE, jobs.length), jobs.length)
     }
@@ -100,6 +101,7 @@ export async function matchJobs(
     resume_id: cfg.resumeId,
     platform,
     threshold: cfg.threshold,
+    evaluate_match: evaluateMatch,
     jobs: jobs.map((j) => ({
       platform_job_id: j.platformJobId,
       title: j.title,
@@ -113,7 +115,7 @@ export async function matchJobs(
   // 提交的载荷进日志：岗位 id/标题为空是「扫描到岗位但匹配 0」的最常见原因
   diag(
     'API',
-    `match 提交 ${payload.jobs.length} 个岗位 threshold=${payload.threshold}`,
+    `match 提交 ${payload.jobs.length} 个岗位 threshold=${payload.threshold} evaluate=${evaluateMatch}`,
     payload.jobs.slice(0, 3).map((j) => ({ id: j.platform_job_id, t: j.title })),
   )
 

@@ -7,7 +7,7 @@
 //   插件下次心跳时消费，实现「网页控制插件」。
 import { VERSION } from './version'
 import { loadConfig, saveConfig, isConfigReady, applyPluginPreferences } from './config'
-import { network } from './platform-bridge'
+import { network, storage } from './platform-bridge'
 import { diag, flushLogs } from './logger'
 import { startDebugCapture } from './debug'
 import {
@@ -32,6 +32,14 @@ interface RemoteCommand {
   payload: Record<string, unknown>
 }
 
+const COMMAND_ACK_KEY = 'aah_remote_command_ack'
+let heartbeatInFlight = false
+
+interface CommandAck {
+  epoch: string
+  id: number
+}
+
 function authHeaders(cfg: ReturnType<typeof loadConfig>): Record<string, string> {
   return {
     'Content-Type': 'application/json',
@@ -41,44 +49,52 @@ function authHeaders(cfg: ReturnType<typeof loadConfig>): Record<string, string>
 
 /** 上报一次心跳；返回的 commands 由调用方逐条执行 */
 export async function reportHeartbeatAndPoll(): Promise<void> {
-  const cfg = loadConfig()
-  if (!isConfigReady(cfg)) return
-
-  // 顺带批量上报缓冲日志（logger 内部按 50 条/60 秒门控,非实时）
-  void flushLogs()
-
-  const orch = getOrchestrator(cfg)
-  // 优先用单例状态;页面跳转后单例尚未恢复时,回退到持久化快照,
-  // 保证网页端看到的阶段/运行态始终真实(修复「网页显示投递开始后退出」)。
-  const live = orch.getState()
-  const snap = await getOrchestratorSnapshot()
-  const phase = live?.phase ?? snap?.phase ?? 'idle'
-  const running = orch.isRunning() || !!snap?.running
-  const currentJob = getCurrentJob()
-  const body = {
-    platform: currentPlatformCode(),
-    version: VERSION,
-    phase,
-    running,
-    visibility: document.visibilityState,
-    applied_total: live?.stats.appliedTotal ?? snap?.appliedTotal ?? 0,
-    replied_total: live?.stats.hrRepliesTotal ?? snap?.hrRepliesTotal ?? 0,
-    send_resume_total: live?.stats.sendResumeTotal ?? snap?.sendResumeTotal ?? 0,
-    pending_hr_messages: live?.stats.pendingHrMessages ?? snap?.pendingHrMessages ?? null,
-    skipped_total: live?.stats.skippedTotal ?? snap?.skippedTotal ?? 0,
-    failed_total: live?.stats.failedTotal ?? snap?.failedTotal ?? 0,
-    goal_target: snap?.goalTarget ?? live?.goal?.target ?? null,
-    keyword: live?.keywords[live.currentKeywordIndex] ?? snap?.keyword ?? '',
-    page: live?.currentPage ?? snap?.page ?? 1,
-    started_at: snap?.startedAt ?? live?.startedAt ?? null,
-    last_error: snap?.lastError ?? null,
-    current_job: currentJob
-      ? { title: currentJob.title, company: currentJob.company, score: currentJob.score }
-      : null,
-    run_id: live?.runId ?? snap?.runId ?? null,
-  }
-
+  // setInterval 不会等待 async 回调。慢网下若允许多个 15s 请求并发，后发的
+  // stop 可能先执行、早发的 start 后执行，最终状态会逆转用户最后意图。
+  if (heartbeatInFlight) return
+  heartbeatInFlight = true
   try {
+    const cfg = loadConfig()
+    if (!isConfigReady(cfg)) return
+
+    // 顺带批量上报缓冲日志（logger 内部按 50 条/60 秒门控,非实时）
+    void flushLogs()
+
+    const orch = getOrchestrator(cfg)
+    // 优先用单例状态;页面跳转后单例尚未恢复时,回退到持久化快照,
+    // 保证网页端看到的阶段/运行态始终真实(修复「网页显示投递开始后退出」)。
+    const live = orch.getState()
+    const snap = await getOrchestratorSnapshot()
+    const phase = live?.phase ?? snap?.phase ?? 'idle'
+    const running = orch.isRunning() || !!snap?.running
+    const currentJob = getCurrentJob()
+    let commandAck = await storage.get<CommandAck>(COMMAND_ACK_KEY, { epoch: '', id: 0 })
+    let ackCommandId = commandAck.id || 0
+    const body = {
+      platform: currentPlatformCode(),
+      version: VERSION,
+      phase,
+      running,
+      visibility: document.visibilityState,
+      applied_total: live?.stats.appliedTotal ?? snap?.appliedTotal ?? 0,
+      replied_total: live?.stats.hrRepliesTotal ?? snap?.hrRepliesTotal ?? 0,
+      send_resume_total: live?.stats.sendResumeTotal ?? snap?.sendResumeTotal ?? 0,
+      pending_hr_messages: live?.stats.pendingHrMessages ?? snap?.pendingHrMessages ?? null,
+      skipped_total: live?.stats.skippedTotal ?? snap?.skippedTotal ?? 0,
+      failed_total: live?.stats.failedTotal ?? snap?.failedTotal ?? 0,
+      goal_target: snap?.goalTarget ?? live?.goal?.target ?? null,
+      keyword: live?.keywords[live.currentKeywordIndex] ?? snap?.keyword ?? '',
+      page: live?.currentPage ?? snap?.page ?? 1,
+      started_at: snap?.startedAt ?? live?.startedAt ?? null,
+      last_error: snap?.lastError ?? null,
+      current_job: currentJob
+        ? { title: currentJob.title, company: currentJob.company, score: currentJob.score }
+        : null,
+      run_id: live?.runId ?? snap?.runId ?? null,
+      ack_command_id: ackCommandId,
+      ack_command_epoch: commandAck.epoch || null,
+    }
+
     const resp = await network.request({
       method: 'POST',
       url: `${cfg.apiBase}/api/plugin/heartbeat`,
@@ -88,9 +104,19 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     })
     if (resp.status !== 200) return
     const result = JSON.parse(resp.responseText)
+    const commandEpoch = typeof result.command_epoch === 'string' ? result.command_epoch : ''
+    if (commandEpoch && commandEpoch !== commandAck.epoch) {
+      commandAck = { epoch: commandEpoch, id: 0 }
+      ackCommandId = 0
+    }
     const commands: RemoteCommand[] = result.commands || []
     for (const cmd of commands) {
-      await executeCommand(cfg, cmd)
+      if (cmd.id <= ackCommandId) continue
+      if (!await executeCommand(cfg, cmd)) break
+      ackCommandId = cmd.id
+      // 先持久化执行游标；即使命令触发跨页导航，新页面也能在下一次心跳 ACK。
+      commandAck = { epoch: commandEpoch, id: ackCommandId }
+      await storage.set(COMMAND_ACK_KEY, commandAck)
     }
     // 网页端插件偏好实时同步：网页端设置优先（任一字段变化都落盘，
     // 否则 cleanRead* 这类设置只进内存、刷新即丢）
@@ -109,6 +135,8 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     }
   } catch {
     // 心跳失败静默（网络/后端暂不可达时不影响插件主流程）
+  } finally {
+    heartbeatInFlight = false
   }
 }
 
@@ -116,14 +144,14 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
 async function executeCommand(
   cfg: ReturnType<typeof loadConfig>,
   cmd: RemoteCommand,
-): Promise<void> {
+): Promise<boolean> {
   const orch = getOrchestrator(cfg)
   try {
     switch (cmd.action) {
       case 'orchestrator.start': {
         if (!detectPlatform()) {
           console.warn('[remote] 未在招聘平台页面，无法启动编排')
-          break
+          return false
         }
         const p = cmd.payload || {}
         const goal = {
@@ -209,9 +237,11 @@ async function executeCommand(
       default:
         console.warn('[remote] 未知命令', cmd.action)
     }
+    return true
   } catch (e) {
     console.warn('[remote] 命令执行失败', cmd.action, e)
     diag('REMOTE', `命令执行失败 ${cmd.action}: ${(e as Error).message}`)
+    return false
   }
 }
 
