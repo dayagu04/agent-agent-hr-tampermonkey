@@ -12,7 +12,7 @@
 
 import type { ApplyProgress, PluginConfig } from './types'
 import { storage, notification } from './platform-bridge'
-import { diag } from './logger'
+import { diag, setLogRunId } from './logger'
 import { saveConfig } from './config'
 import { ApplyEngine } from './engine'
 import { detectPlatform } from './platforms/factory'
@@ -320,6 +320,7 @@ export class Orchestrator {
       chatOnly,
       pendingAction: null,
     }
+    setLogRunId(this.state.runId)
     // 网页端下发的回复策略参数立即落本地配置（不回写网页端，网页端仍是唯一真相源）：
     // 会话托管用 cfg.minReplyScore / cfg.replyScope 调后端，必须与网页端一致。
     if (opts.minReplyScore !== undefined) {
@@ -383,6 +384,7 @@ export class Orchestrator {
     await this._clearLease()
     diag('ORCH', `执行器停止: ${reason}`)
     await this.reportEvent('stopped', { reason, stats: this.state.stats })
+    setLogRunId('')
     if (wasRunning) notification.notify('投递助手已停止', reason)
   }
 
@@ -718,6 +720,7 @@ export class Orchestrator {
       state.pendingAction = null
       this.state = state
       this.running = false
+      setLogRunId('')
       await storage.set(STATE_KEY, state)
       return
     }
@@ -727,6 +730,7 @@ export class Orchestrator {
       // 仍写回实例，让 UI 能读到 stats 与暂停原因
       this.state = state
       this.running = false
+      setLogRunId('')
       return
     }
 
@@ -745,6 +749,7 @@ export class Orchestrator {
 
     this.state = state
     this.running = true
+    setLogRunId(state.runId)
 
     if (state.pendingAction) {
       diag('ORCH', `恢复未完成指令: ${state.pendingAction.action}`)

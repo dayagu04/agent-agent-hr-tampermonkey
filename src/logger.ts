@@ -18,11 +18,19 @@ const MAX_BUFFER = 5000
 interface LogEntry {
   tag: string
   message: string
+  run_id: string
+  event_at: string
 }
 
 let buffer: LogEntry[] = []
 let lastFlush = 0
 let flushing = false
+let currentRunId = ''
+
+/** Attach each event to the active orchestration round at the time it occurs. */
+export function setLogRunId(runId: string): void {
+  currentRunId = /^[A-Za-z0-9_-]{1,64}$/.test(runId) ? runId : ''
+}
 
 /** 上报缓冲日志；未到阈值/间隔时跳过（非实时）。失败保留待下次重试。 */
 export function flushLogs(): Promise<void> {
@@ -36,6 +44,7 @@ export function flushLogs(): Promise<void> {
   if (!isConfigReady(cfg)) return Promise.resolve()
 
   const batch = buffer.splice(0, FLUSH_THRESHOLD)
+  const batchId = `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   flushing = true
   return network.request({
     method: 'POST',
@@ -44,7 +53,7 @@ export function flushLogs(): Promise<void> {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${cfg.token}`,
     },
-    data: JSON.stringify({ logs: batch }),
+    data: JSON.stringify({ batch_id: batchId, logs: batch }),
     timeout: 15000,
   })
     .then((resp) => {
@@ -79,7 +88,7 @@ export function diag(tag: string, msg: string, data?: unknown): void {
       line += ' [unserializable]'
     }
   }
-  buffer.push({ tag, message: line })
+  buffer.push({ tag, message: line, run_id: currentRunId, event_at: new Date().toISOString() })
   if (buffer.length > MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER)
   try {
     console.log(`[${tag}] ${line}`)
