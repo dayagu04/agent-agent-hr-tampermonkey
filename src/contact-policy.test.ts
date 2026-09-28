@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_AGENT_POLICY,
   contactChannelFromQuestion,
+  isAgentActionAllowed,
   isContactExchangeAllowed,
   normalizeAgentPolicy,
 } from './contact-policy'
@@ -53,6 +54,19 @@ describe('contact policy', () => {
     expect(contactChannelFromQuestion('电话面试时间方便吗？')).toBeNull()
     expect(contactChannelFromQuestion('请留下手机号')).toBe('phone')
     expect(contactChannelFromQuestion('方便交换联系方式吗')).toBeNull()
+  })
+
+  it('blocks only deny/ask_once actions while guided notifications continue', () => {
+    const guided = normalizeAgentPolicy({ mode: 'guided' }, { channels: [] })
+    expect(isAgentActionAllowed(guided, 'apply')).toBe(true)
+    const denied = normalizeAgentPolicy(
+      { mode: 'full_auto', actions: { apply: 'deny', send_greeting: 'ask_once' } },
+      { channels: [] },
+    )
+    expect(isAgentActionAllowed(denied, 'apply')).toBe(false)
+    expect(isAgentActionAllowed(denied, 'send_greeting')).toBe(false)
+    const manual = normalizeAgentPolicy({ mode: 'manual' }, { channels: [] })
+    expect(isAgentActionAllowed(manual, 'apply')).toBe(false)
   })
 })
 

@@ -142,3 +142,18 @@ export function isContactExchangeAllowed(
   return channels.includes(channel)
 }
 
+/**
+ * 通用动作护栏。插件只负责执行后端已经允许的副作用；notify_* 仍继续，
+ * 只有 deny/ask_once（以及 manual 未显式 allow）会在本地跳过。
+ */
+export function isAgentActionAllowed(
+  policy: AgentPolicy | null | undefined,
+  action: string,
+): boolean {
+  const p = policy || DEFAULT_AGENT_POLICY
+  const explicit = p.actions?.[action]
+  if (explicit === 'deny' || explicit === 'ask_once') return false
+  if (p.mode === 'manual' && explicit !== 'allow') return false
+  return true
+}
+
