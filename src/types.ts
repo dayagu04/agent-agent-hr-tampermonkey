@@ -17,7 +17,8 @@ export interface ContactPolicy {
 
 /** BOSS Agent 策略。LLM 不直接决定权限，插件只执行这里允许的动作。 */
 export interface AgentPolicy {
-  mode: 'full_auto' | 'assisted' | 'manual'
+  /** Backend uses `guided`; `assisted` remains for older clients/preferences. */
+  mode: 'full_auto' | 'guided' | 'assisted' | 'manual'
   actions: Record<string, AgentActionMode>
   contact: ContactPolicy
 }

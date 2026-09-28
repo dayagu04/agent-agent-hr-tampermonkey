@@ -77,7 +77,7 @@ export function normalizeAgentPolicy(
     ? rawContact as Record<string, unknown>
     : {}
   const contactRaw = Object.keys(topContact).length ? topContact : nestedContact
-  const mode = policy.mode === 'manual' || policy.mode === 'assisted' || policy.mode === 'full_auto'
+  const mode = policy.mode === 'manual' || policy.mode === 'guided' || policy.mode === 'assisted' || policy.mode === 'full_auto'
     ? policy.mode
     : 'full_auto'
 

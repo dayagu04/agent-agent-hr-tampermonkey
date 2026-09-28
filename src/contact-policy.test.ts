@@ -28,6 +28,15 @@ describe('contact policy', () => {
     expect(isContactExchangeAllowed(policy, null)).toBe(false)
   })
 
+  it('preserves the backend guided mode and honors explicit action overrides', () => {
+    const policy = normalizeAgentPolicy(
+      { mode: 'guided', actions: { exchange_phone: 'allow' } },
+      { channels: ['phone'] },
+    )
+    expect(policy.mode).toBe('guided')
+    expect(isContactExchangeAllowed(policy, 'phone')).toBe(true)
+  })
+
   it('respects explicit deny and disabled platform cards', () => {
     const denied = normalizeAgentPolicy(
       { mode: 'full_auto', actions: { exchange_phone: 'deny' } },
