@@ -107,6 +107,12 @@ export function normalizeAgentPolicy(
 /** 从 BOSS 卡片问题文本中提取明确渠道；泛化问题返回 null。 */
 export function contactChannelFromQuestion(question: string): ContactChannel | null {
   const q = String(question || '').replace(/\s/g, '').toLowerCase()
+  // Bare「电话」经常出现在电话面试/电话沟通卡片中，不能当成联系方式交换。
+  // 只有明确的留/发/交换等动作才进入联系方式策略。
+  const action = /交换|留下?|留个|提供|发送|发给|发我|给我|加个|加一下|添加/.test(q)
+  const hasGenericContact = /联系方式/.test(q)
+  const hasChannel = /微信|weixin|wechat|wx|邮箱|邮件|email|mail|手机号|手机|联系电话|mobile|telephone|tel/.test(q)
+  if (!action || (!hasChannel && !hasGenericContact)) return null
   if (/微信|weixin|wechat|wx/.test(q)) return 'wechat'
   if (/邮箱|邮件|email|mail/.test(q)) return 'email'
   if (/电话|手机号|手机|联系电话|mobile|telephone|tel/.test(q)) return 'phone'

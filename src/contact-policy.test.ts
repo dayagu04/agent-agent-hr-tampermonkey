@@ -50,6 +50,8 @@ describe('contact policy', () => {
   it('extracts explicit channels from card text', () => {
     expect(contactChannelFromQuestion('是否方便交换微信？')).toBe('wechat')
     expect(contactChannelFromQuestion('请留下您的邮箱')).toBe('email')
+    expect(contactChannelFromQuestion('电话面试时间方便吗？')).toBeNull()
+    expect(contactChannelFromQuestion('请留下手机号')).toBe('phone')
     expect(contactChannelFromQuestion('方便交换联系方式吗')).toBeNull()
   })
 })

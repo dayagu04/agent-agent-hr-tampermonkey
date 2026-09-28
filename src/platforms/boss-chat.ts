@@ -17,6 +17,7 @@ import {
 import type { SyncChatResponse } from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
 import type { ChatPlanTarget } from '../chat-plan'
+import { selectChatActionId, shouldReportContactOnly } from '../chat-action-report'
 import { collectThreadSnapshot } from '../thread-snapshot'
 import {
   flushConversationDeletedMarks,
@@ -1086,10 +1087,12 @@ interface ChatCard {
  * 判定必须以问题文本为准，按钮对只作为「这是个卡片」的信号；
  * 认不出来的类型一律不自动点，宁可漏也不能乱点。
  */
-function classifyCard(question: string): ChatCard['kind'] {
+export function classifyCard(question: string): ChatCard['kind'] {
   const q = question.replace(/\s/g, '')
   // 联系方式必须先判：它和简历卡片共用同一对按钮，放后面会被简历分支抢走
-  if (/交换联系方式|联系方式|电话|手机号|微信|邮箱|邮件|email|mail/.test(q)) return 'contact_exchange'
+  const contactAction = /交换|留下?|留个|提供|发送|发给|发我|给我|加个|加一下|添加/.test(q)
+  const hasContact = /联系方式|手机号|手机|微信|邮箱|邮件|email|mail/.test(q)
+  if (contactAction && hasContact) return 'contact_exchange'
   if (/附件简历|一份您的简历|您的简历/.test(q)) return 'resume_request'
   if (/工作地点|是否接受此工作地点/.test(q)) return 'location_confirm'
   return 'unknown'
@@ -2387,12 +2390,13 @@ async function processOpenedThread(
   // 没有该字段则按本地 agentPolicy 的已配置渠道执行。先于「无回复」分支处理，
   // 否则 HR 只索要联系方式时会被提前 return 遗漏。
   const contactDecision = extractContactDecision(res)
+  let contactSucceeded = false
   for (const card of findPendingCards().filter((c) => c.kind === 'contact_exchange')) {
     const contactOk = await handleCard(card, cfg, threadId, log, contactDecision)
-    if (contactOk && contactDecision?.actionId) {
-      await markChatSent(cfg, contactDecision.actionId, true, '')
-    }
+    if (contactOk) contactSucceeded = true
   }
+
+  const actionId = selectChatActionId(res.action_id, contactDecision?.actionId)
 
   if (!res.reply) {
     log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
@@ -2400,6 +2404,9 @@ async function processOpenedThread(
     if (res.delete_after_send) {
       log(`  ↳ 策略删除会话（${res.message || ''}）`)
       if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'low_quality', log)) cleaned++
+    }
+    if (shouldReportContactOnly(false, contactSucceeded) && actionId !== null) {
+      await markChatSent(cfg, actionId, true, '')
     }
     return { synced: 1, replied: 0, resumesSent: 0, cleaned }
   }
@@ -2429,11 +2436,11 @@ async function processOpenedThread(
       else resumesSent++
       // 简历未发出时不得标记 sent：否则后端统计会把「文本已发、简历没发」
       // 的动作也计成已发简历（历史计数虚高根因之一）。
-      if (res.action_id) {
-        await markChatSent(cfg, res.action_id, resumeOk, resumeOk ? '' : '简历未发出')
+      if (actionId !== null) {
+        await markChatSent(cfg, actionId, resumeOk, resumeOk ? '' : '简历未发出')
       }
-    } else if (res.action_id) {
-      await markChatSent(cfg, res.action_id, true, '')
+    } else if (actionId !== null) {
+      await markChatSent(cfg, actionId, true, '')
     }
     // 明确被拒：后端已换成「拿信息」话术；会话保留等原因（不再发完即删），
     // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
@@ -2443,8 +2450,8 @@ async function processOpenedThread(
     }
   } else {
     log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
-    if (res.action_id) {
-      await markChatSent(cfg, res.action_id, false, '页面发送未确认')
+    if (actionId !== null) {
+      await markChatSent(cfg, actionId, false, '页面发送未确认')
     }
   }
 
