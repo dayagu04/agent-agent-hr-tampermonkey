@@ -589,6 +589,12 @@ export class Orchestrator {
     this.busy = true
     try {
       if (this.detectRiskControl()) {
+        // 风控页面属于异常事件：先写入插件 outbox，让后端把它转成
+        // 飞书通知；随后仍暂停当前页面，避免在验证码/滑块上盲目重试。
+        await this.reportEvent('captcha', {
+          action: 'apply_batch',
+          reason: '检测到 BOSS 风控页面，需要完成页面验证',
+        })
         await this.pause('检测到 BOSS 风控页面，请手动处理后重启')
         return
       }
@@ -684,6 +690,10 @@ export class Orchestrator {
     this.busy = true
     try {
       if (this.detectRiskControl()) {
+        await this.reportEvent('captcha', {
+          action: 'chat_reply',
+          reason: '检测到 BOSS 风控页面，需要完成页面验证',
+        })
         await this.pause('检测到 BOSS 风控页面，请手动处理后重启')
         return
       }
