@@ -79,6 +79,72 @@ export interface OrchestratorState {
 }
 
 const STATE_KEY = 'aah_orchestrator_state'
+/** 编排事件 outbox：页面跳转、扩展重启或后端短暂不可用时不丢状态推进事件。 */
+const EVENT_OUTBOX_KEY = 'aah_orchestrator_event_outbox'
+interface QueuedOrchestratorEvent {
+  event_id: string
+  payload: {
+    event: string
+    timestamp: number
+    phase: string
+    stats?: Record<string, number>
+    details?: Record<string, unknown>
+    run_id?: string
+    event_id?: string
+  }
+}
+
+/** 只串行化 GM 存储读改写，网络请求不占用这个锁。 */
+let eventQueueOps: Promise<unknown> = Promise.resolve()
+function withEventQueueLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = eventQueueOps.then(fn, fn)
+  eventQueueOps = run.then(() => undefined, () => undefined)
+  return run
+}
+
+let eventFlushPromise: Promise<void> | null = null
+
+async function enqueueOrchestratorEvent(item: QueuedOrchestratorEvent): Promise<void> {
+  await withEventQueueLock(async () => {
+    const current = await storage.get<QueuedOrchestratorEvent[]>(EVENT_OUTBOX_KEY, [])
+    const queue = Array.isArray(current) ? current : []
+    if (queue.some((entry) => entry.event_id === item.event_id)) return
+    queue.push(item)
+    await storage.set(EVENT_OUTBOX_KEY, queue)
+  })
+}
+
+/**
+ * Flush one or more durable events. Successful removal is keyed by event_id so
+ * an enqueue racing with the network request cannot overwrite a newer event.
+ */
+export async function flushOrchestratorEvents(config: PluginConfig): Promise<void> {
+  if (eventFlushPromise) return eventFlushPromise
+  eventFlushPromise = (async () => {
+    while (true) {
+      const first = await withEventQueueLock(async () => {
+        const current = await storage.get<QueuedOrchestratorEvent[]>(EVENT_OUTBOX_KEY, [])
+        return Array.isArray(current) ? current[0] || null : null
+      })
+      if (!first) return
+
+      const delivered = await reportOrchestratorEvent(config, first.payload)
+      if (!delivered) return
+
+      await withEventQueueLock(async () => {
+        const current = await storage.get<QueuedOrchestratorEvent[]>(EVENT_OUTBOX_KEY, [])
+        const queue = Array.isArray(current) ? current : []
+        const index = queue.findIndex((entry) => entry.event_id === first.event_id)
+        if (index >= 0) queue.splice(index, 1)
+        await storage.set(EVENT_OUTBOX_KEY, queue)
+      })
+    }
+  })().finally(() => {
+    eventFlushPromise = null
+  })
+  return eventFlushPromise
+}
+
 /** 跨标签页编排租约：同一轮只允许一个标签页实例实际执行（防双跑/互踩） */
 const ORCH_LEASE_KEY = 'aah_orch_lease'
 const ORCH_LEASE_TTL = 10000
@@ -288,6 +354,18 @@ export class Orchestrator {
       return
     }
 
+    // 目前只有 BOSS 的搜索导航、投递确认和聊天托管经过完整回归。
+    // 其他适配器仍可由「投当前页」使用，但不能创建一个后端永远等不到
+    // 正确执行结果的智能编排运行。
+    const currentPlatform = detectPlatform()
+    if (!currentPlatform || currentPlatform.code !== 'zhipin') {
+      const name = currentPlatform?.name || '当前页面'
+      const reason = `${name} 暂未开放智能编排，请使用已验证的 BOSS 直聘搜索页`
+      diag('ORCH', reason)
+      notification.notify('智能编排暂不可用', reason)
+      return
+    }
+
     // 组合额度计划：网页端生成 plan（per_combination / total_llm）；
     // 无 plan（旧调用）按 keywords×城市 各投 goal.target 兜底。
     const normalizedPlan = (plan && plan.length)
@@ -423,15 +501,17 @@ export class Orchestrator {
    * apply_batch / chat_snapshot / chat_reply / stop / pause。
    * 这是执行器的唯一动作入口 —— 插件不做任何决策，只按指令执行。
    */
-  async applyBackendAction(action: Record<string, unknown>): Promise<void> {
-    if (!this.state || !this.running) return
+  async applyBackendAction(action: Record<string, unknown>): Promise<boolean> {
+    // 返回 false 时远程命令不能 ACK。否则页面刚刷新、执行器尚未恢复，
+    // 或已有批次正在运行时，后端会误以为动作完成并永久清掉 next_action。
+    if (!this.state || !this.running) return false
     if (this.busy) {
       diag('ORCH', '已有指令在执行中，忽略新指令', action)
-      return
+      return false
     }
     // 跨标签页一致性：其他标签页停止/暂停/新开一轮时本页放弃旧轮
-    if ((await this._syncCrossTabState()) === 'abandon') return
-    if (!this.running) return
+    if ((await this._syncCrossTabState()) === 'abandon') return false
+    if (!this.running) return false
 
     const kind = typeof action?.action === 'string' ? action.action : ''
     try {
@@ -447,7 +527,9 @@ export class Orchestrator {
         await this.pause(typeof action.reason === 'string' ? action.reason : '后端指令暂停（请人工处理后继续）')
       } else {
         diag('ORCH', `未知后端指令: ${kind}`)
+        return false
       }
+      return true
     } catch (e) {
       const msg = (e as Error).message
       diag('ORCH', `指令执行失败: ${msg}`)
@@ -457,6 +539,7 @@ export class Orchestrator {
       }
       // 执行异常不能静默：上报 paused，让后端置暂停、网页端可见，用户处理后可恢复
       await this.pause(`执行指令失败: ${msg}`)
+      return true
     }
   }
 
@@ -574,6 +657,7 @@ export class Orchestrator {
         scanned: scannedThisPage,
         scanComplete: scanCompleteThisPage,
         platform: platform.code,
+        command_id: typeof action.command_id === 'string' ? action.command_id : undefined,
       })
     } finally {
       this.busy = false
@@ -626,7 +710,10 @@ export class Orchestrator {
 
       if (mode === 'snapshot') {
         this.state.stats.pendingHrMessages = result.pending ?? 0
-        await this.reportEvent('chat_snapshot_done', { pending: result.pending ?? 0 })
+        await this.reportEvent('chat_snapshot_done', {
+          pending: result.pending ?? 0,
+          command_id: typeof action.command_id === 'string' ? action.command_id : undefined,
+        })
       } else {
         this.state.stats.chatRoundsTotal++
         this.state.stats.hrRepliesTotal += result.replied
@@ -645,6 +732,7 @@ export class Orchestrator {
           resumes_sent: result.resumes_sent || 0,
           synced: result.synced || 0,
           cleaned: result.cleaned || 0,
+          command_id: typeof action.command_id === 'string' ? action.command_id : undefined,
         })
       }
       await storage.set(STATE_KEY, this.state)
@@ -685,20 +773,25 @@ export class Orchestrator {
     )
   }
 
-  /** 上报事件到服务器（后端推进编排图；失败不影响本地执行） */
+  /** 将事件先写入本地 outbox，再异步上报；网络失败不能丢状态推进。 */
   private async reportEvent(event: string, details: Record<string, unknown>): Promise<void> {
-    try {
-      await reportOrchestratorEvent(this.config, {
-        event,
-        timestamp: Date.now(),
-        phase: this.state?.phase || 'unknown',
-        stats: this.state?.stats,
-        details,
-        run_id: this.state?.runId || '',
-      })
-    } catch {
-      // 上报失败不影响主流程
+    const runId = this.state?.runId || ''
+    const commandId = typeof details.command_id === 'string' ? details.command_id : ''
+    const eventId = commandId
+      ? `${event}:${commandId}`.slice(0, 64)
+      : `${event}:${runId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`.slice(0, 64)
+    const payload = {
+      event,
+      timestamp: Date.now(),
+      phase: this.state?.phase || 'unknown',
+      stats: this.state?.stats,
+      details,
+      run_id: runId,
+      event_id: eventId,
     }
+    await enqueueOrchestratorEvent({ event_id: eventId, payload })
+    // 立即尝试一次；失败时保留队列，由远程心跳继续冲刷。
+    void flushOrchestratorEvents(this.config)
   }
 
   /**

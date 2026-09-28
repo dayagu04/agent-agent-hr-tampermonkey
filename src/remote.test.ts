@@ -19,7 +19,9 @@ vi.mock('./orchestrator', () => ({
   getOrchestrator: vi.fn(() => ({
     getState: () => null,
     isRunning: () => false,
+    applyBackendAction: vi.fn(async () => true),
   })),
+  flushOrchestratorEvents: vi.fn(async () => undefined),
 }))
 vi.mock('./platforms/boss-chat', () => ({ runChatAudit: vi.fn() }))
 vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
@@ -27,6 +29,7 @@ vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
 import { network, storage } from './platform-bridge'
 import { reportHeartbeatAndPoll } from './remote'
 import { detectPlatform } from './platforms/factory'
+import { getOrchestrator } from './orchestrator'
 
 beforeEach(() => {
   vi.mocked(network.request).mockReset()
@@ -90,6 +93,33 @@ describe('远程心跳命令协议', () => {
 
     await reportHeartbeatAndPoll()
 
+    expect(storage.set).not.toHaveBeenCalled()
+  })
+
+  it('编排动作未被执行器接受时不写 ACK，等待下一次心跳重试', async () => {
+    const applyBackendAction = vi.fn(async () => false)
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-a',
+        commands: [{
+          id: 9,
+          action: 'orchestrator.action',
+          payload: { action: 'apply_batch', command_id: 'cmd-9' },
+        }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(applyBackendAction).toHaveBeenCalledWith({
+      action: 'apply_batch', command_id: 'cmd-9',
+    })
     expect(storage.set).not.toHaveBeenCalled()
   })
 })
