@@ -2449,7 +2449,7 @@ async function processOpenedThread(
   }
 
   // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
-  // 简历卡已在上方优先处理，这里只处理其余卡片（联系方式仍不自动点）。
+  // 简历卡已在上方优先处理，这里只处理其余卡片；联系方式卡片由后端动作/策略分支处理。
   for (const card of findPendingCards()) {
     if (card.kind === 'resume_request' || card.kind === 'contact_exchange') continue
     await handleCard(card, cfg, threadId, log)
