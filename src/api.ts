@@ -588,7 +588,9 @@ export async function recordApplication(
 
 /**
  * POST /api/plugin/orchestrator/event — 上报编排器事件（阶段切换、批次完成、停止）。
- * 失败静默：可观测性不该拖垮投递主流程。
+ *
+ * 返回 false 表示事件没有被服务端确认。调用方可以把事件留在本地 outbox，
+ * 等下一次心跳重试；不能把网络失败当成“事件已经发生”。
  */
 export async function reportOrchestratorEvent(
   cfg: PluginConfig,
@@ -599,8 +601,9 @@ export async function reportOrchestratorEvent(
     stats?: Record<string, number>
     details?: Record<string, unknown>
     run_id?: string
+    event_id?: string
   },
-): Promise<void> {
+): Promise<boolean> {
   try {
     const resp = await network.request({
       method: 'POST',
@@ -610,10 +613,13 @@ export async function reportOrchestratorEvent(
       timeout: 20000,
     })
     if (resp.status !== 200) {
-      diag('API', `编排事件上报返回 ${resp.status}（不影响投递）`)
+      diag('API', `编排事件上报返回 ${resp.status}（已留在本地待重试）`)
+      return false
     }
+    return true
   } catch {
-    /* 上报失败不影响运行 */
+    /* 上报失败不影响运行；编排器本地 outbox 会继续重试 */
+    return false
   }
 }
 

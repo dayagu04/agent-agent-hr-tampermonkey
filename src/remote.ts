@@ -11,7 +11,7 @@ import { network, storage } from './platform-bridge'
 import { diag, flushLogs } from './logger'
 import { startDebugCapture } from './debug'
 import {
-  getCurrentJob, getOrchestrator, getOrchestratorSnapshot, resumeOrchestrator,
+  flushOrchestratorEvents, getCurrentJob, getOrchestrator, getOrchestratorSnapshot, resumeOrchestrator,
 } from './orchestrator'
 import { runChatAudit } from './platforms/boss-chat'
 import { detectPlatform } from './platforms/factory'
@@ -56,6 +56,10 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
   try {
     const cfg = loadConfig()
     if (!isConfigReady(cfg)) return
+
+    // 先冲刷页面跳转/断网期间积压的事件，让后端状态机在本次心跳里看到
+    // 最新的 apply/chat 完成结果，再决定是否下发下一条动作。
+    await flushOrchestratorEvents(cfg)
 
     // 顺带批量上报缓冲日志（logger 内部按 50 条/60 秒门控,非实时）
     void flushLogs()
@@ -216,8 +220,7 @@ async function executeCommand(
         break
       case 'orchestrator.action':
         // 后端 LangGraph 下发的执行指令（apply_batch / chat_snapshot / chat_reply / stop / pause）
-        await orch.applyBackendAction((cmd.payload || {}) as Record<string, unknown>)
-        break
+        return await orch.applyBackendAction((cmd.payload || {}) as Record<string, unknown>)
       case 'chat.audit':
         // 只读会话审计（测试阶段人工核对）：采集分类消息，不回复不删除
         await runChatAudit(cfg, (m) => diag('AUDIT', m), {
@@ -236,6 +239,7 @@ async function executeCommand(
       }
       default:
         console.warn('[remote] 未知命令', cmd.action)
+        return false
     }
     return true
   } catch (e) {
