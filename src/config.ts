@@ -1,5 +1,6 @@
 // 配置存储 — 基于油猴 GM_setValue/GM_getValue 持久化
 import type { PluginConfig } from './types'
+import { DEFAULT_AGENT_POLICY, normalizeAgentPolicy } from './contact-policy'
 
 const CONFIG_KEY = 'aah_plugin_config'
 
@@ -35,6 +36,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   defaultSendResumeId: null,
   resumeNames: {},
   qualityJudge: true,
+  agentPolicy: DEFAULT_AGENT_POLICY,
 }
 
 export function loadConfig(): PluginConfig {
@@ -72,6 +74,11 @@ export function applyPluginPreferences(
 ): PluginConfig {
   if (!prefs || typeof prefs !== 'object') return cfg
   const next = { ...cfg }
+  // Agent 策略由后端统一维护。支持新旧两种形态：
+  // { agent_policy: {...}, contact: {...} } 以及 agent_policy.contact。
+  if (prefs.agent_policy || prefs.contact) {
+    next.agentPolicy = normalizeAgentPolicy(prefs.agent_policy, prefs.contact)
+  }
   if (prefs.reply_scope === 'this_round' || prefs.reply_scope === 'all') {
     next.replyScope = prefs.reply_scope
   }

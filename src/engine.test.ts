@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApplyProgress, JobCard, PlatformCode, PluginConfig } from './types'
+import { DEFAULT_AGENT_POLICY } from './contact-policy'
 import { ApplyEngine } from './engine'
 import { BasePlatform, type ApplyResult } from './platforms/base'
 
@@ -50,6 +51,7 @@ function makeConfig(overrides: Partial<PluginConfig> = {}): PluginConfig {
     defaultSendResumeId: null,
     resumeNames: {},
     qualityJudge: false,
+    agentPolicy: DEFAULT_AGENT_POLICY,
     ...overrides,
   }
 }

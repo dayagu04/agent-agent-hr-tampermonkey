@@ -222,6 +222,42 @@ export async function logDecision(
 }
 
 /** POST /api/plugin/chat/sync — 单条会话同步+回复生成（完整版：去重/已回复判定/评分） */
+export interface ChatContactExchange {
+  /** 后端策略是否明确允许点击；未提供时插件按本地 agentPolicy 判定。 */
+  allowed?: boolean
+  allow?: boolean
+  channel?: string
+  action_id?: number | null
+  actionId?: number | null
+  contact_action_id?: number | null
+  contactActionId?: number | null
+  idempotency_key?: string
+  idempotencyKey?: string
+  reason?: string
+}
+
+export interface SyncChatResponse {
+  conversation_id: number | null
+  new_messages: number
+  intent: string
+  confidence: number
+  reply: string
+  send_resume: boolean
+  action_id: number | null
+  message: string
+  delete_after_send?: boolean
+  /** 新 Agent 联系方式动作；后端尚未统一字段时由插件兼容别名。 */
+  contact_exchange?: ChatContactExchange | boolean | null
+  send_contact?: ChatContactExchange | boolean | null
+  contact?: ChatContactExchange | boolean | null
+  actions?: Array<{
+    type?: string
+    action_type?: string
+    payload?: ChatContactExchange
+    [key: string]: unknown
+  }>
+}
+
 export async function syncChatOne(
   cfg: PluginConfig,
   payload: {
@@ -237,17 +273,7 @@ export async function syncChatOne(
     run_id?: string
     reply_scope?: 'this_round' | 'all'
   },
-): Promise<{
-  conversation_id: number | null
-  new_messages: number
-  intent: string
-  confidence: number
-  reply: string
-  send_resume: boolean
-  action_id: number | null
-  message: string
-  delete_after_send?: boolean
-} | null> {
+): Promise<SyncChatResponse | null> {
   try {
     const resp = await network.request({
       method: 'POST',

@@ -14,6 +14,7 @@ import {
   syncChatOne,
   reconcileThreads,
 } from '../api'
+import type { SyncChatResponse } from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
 import type { ChatPlanTarget } from '../chat-plan'
 import { collectThreadSnapshot } from '../thread-snapshot'
@@ -23,6 +24,11 @@ import {
   removeMirrorByKey,
 } from '../ledger'
 import { loadConfig } from '../config'
+import {
+  contactChannelFromQuestion,
+  isContactExchangeAllowed,
+  normalizeContactChannel,
+} from '../contact-policy'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
 import {
@@ -1068,6 +1074,8 @@ interface ChatCard {
   question: string
   acceptBtn: HTMLElement | null
   rejectBtn: HTMLElement | null
+  /** 卡片容器，用于本轮立即幂等标记，避免点击后 DOM 更新前再次点击。 */
+  element?: HTMLElement | null
 }
 
 /**
@@ -1081,7 +1089,7 @@ interface ChatCard {
 function classifyCard(question: string): ChatCard['kind'] {
   const q = question.replace(/\s/g, '')
   // 联系方式必须先判：它和简历卡片共用同一对按钮，放后面会被简历分支抢走
-  if (/交换联系方式|联系方式|电话|手机号|微信/.test(q)) return 'contact_exchange'
+  if (/交换联系方式|联系方式|电话|手机号|微信|邮箱|邮件|email|mail/.test(q)) return 'contact_exchange'
   if (/附件简历|一份您的简历|您的简历/.test(q)) return 'resume_request'
   if (/工作地点|是否接受此工作地点/.test(q)) return 'location_confirm'
   return 'unknown'
@@ -1177,7 +1185,10 @@ function findPendingCards(): ChatCard[] {
       continue
     }
 
-    cards.push({ kind, question, acceptBtn: accept, rejectBtn: reject })
+    // 同一轮内 findPendingCards 可能在 BOSS 更新消息前再次执行；
+    // 标记放在卡片容器上，避免联系方式/简历卡被重复点击。
+    if (cardEl?.dataset.aahCardHandled === '1') continue
+    cards.push({ kind, question, acceptBtn: accept, rejectBtn: reject, element: cardEl })
   }
 
   if (cards.length) {
@@ -1186,19 +1197,76 @@ function findPendingCards(): ChatCard[] {
   return cards
 }
 
+interface ContactDecision {
+  /** 字段存在即表示后端已给出联系方式动作。 */
+  provided: boolean
+  allowed: boolean | null
+  channel: ReturnType<typeof normalizeContactChannel>
+  actionId: number | null
+  idempotencyKey?: string
+}
+
+/**
+ * 兼容后端策略演进期的三个字段：contact_exchange / send_contact / contact，
+ * 以及 actions[] 中的同名动作。字段不存在时返回 null，交给本地策略判定。
+ */
+function extractContactDecision(res: SyncChatResponse): ContactDecision | null {
+  const record = (value: unknown): Record<string, unknown> | null =>
+    value && typeof value === 'object' ? value as Record<string, unknown> : null
+  const candidates: unknown[] = [res.contact_exchange, res.send_contact, res.contact]
+  if (Array.isArray(res.actions)) {
+    const action = res.actions.find((item) => {
+      const type = String(item.type || item.action_type || '').toLowerCase()
+      return type === 'contact_exchange' || type === 'send_contact' || type === 'exchange_contact'
+    })
+    if (action) candidates.push(action.payload || action)
+  }
+  const raw = candidates.find((value) => value !== undefined && value !== null)
+  if (raw === undefined) return null
+  if (typeof raw === 'boolean') {
+    return { provided: true, allowed: raw, channel: null, actionId: null }
+  }
+  const obj = record(raw)
+  if (!obj) return { provided: true, allowed: null, channel: null, actionId: null }
+  const mode = String(obj.action || obj.decision || '').toLowerCase()
+  const explicit = typeof obj.allowed === 'boolean'
+    ? obj.allowed
+    : typeof obj.allow === 'boolean'
+      ? obj.allow
+      : mode === 'allow'
+        ? true
+        : false
+  const idRaw = obj.contact_action_id ?? obj.contactActionId ?? obj.action_id ?? obj.actionId
+  const actionId = typeof idRaw === 'number' && Number.isFinite(idRaw) ? idRaw : null
+  return {
+    provided: true,
+    allowed: explicit,
+    channel: normalizeContactChannel(obj.channel ?? obj.method ?? obj.type),
+    actionId,
+    idempotencyKey: typeof (obj.idempotency_key ?? obj.idempotencyKey) === 'string'
+      ? String(obj.idempotency_key ?? obj.idempotencyKey)
+      : undefined,
+  }
+}
+
+function markCardHandled(card: ChatCard): void {
+  card.element?.setAttribute('data-aah-card-handled', '1')
+}
+
 /**
  * 处理交互卡片。
  *
  * 简历卡片一律同意（用户已授权全自动投递，索要简历是推进流程的正常环节）；
  * 工作地点是否接受取决于用户偏好城市，按配置处理；
- * 联系方式卡片一律不自动同意：手机号/微信一旦给出无法收回，且大量索要
- * 联系方式的是垃圾招聘方，只记日志留给用户手动决定。
+ * 联系方式卡片按后端 Agent 策略或本地已配置渠道自动处理。没有明确策略时
+ * 保持跳过；未知卡片仍然不自动点击。
  */
 async function handleCard(
   card: ChatCard,
   cfg: PluginConfig,
   expectThread: string,
   log: (m: string) => void,
+  contactDecision?: ContactDecision | null,
 ): Promise<boolean> {
   // 点按钮前同样校验会话身份，防止中途切换点错人
   if (currentThreadId() !== expectThread) {
@@ -1206,13 +1274,47 @@ async function handleCard(
     return false
   }
 
-  // 联系方式：不点任何按钮（同意泄露隐私、拒绝可能误伤好岗位）
   if (card.kind === 'contact_exchange') {
-    log('  ⚠ HR 索要联系方式 → 不自动处理，请手动决定（同意会发出手机号/微信）')
-    diag('CHAT', '⚠ 跳过联系方式交换卡片（需人工决定）', {
-      question: card.question.slice(0, 80),
+    const channel = contactChannelFromQuestion(card.question)
+    // 后端给了动作时，以后端显式决策为准；没有动作才回落到本地策略。
+    if (contactDecision?.channel && channel && contactDecision.channel !== channel) {
+      log(`  ↳ HR 索要${channel}，后端动作渠道为${contactDecision.channel} → 按策略跳过`)
+      diag('CHAT', '跳过联系方式交换卡片（渠道不匹配）', {
+        channel,
+        backendChannel: contactDecision.channel,
+      })
+      return false
+    }
+    if (!channel) {
+      log('  ↳ HR 索要未识别联系方式 → 按策略跳过')
+      diag('CHAT', '跳过联系方式交换卡片（未知渠道）', {
+        backendDecision: contactDecision?.allowed ?? null,
+        question: card.question.slice(0, 80),
+      })
+      return false
+    }
+    const allowed = contactDecision?.provided
+      ? contactDecision.allowed === true
+      : isContactExchangeAllowed(cfg.agentPolicy, channel)
+    if (!allowed || !card.acceptBtn) {
+      log(`  ↳ HR 索要${channel || '联系方式'} → 按策略跳过`)
+      diag('CHAT', '跳过联系方式交换卡片', {
+        channel,
+        backendDecision: contactDecision?.allowed ?? null,
+        question: card.question.slice(0, 80),
+      })
+      return false
+    }
+    // 先写本地幂等标记，再派发点击；页面异步更新期间再次扫描也不会重复交换。
+    markCardHandled(card)
+    log(`  ↳ HR 索要${channel || '联系方式'} → 点「同意」`)
+    realClick(card.acceptBtn)
+    await delay(1200, 2000)
+    diag('CHAT', '已同意交换联系方式', {
+      channel,
+      idempotencyKey: contactDecision?.idempotencyKey || null,
     })
-    return false
+    return true
   }
 
   // 认不出的卡片一律不点：盲点等于把未知授权交给对方
@@ -1226,6 +1328,7 @@ async function handleCard(
 
   if (card.kind === 'resume_request') {
     if (!card.acceptBtn) return false
+    markCardHandled(card)
     log(`  ↳ HR 索要附件简历 → 点「同意」`)
     card.acceptBtn.click()
     await delay(1200, 2000)
@@ -1265,7 +1368,8 @@ async function handleCard(
     } else {
       log('  ↳ 工作地点确认 → 点「可以接受」')
     }
-    card.acceptBtn.click()
+    markCardHandled(card)
+    realClick(card.acceptBtn)
     await delay(1200, 2000)
     return true
   }
@@ -2256,6 +2360,7 @@ async function processOpenedThread(
     intent: res.intent,
     newMessages: res.new_messages,
     hasReply: !!res.reply,
+    contactAction: !!extractContactDecision(res),
     message: (res.message || '').slice(0, 80),
   })
 
@@ -2277,6 +2382,17 @@ async function processOpenedThread(
   let replied = 0
   let resumesSent = 0
   let cleaned = 0
+
+  // 联系方式卡片不依赖文本回复：后端给出 contact action 时按其决策执行，
+  // 没有该字段则按本地 agentPolicy 的已配置渠道执行。先于「无回复」分支处理，
+  // 否则 HR 只索要联系方式时会被提前 return 遗漏。
+  const contactDecision = extractContactDecision(res)
+  for (const card of findPendingCards().filter((c) => c.kind === 'contact_exchange')) {
+    const contactOk = await handleCard(card, cfg, threadId, log, contactDecision)
+    if (contactOk && contactDecision?.actionId) {
+      await markChatSent(cfg, contactDecision.actionId, true, '')
+    }
+  }
 
   if (!res.reply) {
     log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
@@ -2335,7 +2451,7 @@ async function processOpenedThread(
   // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
   // 简历卡已在上方优先处理，这里只处理其余卡片（联系方式仍不自动点）。
   for (const card of findPendingCards()) {
-    if (card.kind === 'resume_request') continue
+    if (card.kind === 'resume_request' || card.kind === 'contact_exchange') continue
     await handleCard(card, cfg, threadId, log)
   }
 
