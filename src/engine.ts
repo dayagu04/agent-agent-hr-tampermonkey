@@ -243,6 +243,10 @@ export class ApplyEngine {
 
       // 3. 筛选推荐岗位（规则过滤 + 匹配阈值），跳过原因上报后端决策日志
       const recommended: Array<{ job: JobCard; score: number }> = []
+      // 页面选择器改版或虚拟列表重渲染时，同一岗位可能在扫描结果中出现多次。
+      // 先按稳定的岗位 ID 去重，避免同一批次重复点击「立即沟通」；跨页续跑
+      // 仍由 skipJobIds 负责，两层护栏分别覆盖不同的重复来源。
+      const seenJobIds = new Set<string>()
       let ruleBlocked = 0
       for (const job of jobs) {
         const r = scoreMap.get(job.platformJobId)
@@ -252,6 +256,24 @@ export class ApplyEngine {
           progress.skipped++
           continue
         }
+
+        // 同一批次内的重复卡片不再进入推荐列表。空 ID 不参与去重：
+        // 非 BOSS 适配器可能暂时只有文本身份，不能把所有空 ID 岗位误合并。
+        if (job.platformJobId && seenJobIds.has(job.platformJobId)) {
+          progress.skipped++
+          this.platform.markCard(job, '#d1d5db')
+          void logDecision(this.config, {
+            run_id: this.runId,
+            platform: this.platform.code,
+            platform_job_id: job.platformJobId,
+            decision: 'blocked_duplicate_in_batch',
+            reason: '同一批次重复岗位卡片，已跳过重复动作',
+            match_score: r?.score,
+            details: { title: job.title, company: job.company },
+          })
+          continue
+        }
+        if (job.platformJobId) seenJobIds.add(job.platformJobId)
 
         // 规则过滤优先于分数（用户明确设的底线不该被高分绕过）
         const hitRule = this.matchBlockRule(job)

@@ -17,7 +17,7 @@ vi.mock('./ledger', () => ({
   cacheScannedJobs: vi.fn(),
 }))
 
-import { fetchRules, judgeJobs, matchJobs, recordApplication } from './api'
+import { fetchRules, judgeJobs, logDecision, matchJobs, recordApplication } from './api'
 
 const job: JobCard = {
   platformJobId: 'j1',
@@ -102,6 +102,30 @@ beforeEach(() => {
 })
 
 describe('ApplyEngine 投递结果口径', () => {
+  it('同一批次重复岗位 ID 只执行一次浏览器动作', async () => {
+    const platform = new FakePlatform()
+    platform.setJobs([
+      job,
+      { ...job, title: '同一岗位的重复卡片' },
+    ])
+    vi.mocked(matchJobs).mockResolvedValue([
+      { platform_job_id: 'j1', score: 0, recommend: true, reason: '仅执行投递护栏' },
+    ])
+
+    const progress = await runEngine(platform, makeConfig())
+
+    expect(platform.applyCalls).toBe(1)
+    expect(progress.applied).toBe(1)
+    expect(progress.skipped).toBe(1)
+    expect(vi.mocked(logDecision)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        platform_job_id: 'j1',
+        decision: 'blocked_duplicate_in_batch',
+      }),
+    )
+  })
+
   it('跨页续跑收到已尝试岗位集合时不再次点击', async () => {
     const firstPlatform = new FakePlatform()
     firstPlatform.setJobs([job])
