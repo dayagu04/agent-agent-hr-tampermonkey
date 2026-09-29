@@ -32,8 +32,32 @@ interface RemoteCommand {
   payload: Record<string, unknown>
 }
 
+/** 与服务端 `/api/plugin/heartbeat` 协商的远程命令协议。 */
+const PLUGIN_PROTOCOL_VERSION = 2
+const PLUGIN_CAPABILITIES = ['command_ack_v2'] as const
+
+interface PluginCompatibility {
+  can_receive_commands?: boolean
+  status?: string
+  reason?: string
+}
+
+function parsePluginCompatibility(value: unknown): PluginCompatibility | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  return {
+    can_receive_commands:
+      typeof raw.can_receive_commands === 'boolean' ? raw.can_receive_commands : undefined,
+    status: typeof raw.status === 'string' ? raw.status : undefined,
+    reason: typeof raw.reason === 'string' ? raw.reason.slice(0, 160) : undefined,
+  }
+}
+
 const COMMAND_ACK_KEY = 'aah_remote_command_ack'
 let heartbeatInFlight = false
+const REMOTE_DIAG_DEDUPE_MS = 30_000
+let lastProtocolDiagnosticKey = ''
+let lastProtocolDiagnosticAt = 0
 
 interface CommandAck {
   epoch: string
@@ -45,6 +69,25 @@ function authHeaders(cfg: ReturnType<typeof loadConfig>): Record<string, string>
     'Content-Type': 'application/json',
     Authorization: `Bearer ${cfg.token}`,
   }
+}
+
+/** 协议降级每秒随心跳返回时只保留低噪声诊断；原因变化或 30s 后再提示。 */
+function protocolDiagnostic(key: string, message: string): void {
+  const now = Date.now()
+  if (
+    key === lastProtocolDiagnosticKey &&
+    now - lastProtocolDiagnosticAt < REMOTE_DIAG_DEDUPE_MS
+  ) {
+    return
+  }
+  lastProtocolDiagnosticKey = key
+  lastProtocolDiagnosticAt = now
+  diag('REMOTE', message)
+}
+
+function clearProtocolDiagnostic(): void {
+  lastProtocolDiagnosticKey = ''
+  lastProtocolDiagnosticAt = 0
 }
 
 /** 上报一次心跳；返回的 commands 由调用方逐条执行 */
@@ -77,6 +120,8 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     const body = {
       platform: currentPlatformCode(),
       version: VERSION,
+      protocol_version: PLUGIN_PROTOCOL_VERSION,
+      capabilities: [...PLUGIN_CAPABILITIES],
       phase,
       running,
       visibility: document.visibilityState,
@@ -107,25 +152,50 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
       timeout: 15000,
     })
     if (resp.status !== 200) return
-    const result = JSON.parse(resp.responseText)
+    const result = JSON.parse(resp.responseText) as Record<string, unknown>
+    const compatibility = parsePluginCompatibility(result.plugin_compatibility)
     const commandEpoch = typeof result.command_epoch === 'string' ? result.command_epoch : ''
-    if (commandEpoch && commandEpoch !== commandAck.epoch) {
-      commandAck = { epoch: commandEpoch, id: 0 }
-      ackCommandId = 0
-    }
-    const commands: RemoteCommand[] = result.commands || []
-    for (const cmd of commands) {
-      if (cmd.id <= ackCommandId) continue
-      if (!await executeCommand(cfg, cmd)) break
-      ackCommandId = cmd.id
-      // 先持久化执行游标；即使命令触发跨页导航，新页面也能在下一次心跳 ACK。
-      commandAck = { epoch: commandEpoch, id: ackCommandId }
-      await storage.set(COMMAND_ACK_KEY, commandAck)
+
+    // 命令协议必须由服务端明确确认。兼容性字段缺失、明确拒绝或缺少
+    // epoch 都按不兼容处理：不执行命令、不推进本地 ACK，等待下一次握手。
+    // 这样旧服务端、代理截断响应和部分部署都不会意外放行远程动作。
+    if (!compatibility || compatibility.can_receive_commands !== true) {
+      const reason = (compatibility?.reason || '服务端未确认远程命令协议')
+        .replace(/[\r\n]+/g, ' ')
+        .slice(0, 120)
+      protocolDiagnostic(`compatibility:${reason}`, `远程命令未执行：${reason}`)
+    } else if (!commandEpoch) {
+      protocolDiagnostic('missing-command-epoch', '远程命令未执行：服务端缺少 command_epoch')
+    } else {
+      if (commandEpoch !== commandAck.epoch) {
+        commandAck = { epoch: commandEpoch, id: 0 }
+        ackCommandId = 0
+      }
+      const rawCommands = result.commands
+      if (rawCommands !== undefined && !Array.isArray(rawCommands)) {
+        protocolDiagnostic('invalid-commands', '远程命令未执行：commands 格式无效')
+      } else {
+        clearProtocolDiagnostic()
+        const commands: RemoteCommand[] = Array.isArray(rawCommands) ? rawCommands : []
+        for (const cmd of commands) {
+          if (!cmd || typeof cmd !== 'object' || typeof cmd.id !== 'number' || typeof cmd.action !== 'string') {
+            protocolDiagnostic('invalid-command-item', '远程命令未执行：命令格式无效')
+            break
+          }
+          if (cmd.id <= ackCommandId) continue
+          if (!await executeCommand(cfg, cmd)) break
+          ackCommandId = cmd.id
+          // 先持久化执行游标；即使命令触发跨页导航，新页面也能在下一次心跳 ACK。
+          commandAck = { epoch: commandEpoch, id: ackCommandId }
+          await storage.set(COMMAND_ACK_KEY, commandAck)
+        }
+      }
     }
     // 网页端插件偏好实时同步：网页端设置优先（任一字段变化都落盘，
     // 否则 cleanRead* 这类设置只进内存、刷新即丢）
-    if (result.plugin_preferences) {
-      const next = applyPluginPreferences(cfg, result.plugin_preferences)
+    const rawPreferences = result.plugin_preferences
+    if (rawPreferences && typeof rawPreferences === 'object' && !Array.isArray(rawPreferences)) {
+      const next = applyPluginPreferences(cfg, rawPreferences as Record<string, unknown>)
       if (
         next.replyScope !== cfg.replyScope ||
         next.maxRepliesPerRound !== cfg.maxRepliesPerRound ||
