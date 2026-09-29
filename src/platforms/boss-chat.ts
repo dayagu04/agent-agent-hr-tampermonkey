@@ -18,6 +18,12 @@ import type { SyncChatResponse } from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
 import type { ChatPlanTarget } from '../chat-plan'
 import { selectChatActionId, shouldReportContactOnly } from '../chat-action-report'
+import {
+  actionForCard,
+  cardActionAllowed,
+  normalizeChatActionPlan,
+} from '../chat-action-plan'
+import type { ChatActionPlan } from '../chat-action-plan'
 import { collectThreadSnapshot } from '../thread-snapshot'
 import {
   flushConversationDeletedMarks,
@@ -1249,7 +1255,21 @@ export function isActionCardAllowed(
  * 兼容后端策略演进期的三个字段：contact_exchange / send_contact / contact，
  * 以及 actions[] 中的同名动作。字段不存在时返回 null，交给本地策略判定。
  */
-function extractContactDecision(res: SyncChatResponse): ContactDecision | null {
+function extractContactDecision(
+  res: SyncChatResponse,
+  actionPlan: ChatActionPlan = normalizeChatActionPlan(res),
+): ContactDecision | null {
+  const planned = actionPlan.contactAction
+  if (planned) {
+    return {
+      provided: true,
+      allowed: planned.allowed,
+      channel: planned.channels?.length === 1 ? planned.channels[0] : null,
+      channels: planned.channels,
+      actionId: planned.actionId,
+      idempotencyKey: planned.idempotencyKey,
+    }
+  }
   const record = (value: unknown): Record<string, unknown> | null =>
     value && typeof value === 'object' ? value as Record<string, unknown> : null
   const candidates: unknown[] = [res.contact_exchange, res.send_contact, res.contact]
@@ -1310,10 +1330,24 @@ async function handleCard(
   expectThread: string,
   log: (m: string) => void,
   contactDecision?: ContactDecision | null,
+  actionPlan: ChatActionPlan = normalizeChatActionPlan({}),
 ): Promise<boolean> {
   // 点按钮前同样校验会话身份，防止中途切换点错人
   if (currentThreadId() !== expectThread) {
     diag('CHAT', '已中止卡片操作：会话已切换')
+    return false
+  }
+
+  // A versioned backend plan is the authority for external side effects.  A
+  // fact such as an interview time or city is never enough to click a card;
+  // the corresponding action must be present and allowed.  Legacy responses
+  // return null and continue through the v0.6.8 local-policy fallback below.
+  const cardKind = card.kind === 'unknown' ? null : card.kind
+  const backendPermission = cardKind ? cardActionAllowed(actionPlan, cardKind) : null
+  const backendAction = cardKind ? actionForCard(actionPlan, cardKind) : null
+  if (backendPermission === false) {
+    log(`  ↳ ${card.kind} 未获后端动作授权 → 跳过`)
+    diag('CHAT', '跳过未获后端授权的卡片动作', { kind: card.kind })
     return false
   }
 
@@ -1394,6 +1428,28 @@ async function handleCard(
       diag('CHAT', '跳过地点卡片（策略未允许城市回答或面试协商）')
       return false
     }
+
+    // A modern plan may explicitly reject or accept the proposed location.
+    // Respect that decision after the local policy gate; do not infer a click
+    // from facts alone.  If no decision is supplied, retain the legacy city
+    // preference behavior below.
+    if (backendAction?.decision === 'reject') {
+      if (!card.rejectBtn) return false
+      markCardHandled(card)
+      log('  ↳ 后端事实/策略判定地点不接受 → 点「暂不考虑」')
+      realClick(card.rejectBtn)
+      await delay(1200, 2000)
+      return true
+    }
+    if (backendAction?.decision === 'allow') {
+      if (!card.acceptBtn) return false
+      markCardHandled(card)
+      log('  ↳ 后端事实/策略判定地点可接受 → 点「可以接受」')
+      realClick(card.acceptBtn)
+      await delay(1200, 2000)
+      return true
+    }
+
     const prefCity = (cfg.prefCity || '').trim()
     const offCity = !!prefCity && !card.question.includes(prefCity)
 
@@ -2407,11 +2463,14 @@ async function processOpenedThread(
     return { synced: 0, replied: 0, resumesSent: 0, cleaned: 0 }
   }
 
+  const actionPlan = normalizeChatActionPlan(res)
   diag('CHAT', `后端返回 ${company || t.company}`, {
     intent: res.intent,
     newMessages: res.new_messages,
-    hasReply: !!res.reply,
-    contactAction: !!extractContactDecision(res),
+    hasReply: !!actionPlan.replyText,
+    contactAction: !!actionPlan.contactAction,
+    actionTypes: actionPlan.actions.map((item) => item.type),
+    factKeys: Object.keys(actionPlan.facts),
     message: (res.message || '').slice(0, 80),
   })
 
@@ -2437,16 +2496,16 @@ async function processOpenedThread(
   // 联系方式卡片不依赖文本回复：后端给出 contact action 时按其决策执行，
   // 没有该字段则按本地 agentPolicy 的已配置渠道执行。先于「无回复」分支处理，
   // 否则 HR 只索要联系方式时会被提前 return 遗漏。
-  const contactDecision = extractContactDecision(res)
+  const contactDecision = extractContactDecision(res, actionPlan)
   let contactSucceeded = false
   for (const card of findPendingCards().filter((c) => c.kind === 'contact_exchange')) {
-    const contactOk = await handleCard(card, cfg, threadId, log, contactDecision)
+    const contactOk = await handleCard(card, cfg, threadId, log, contactDecision, actionPlan)
     if (contactOk) contactSucceeded = true
   }
 
-  const actionId = selectChatActionId(res.action_id, contactDecision?.actionId)
+  const actionId = selectChatActionId(actionPlan.replyActionId, contactDecision?.actionId)
 
-  if (!res.reply) {
+  if (!actionPlan.replyText) {
     log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
     // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
     if (res.delete_after_send) {
@@ -2464,22 +2523,23 @@ async function processOpenedThread(
   // isCardAnswered 会把卡片误判为「已答过」而跳过 → 简历永远发不出去。
   // 因此先点卡片发简历，再发文字回复。
   let resumeCardHandled = false
-  const resumePolicyAllowed = isActionCardAllowed(cfg.agentPolicy, 'resume_request')
-  if (res.send_resume && resumePolicyAllowed) {
+  const resumePolicyAllowed = isActionCardAllowed(cfg.agentPolicy, 'resume_request') &&
+    cardActionAllowed(actionPlan, 'resume_request') !== false
+  if (actionPlan.sendResume && resumePolicyAllowed) {
     const resumeCard = findPendingCards().find((c) => c.kind === 'resume_request')
     if (resumeCard) {
-      resumeCardHandled = await handleCard(resumeCard, cfg, threadId, log)
+      resumeCardHandled = await handleCard(resumeCard, cfg, threadId, log, null, actionPlan)
     }
-  } else if (res.send_resume && !resumePolicyAllowed) {
+  } else if (actionPlan.sendResume && !resumePolicyAllowed) {
     log('  ↳ 后端建议发送简历，但当前 Agent 策略未允许，跳过简历副作用')
   }
 
   // 发送回复（当前会话已打开，直接发，无需重开）
-  log(`  [${company || t.company}] 回复: ${res.reply}`)
-  const ok = await sendText(res.reply, threadId)
+  log(`  [${company || t.company}] 回复: ${actionPlan.replyText}`)
+  const ok = await sendText(actionPlan.replyText, threadId)
   if (ok) {
     replied++
-    if (res.send_resume) {
+    if (actionPlan.sendResume) {
       // 卡片路径已发简历则跳过；否则退回输入区「发简历」按钮路径
       let resumeOk = resumePolicyAllowed && resumeCardHandled
       if (resumePolicyAllowed && !resumeOk) resumeOk = await sendResume()
@@ -2510,7 +2570,7 @@ async function processOpenedThread(
   // 简历卡已在上方优先处理，这里只处理其余卡片；联系方式卡片由后端动作/策略分支处理。
   for (const card of findPendingCards()) {
     if (card.kind === 'resume_request' || card.kind === 'contact_exchange') continue
-    await handleCard(card, cfg, threadId, log)
+    await handleCard(card, cfg, threadId, log, null, actionPlan)
   }
 
   await delay(800, 1600) // 会话间间隔
