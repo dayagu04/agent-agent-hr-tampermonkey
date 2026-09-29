@@ -102,6 +102,28 @@ beforeEach(() => {
 })
 
 describe('ApplyEngine 投递结果口径', () => {
+  it('跨页续跑收到已尝试岗位集合时不再次点击', async () => {
+    const firstPlatform = new FakePlatform()
+    firstPlatform.setJobs([job])
+    const first = await runEngine(firstPlatform, makeConfig())
+    expect(first.applied).toBe(1)
+    expect(firstPlatform.applyCalls).toBe(1)
+
+    const resumedPlatform = new FakePlatform()
+    resumedPlatform.setJobs([job])
+    const resumed = await new ApplyEngine(
+      resumedPlatform,
+      makeConfig(),
+      () => {},
+      new Set(['j1']),
+      'run-test',
+    ).run()
+
+    expect(resumedPlatform.applyCalls).toBe(0)
+    expect(resumed.applied).toBe(0)
+    expect(resumed.skipped).toBe(1)
+  })
+
   it('Agent 策略禁止投递时在浏览器动作前跳过岗位', async () => {
     const platform = new FakePlatform()
     platform.setJobs([job])
