@@ -171,6 +171,30 @@ describe('远程心跳命令协议', () => {
     expect(vi.mocked(diag)).toHaveBeenCalledTimes(2)
   })
 
+  it('握手许可但缺少 command_epoch 时仍不执行或 ACK', async () => {
+    const applyBackendAction = vi.fn(async () => true)
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        plugin_compatibility: compatible,
+        commands: [{ id: 10, action: 'orchestrator.action', payload: { action: 'stop' } }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(applyBackendAction).not.toHaveBeenCalled()
+    expect(storage.set).not.toHaveBeenCalled()
+    expect(vi.mocked(diag)).toHaveBeenCalledWith(
+      'REMOTE', expect.stringContaining('缺少 command_epoch'),
+    )
+  })
+
   it('慢请求期间不启动重叠心跳', async () => {
     let resolveRequest!: (value: { status: number; responseText: string }) => void
     vi.mocked(network.request).mockImplementation(() => new Promise((resolve) => {
