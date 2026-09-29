@@ -133,8 +133,12 @@ export function isContactExchangeAllowed(
     ? [`exchange_${channel}`, 'contact_exchange']
     : ['contact_exchange']
   const explicit = actionKeys.map((key) => p.actions?.[key]).find((v) => v !== undefined)
-  if (explicit && explicit !== 'allow') return false
-  if (p.mode !== 'full_auto' && explicit !== 'allow') return false
+  // Notifications are deliberately not approval gates.  Only an explicit
+  // deny/ask_once (or an un-overridden manual policy) may block the card.
+  // This mirrors the server evaluator so a guided policy does not silently
+  // turn into a skip merely because the browser is executing the card.
+  if (explicit === 'deny' || explicit === 'ask_once') return false
+  if (p.mode === 'manual' && explicit !== 'allow') return false
 
   const channels = p.contact?.channels || []
   // 没有明确渠道时无法证明用户允许交换哪种联系方式；未知问题必须人工处理。

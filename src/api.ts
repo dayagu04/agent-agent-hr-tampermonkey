@@ -226,6 +226,9 @@ export interface ChatContactExchange {
   /** 后端策略是否明确允许点击；未提供时插件按本地 agentPolicy 判定。 */
   allowed?: boolean
   allow?: boolean
+  /** 后端按请求文本计算出的允许渠道；存在时插件必须逐卡片校验。 */
+  channels?: string[]
+  requested_channels?: string[]
   channel?: string
   action_id?: number | null
   actionId?: number | null
