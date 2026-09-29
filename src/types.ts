@@ -3,6 +3,26 @@
 /** 平台代号 */
 export type PlatformCode = 'zhipin' | 'zhaopin' | 'liepin' | 'qiancheng'
 
+/** Agent 的单个动作策略。后端可按动作覆盖，插件只在 allow 时直接执行。 */
+export type AgentActionMode = 'allow' | 'deny' | 'notify_after' | 'notify_before' | 'ask_once'
+
+/** BOSS 联系方式卡片允许交换的渠道。 */
+export type ContactChannel = 'phone' | 'wechat' | 'email' | 'other'
+
+/** 来自 users.plugin_preferences 的联系方式策略（snake_case 与 camelCase 均由解析层兼容）。 */
+export interface ContactPolicy {
+  channels: ContactChannel[]
+  allowPlatformCard: boolean
+}
+
+/** BOSS Agent 策略。LLM 不直接决定权限，插件只执行这里允许的动作。 */
+export interface AgentPolicy {
+  /** Backend uses `guided`; `assisted` remains for older clients/preferences. */
+  mode: 'full_auto' | 'guided' | 'assisted' | 'manual'
+  actions: Record<string, AgentActionMode>
+  contact: ContactPolicy
+}
+
 /** 从页面扫描到的单个岗位卡片 */
 export interface JobCard {
   platformJobId: string // 平台职位唯一 ID（去重用）
@@ -109,6 +129,8 @@ export interface PluginConfig {
   resumeNames: Record<string, string>
   /** 是否启用 LLM 低质量岗位判定（外包/批量招聘等，默认开启） */
   qualityJudge: boolean
+  /** 网页端同步的 Agent 策略；联系方式卡片由此策略决定是否自动同意。 */
+  agentPolicy: AgentPolicy
 }
 
 /** 面板 Tab 键 */

@@ -14,6 +14,7 @@ import {
 } from './api'
 import { cacheScannedJobs } from './ledger'
 import { hhmmss } from './logger'
+import { isAgentActionAllowed } from './contact-policy'
 
 export class ApplyEngine {
   private aborted = false
@@ -382,6 +383,24 @@ export class ApplyEngine {
           break
         }
 
+        // 后端编排器通常已在下发批次前完成策略判断；这里再做一次本地
+        // 护栏，覆盖旧页面缓存或用户在另一标签页刚修改策略的窗口。
+        if (!isAgentActionAllowed(this.config.agentPolicy, 'apply')) {
+          progress.skipped++
+          this.attemptedIds.push(job.platformJobId)
+          this.platform.markCard(job, '#d1d5db')
+          log(`跳过: ${job.title} @ ${job.company}（Agent 策略禁止投递）`)
+          void logDecision(this.config, {
+            run_id: this.runId,
+            platform: this.platform.code,
+            platform_job_id: job.platformJobId,
+            decision: 'policy_denied',
+            reason: 'Agent 策略禁止 apply',
+            details: { title: job.title, company: job.company },
+          })
+          continue
+        }
+
         // 投递前更新当前岗位（实时显示用）
         progress.currentJob = { title: job.title, company: job.company, score }
         this.onProgress({ ...progress })
@@ -398,7 +417,9 @@ export class ApplyEngine {
         try {
           // 注入招呼语获取器：BOSS 建立会话需发首条消息，复用后端主项目话术
           const raw = await this.platform.applyJob(job, {
-            getGreeting: () => fetchGreeting(this.config, this.platform.code, job),
+            getGreeting: () => isAgentActionAllowed(this.config.agentPolicy, 'send_greeting')
+              ? fetchGreeting(this.config, this.platform.code, job)
+              : Promise.resolve(''),
           })
           // 兼容旧签名（boolean）与新签名（ApplyResult）
           if (typeof raw === 'boolean') {

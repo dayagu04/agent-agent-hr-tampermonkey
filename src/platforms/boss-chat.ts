@@ -6,7 +6,7 @@
 // 红线：只在用户显式启动「会话托管」后运行。发给 HR 的消息不可撤回，
 // 全过程由后端 conversation_* 三表留痕（意图/回复/发送结果）供事后评判。
 import { diag } from '../logger'
-import type { PluginConfig } from '../types'
+import type { AgentPolicy, ContactChannel, PluginConfig } from '../types'
 import {
   markChatSent,
   reportChatAudit,
@@ -14,8 +14,10 @@ import {
   syncChatOne,
   reconcileThreads,
 } from '../api'
+import type { SyncChatResponse } from '../api'
 import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
 import type { ChatPlanTarget } from '../chat-plan'
+import { selectChatActionId, shouldReportContactOnly } from '../chat-action-report'
 import { collectThreadSnapshot } from '../thread-snapshot'
 import {
   flushConversationDeletedMarks,
@@ -23,6 +25,12 @@ import {
   removeMirrorByKey,
 } from '../ledger'
 import { loadConfig } from '../config'
+import {
+  contactChannelFromQuestion,
+  isAgentActionAllowed,
+  isContactExchangeAllowed,
+  normalizeContactChannel,
+} from '../contact-policy'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
 import {
@@ -1068,6 +1076,8 @@ interface ChatCard {
   question: string
   acceptBtn: HTMLElement | null
   rejectBtn: HTMLElement | null
+  /** 卡片容器，用于本轮立即幂等标记，避免点击后 DOM 更新前再次点击。 */
+  element?: HTMLElement | null
 }
 
 /**
@@ -1078,10 +1088,12 @@ interface ChatCard {
  * 判定必须以问题文本为准，按钮对只作为「这是个卡片」的信号；
  * 认不出来的类型一律不自动点，宁可漏也不能乱点。
  */
-function classifyCard(question: string): ChatCard['kind'] {
+export function classifyCard(question: string): ChatCard['kind'] {
   const q = question.replace(/\s/g, '')
   // 联系方式必须先判：它和简历卡片共用同一对按钮，放后面会被简历分支抢走
-  if (/交换联系方式|联系方式|电话|手机号|微信/.test(q)) return 'contact_exchange'
+  const contactAction = /交换|留下?|留个|提供|发送|发给|发我|给我|加个|加一下|添加/.test(q)
+  const hasContact = /联系方式|手机号|手机|微信|邮箱|邮件|email|mail/.test(q)
+  if (contactAction && hasContact) return 'contact_exchange'
   if (/附件简历|一份您的简历|您的简历/.test(q)) return 'resume_request'
   if (/工作地点|是否接受此工作地点/.test(q)) return 'location_confirm'
   return 'unknown'
@@ -1177,7 +1189,10 @@ function findPendingCards(): ChatCard[] {
       continue
     }
 
-    cards.push({ kind, question, acceptBtn: accept, rejectBtn: reject })
+    // 同一轮内 findPendingCards 可能在 BOSS 更新消息前再次执行；
+    // 标记放在卡片容器上，避免联系方式/简历卡被重复点击。
+    if (cardEl?.dataset.aahCardHandled === '1') continue
+    cards.push({ kind, question, acceptBtn: accept, rejectBtn: reject, element: cardEl })
   }
 
   if (cards.length) {
@@ -1186,19 +1201,115 @@ function findPendingCards(): ChatCard[] {
   return cards
 }
 
+export interface ContactDecision {
+  /** 字段存在即表示后端已给出联系方式动作。 */
+  provided: boolean
+  allowed: boolean | null
+  channel: ReturnType<typeof normalizeContactChannel>
+  /** 若后端返回此字段，必须按每张卡片的渠道逐一匹配。 */
+  channels?: ContactChannel[]
+  actionId: number | null
+  idempotencyKey?: string
+}
+
+/**
+ * 计算单张联系方式卡片是否可点击。
+ * 后端返回 channels 时它是权限边界，不能只看 allowed=true；没有渠道信息
+ * 时才回落到旧协议的单渠道字段或插件本地策略。
+ */
+export function isContactCardAllowed(
+  decision: ContactDecision | null | undefined,
+  channel: ContactChannel | null,
+  policy: AgentPolicy | null | undefined,
+): boolean {
+  if (!channel) return false
+  if (decision?.provided) {
+    if (decision.allowed !== true) return false
+    if (decision.channels) return decision.channels.includes(channel)
+    if (decision.channel) return decision.channel === channel
+  }
+  return isContactExchangeAllowed(policy, channel)
+}
+
+/** 卡片副作用使用与后端相同的动作键，防止卡片路径绕过 Agent 策略。 */
+export function isActionCardAllowed(
+  policy: AgentPolicy | null | undefined,
+  kind: ChatCard['kind'],
+): boolean {
+  if (kind === 'resume_request') return isAgentActionAllowed(policy, 'send_resume')
+  if (kind === 'location_confirm') {
+    // 地点卡片既会回答城市，也可能推进面试地点协商；两项都必须允许。
+    return isAgentActionAllowed(policy, 'answer_city') &&
+      isAgentActionAllowed(policy, 'negotiate_interview')
+  }
+  return true
+}
+
+/**
+ * 兼容后端策略演进期的三个字段：contact_exchange / send_contact / contact，
+ * 以及 actions[] 中的同名动作。字段不存在时返回 null，交给本地策略判定。
+ */
+function extractContactDecision(res: SyncChatResponse): ContactDecision | null {
+  const record = (value: unknown): Record<string, unknown> | null =>
+    value && typeof value === 'object' ? value as Record<string, unknown> : null
+  const candidates: unknown[] = [res.contact_exchange, res.send_contact, res.contact]
+  if (Array.isArray(res.actions)) {
+    const action = res.actions.find((item) => {
+      const type = String(item.type || item.action_type || '').toLowerCase()
+      return type === 'contact_exchange' || type === 'send_contact' || type === 'exchange_contact'
+    })
+    if (action) candidates.push(action.payload || action)
+  }
+  const raw = candidates.find((value) => value !== undefined && value !== null)
+  if (raw === undefined) return null
+  if (typeof raw === 'boolean') {
+    return { provided: true, allowed: raw, channel: null, actionId: null }
+  }
+  const obj = record(raw)
+  if (!obj) return { provided: true, allowed: null, channel: null, actionId: null }
+  const mode = String(obj.action || obj.decision || '').toLowerCase()
+  const explicit = typeof obj.allowed === 'boolean'
+    ? obj.allowed
+    : typeof obj.allow === 'boolean'
+      ? obj.allow
+      : mode === 'allow'
+        ? true
+        : false
+  const idRaw = obj.contact_action_id ?? obj.contactActionId ?? obj.action_id ?? obj.actionId
+  const actionId = typeof idRaw === 'number' && Number.isFinite(idRaw) ? idRaw : null
+  const channels = Array.isArray(obj.channels)
+    ? Array.from(new Set(obj.channels.map(normalizeContactChannel).filter((v): v is ContactChannel => !!v)))
+    : undefined
+  return {
+    provided: true,
+    allowed: explicit,
+    channel: normalizeContactChannel(obj.channel ?? obj.method ?? obj.type),
+    channels,
+    actionId,
+    idempotencyKey: typeof (obj.idempotency_key ?? obj.idempotencyKey) === 'string'
+      ? String(obj.idempotency_key ?? obj.idempotencyKey)
+      : undefined,
+  }
+}
+
+function markCardHandled(card: ChatCard): void {
+  card.element?.setAttribute('data-aah-card-handled', '1')
+}
+
 /**
  * 处理交互卡片。
  *
  * 简历卡片一律同意（用户已授权全自动投递，索要简历是推进流程的正常环节）；
  * 工作地点是否接受取决于用户偏好城市，按配置处理；
- * 联系方式卡片一律不自动同意：手机号/微信一旦给出无法收回，且大量索要
- * 联系方式的是垃圾招聘方，只记日志留给用户手动决定。
+ * 联系方式卡片按后端 Agent 策略或本地已配置渠道自动处理。没有明确策略时
+ * 保持跳过；未知卡片仍然不自动点击。
  */
 async function handleCard(
   card: ChatCard,
   cfg: PluginConfig,
   expectThread: string,
   log: (m: string) => void,
+  contactDecision?: ContactDecision | null,
 ): Promise<boolean> {
   // 点按钮前同样校验会话身份，防止中途切换点错人
   if (currentThreadId() !== expectThread) {
@@ -1206,13 +1317,45 @@ async function handleCard(
     return false
   }
 
-  // 联系方式：不点任何按钮（同意泄露隐私、拒绝可能误伤好岗位）
   if (card.kind === 'contact_exchange') {
-    log('  ⚠ HR 索要联系方式 → 不自动处理，请手动决定（同意会发出手机号/微信）')
-    diag('CHAT', '⚠ 跳过联系方式交换卡片（需人工决定）', {
-      question: card.question.slice(0, 80),
+    const channel = contactChannelFromQuestion(card.question)
+    // 后端给了动作时，以后端显式决策为准；没有动作才回落到本地策略。
+    if (contactDecision?.channel && channel && contactDecision.channel !== channel) {
+      log(`  ↳ HR 索要${channel}，后端动作渠道为${contactDecision.channel} → 按策略跳过`)
+      diag('CHAT', '跳过联系方式交换卡片（渠道不匹配）', {
+        channel,
+        backendChannel: contactDecision.channel,
+      })
+      return false
+    }
+    if (!channel) {
+      log('  ↳ HR 索要未识别联系方式 → 按策略跳过')
+      diag('CHAT', '跳过联系方式交换卡片（未知渠道）', {
+        backendDecision: contactDecision?.allowed ?? null,
+        question: card.question.slice(0, 80),
+      })
+      return false
+    }
+    const allowed = isContactCardAllowed(contactDecision, channel, cfg.agentPolicy)
+    if (!allowed || !card.acceptBtn) {
+      log(`  ↳ HR 索要${channel || '联系方式'} → 按策略跳过`)
+      diag('CHAT', '跳过联系方式交换卡片', {
+        channel,
+        backendDecision: contactDecision?.allowed ?? null,
+        question: card.question.slice(0, 80),
+      })
+      return false
+    }
+    // 先写本地幂等标记，再派发点击；页面异步更新期间再次扫描也不会重复交换。
+    markCardHandled(card)
+    log(`  ↳ HR 索要${channel || '联系方式'} → 点「同意」`)
+    realClick(card.acceptBtn)
+    await delay(1200, 2000)
+    diag('CHAT', '已同意交换联系方式', {
+      channel,
+      idempotencyKey: contactDecision?.idempotencyKey || null,
     })
-    return false
+    return true
   }
 
   // 认不出的卡片一律不点：盲点等于把未知授权交给对方
@@ -1225,21 +1368,32 @@ async function handleCard(
   }
 
   if (card.kind === 'resume_request') {
+    if (!isActionCardAllowed(cfg.agentPolicy, card.kind)) {
+      log('  ↳ HR 索要附件简历 → 按 Agent 策略跳过')
+      diag('CHAT', '跳过简历卡片（策略未允许发送简历）')
+      return false
+    }
     if (!card.acceptBtn) return false
+    markCardHandled(card)
     log(`  ↳ HR 索要附件简历 → 点「同意」`)
     card.acceptBtn.click()
     await delay(1200, 2000)
     diag('CHAT', '已同意发送附件简历')
     // 同意后 BOSS 弹简历选择框（多简历时）：选默认简历并发送
-    const cfg = loadConfig()
+    const resumeCfg = loadConfig()
     const targetName =
-      cfg.defaultSendResumeId && cfg.resumeNames
-        ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
+      resumeCfg.defaultSendResumeId && resumeCfg.resumeNames
+        ? resumeCfg.resumeNames[String(resumeCfg.defaultSendResumeId)] || null
         : null
     return await completeResumeSend(targetName)
   }
 
   if (card.kind === 'location_confirm') {
+    if (!isActionCardAllowed(cfg.agentPolicy, card.kind)) {
+      log('  ↳ 工作地点确认 → 按 Agent 策略跳过')
+      diag('CHAT', '跳过地点卡片（策略未允许城市回答或面试协商）')
+      return false
+    }
     const prefCity = (cfg.prefCity || '').trim()
     const offCity = !!prefCity && !card.question.includes(prefCity)
 
@@ -1265,7 +1419,8 @@ async function handleCard(
     } else {
       log('  ↳ 工作地点确认 → 点「可以接受」')
     }
-    card.acceptBtn.click()
+    markCardHandled(card)
+    realClick(card.acceptBtn)
     await delay(1200, 2000)
     return true
   }
@@ -2256,6 +2411,7 @@ async function processOpenedThread(
     intent: res.intent,
     newMessages: res.new_messages,
     hasReply: !!res.reply,
+    contactAction: !!extractContactDecision(res),
     message: (res.message || '').slice(0, 80),
   })
 
@@ -2278,12 +2434,27 @@ async function processOpenedThread(
   let resumesSent = 0
   let cleaned = 0
 
+  // 联系方式卡片不依赖文本回复：后端给出 contact action 时按其决策执行，
+  // 没有该字段则按本地 agentPolicy 的已配置渠道执行。先于「无回复」分支处理，
+  // 否则 HR 只索要联系方式时会被提前 return 遗漏。
+  const contactDecision = extractContactDecision(res)
+  let contactSucceeded = false
+  for (const card of findPendingCards().filter((c) => c.kind === 'contact_exchange')) {
+    const contactOk = await handleCard(card, cfg, threadId, log, contactDecision)
+    if (contactOk) contactSucceeded = true
+  }
+
+  const actionId = selectChatActionId(res.action_id, contactDecision?.actionId)
+
   if (!res.reply) {
     log(`  [${company || t.company}] 无需回复（${res.message || ''}）`)
     // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
     if (res.delete_after_send) {
       log(`  ↳ 策略删除会话（${res.message || ''}）`)
       if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'low_quality', log)) cleaned++
+    }
+    if (shouldReportContactOnly(false, contactSucceeded) && actionId !== null) {
+      await markChatSent(cfg, actionId, true, '')
     }
     return { synced: 1, replied: 0, resumesSent: 0, cleaned }
   }
@@ -2293,11 +2464,14 @@ async function processOpenedThread(
   // isCardAnswered 会把卡片误判为「已答过」而跳过 → 简历永远发不出去。
   // 因此先点卡片发简历，再发文字回复。
   let resumeCardHandled = false
-  if (res.send_resume) {
+  const resumePolicyAllowed = isActionCardAllowed(cfg.agentPolicy, 'resume_request')
+  if (res.send_resume && resumePolicyAllowed) {
     const resumeCard = findPendingCards().find((c) => c.kind === 'resume_request')
     if (resumeCard) {
       resumeCardHandled = await handleCard(resumeCard, cfg, threadId, log)
     }
+  } else if (res.send_resume && !resumePolicyAllowed) {
+    log('  ↳ 后端建议发送简历，但当前 Agent 策略未允许，跳过简历副作用')
   }
 
   // 发送回复（当前会话已打开，直接发，无需重开）
@@ -2307,17 +2481,17 @@ async function processOpenedThread(
     replied++
     if (res.send_resume) {
       // 卡片路径已发简历则跳过；否则退回输入区「发简历」按钮路径
-      let resumeOk = resumeCardHandled
-      if (!resumeOk) resumeOk = await sendResume()
+      let resumeOk = resumePolicyAllowed && resumeCardHandled
+      if (resumePolicyAllowed && !resumeOk) resumeOk = await sendResume()
       if (!resumeOk) log('  ↳ 简历未发出，需手动处理')
       else resumesSent++
       // 简历未发出时不得标记 sent：否则后端统计会把「文本已发、简历没发」
       // 的动作也计成已发简历（历史计数虚高根因之一）。
-      if (res.action_id) {
-        await markChatSent(cfg, res.action_id, resumeOk, resumeOk ? '' : '简历未发出')
+      if (actionId !== null) {
+        await markChatSent(cfg, actionId, resumeOk, resumeOk ? '' : '简历未发出')
       }
-    } else if (res.action_id) {
-      await markChatSent(cfg, res.action_id, true, '')
+    } else if (actionId !== null) {
+      await markChatSent(cfg, actionId, true, '')
     }
     // 明确被拒：后端已换成「拿信息」话术；会话保留等原因（不再发完即删），
     // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
@@ -2327,15 +2501,15 @@ async function processOpenedThread(
     }
   } else {
     log(`  [${company || t.company}] 未发送（会话已切换或发送失败）`)
-    if (res.action_id) {
-      await markChatSent(cfg, res.action_id, false, '页面发送未确认')
+    if (actionId !== null) {
+      await markChatSent(cfg, actionId, false, '页面发送未确认')
     }
   }
 
   // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
-  // 简历卡已在上方优先处理，这里只处理其余卡片（联系方式仍不自动点）。
+  // 简历卡已在上方优先处理，这里只处理其余卡片；联系方式卡片由后端动作/策略分支处理。
   for (const card of findPendingCards()) {
-    if (card.kind === 'resume_request') continue
+    if (card.kind === 'resume_request' || card.kind === 'contact_exchange') continue
     await handleCard(card, cfg, threadId, log)
   }
 

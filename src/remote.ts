@@ -132,7 +132,8 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
         next.minReplyScore !== cfg.minReplyScore ||
         next.cleanReadConversations !== cfg.cleanReadConversations ||
         next.cleanReadAfterHours !== cfg.cleanReadAfterHours ||
-        next.defaultSendResumeId !== cfg.defaultSendResumeId
+        next.defaultSendResumeId !== cfg.defaultSendResumeId ||
+        JSON.stringify(next.agentPolicy) !== JSON.stringify(cfg.agentPolicy)
       ) {
         saveConfig(next)
       }

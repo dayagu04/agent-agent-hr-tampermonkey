@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApplyProgress, JobCard, PlatformCode, PluginConfig } from './types'
+import { DEFAULT_AGENT_POLICY } from './contact-policy'
 import { ApplyEngine } from './engine'
 import { BasePlatform, type ApplyResult } from './platforms/base'
 
@@ -50,6 +51,7 @@ function makeConfig(overrides: Partial<PluginConfig> = {}): PluginConfig {
     defaultSendResumeId: null,
     resumeNames: {},
     qualityJudge: false,
+    agentPolicy: DEFAULT_AGENT_POLICY,
     ...overrides,
   }
 }
@@ -60,6 +62,7 @@ class FakePlatform extends BasePlatform {
   readonly chatUrl = ''
   private jobs: JobCard[] = []
   private result: boolean | ApplyResult = { outcome: 'applied' }
+  applyCalls = 0
 
   setJobs(jobs: JobCard[]): void {
     this.jobs = jobs
@@ -74,6 +77,7 @@ class FakePlatform extends BasePlatform {
   }
 
   async applyJob(): Promise<boolean | ApplyResult> {
+    this.applyCalls++
     return this.result
   }
 }
@@ -98,6 +102,22 @@ beforeEach(() => {
 })
 
 describe('ApplyEngine 投递结果口径', () => {
+  it('Agent 策略禁止投递时在浏览器动作前跳过岗位', async () => {
+    const platform = new FakePlatform()
+    platform.setJobs([job])
+    const progress = await runEngine(platform, makeConfig({
+      agentPolicy: {
+        ...DEFAULT_AGENT_POLICY,
+        actions: { apply: 'deny' },
+      },
+    }))
+
+    expect(platform.applyCalls).toBe(0)
+    expect(progress.applied).toBe(0)
+    expect(progress.skipped).toBe(1)
+    expect(progress.logs.join('\n')).toContain('策略禁止投递')
+  })
+
   it('已沟通过的岗位（alreadyApplied）计为跳过并向后端补记真实投递', async () => {
     const platform = new FakePlatform()
     platform.setJobs([job])
