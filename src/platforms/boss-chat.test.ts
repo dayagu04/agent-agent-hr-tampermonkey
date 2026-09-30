@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   classifyCard,
+  findDialogButton,
+  findResumeDialog,
   isActionCardAllowed,
   isContactCardAllowed,
 } from './boss-chat'
@@ -50,5 +52,50 @@ describe('BOSS interaction card classification', () => {
       { channels: [] },
     )
     expect(isActionCardAllowed(locationDenied, 'location_confirm')).toBe(false)
+  })
+})
+
+describe('BOSS resume picker DOM handling', () => {
+  function setRect(el: Element, width: number, height: number): void {
+    vi.spyOn(el, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: height,
+      width,
+      height,
+      toJSON: () => ({}),
+    })
+  }
+
+  it('finds the visible resume picker and its send button through a portal dialog', () => {
+    document.body.innerHTML = `
+      <div role="dialog" class="upload-resume-dialog">
+        <div class="dialog-header">请选择要发送的简历</div>
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const button = dialog.querySelector('button') as HTMLElement
+    setRect(dialog, 720, 398)
+    setRect(button, 100, 40)
+
+    expect(findResumeDialog()).toBe(dialog)
+    expect(findDialogButton(dialog, /^(发送|确定)$/)).toBe(button)
+  })
+
+  it('ignores hidden dialog remnants after the picker closes', () => {
+    document.body.innerHTML = `
+      <div class="dialog-wrap upload-resume-dialog">
+        <div>请选择要发送的简历</div>
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('.dialog-wrap') as HTMLElement
+    setRect(dialog, 0, 0)
+
+    expect(findResumeDialog()).toBeNull()
   })
 })
