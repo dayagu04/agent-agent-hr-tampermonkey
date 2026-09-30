@@ -7,7 +7,7 @@ const CONFIG_KEY = 'aah_plugin_config'
 /**
  * 服务器地址构建期固定：不需要用户填写。
  * - 生产构建：VITE_API_BASE 留空 → https://gudaya.chat
- * - 本地测试构建：VITE_API_BASE=http://127.0.0.1:8010 npm run build
+ * - 本地测试构建：npm run build:local（默认 http://127.0.0.1:8010；也可先设置 VITE_API_BASE）
  */
 const BUILTIN_API_BASE: string = import.meta.env.VITE_API_BASE || 'https://gudaya.chat'
 

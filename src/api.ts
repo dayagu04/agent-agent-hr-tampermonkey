@@ -249,6 +249,12 @@ export interface SyncChatResponse {
   action_id: number | null
   message: string
   delete_after_send?: boolean
+  /** Versioned fact/action response. Facts never grant permission by themselves. */
+  facts?: Record<string, unknown> | null
+  fact_context?: Record<string, unknown> | null
+  personal_facts?: Record<string, unknown> | null
+  actions_authoritative?: boolean
+  action_plan_version?: number
   /** 新 Agent 联系方式动作；后端尚未统一字段时由插件兼容别名。 */
   contact_exchange?: ChatContactExchange | boolean | null
   send_contact?: ChatContactExchange | boolean | null
