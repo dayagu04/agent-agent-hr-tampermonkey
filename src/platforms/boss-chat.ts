@@ -1410,7 +1410,9 @@ async function handleCard(
     if (!card.acceptBtn) return false
     markCardHandled(card)
     log(`  ↳ HR 索要附件简历 → 点「同意」`)
-    card.acceptBtn.click()
+    // The card is also handled by BOSS's delegated Vue listener. The old
+    // bare click() could leave the follow-up resume picker unopened.
+    realClick(card.acceptBtn)
     await delay(1200, 2000)
     diag('CHAT', '已同意发送附件简历')
     // 同意后 BOSS 弹简历选择框（多简历时）：选默认简历并发送
@@ -1495,7 +1497,7 @@ function isDialogButtonDisabled(el: HTMLElement): boolean {
 }
 
 /** 在弹窗里找按钮：只匹配叶子节点自身文本，排除 拒绝/取消，且可见 */
-function findDialogButton(root: HTMLElement, re: RegExp): HTMLElement | null {
+export function findDialogButton(root: HTMLElement, re: RegExp): HTMLElement | null {
   const els = Array.from(root.querySelectorAll('div,span,button,a,[role="button"]')) as HTMLElement[]
   for (const el of els) {
     const own = Array.from(el.childNodes)
@@ -1522,9 +1524,9 @@ function normResumeName(s: string): string {
 }
 
 /** 定位简历弹窗：优先「请选择要发送的简历」选择框，其次确认框，兜底 .dialog-wrap.active */
-function findResumeDialog(): HTMLElement | null {
+export function findResumeDialog(): HTMLElement | null {
   const cands = Array.from(document.querySelectorAll(
-    '[class*="dialog"], [class*="modal"], [class*="layer"], [class*="popup"]',
+    '[role="dialog"], [class*="dialog"], [class*="modal"], [class*="layer"], [class*="popup"]',
   )) as HTMLElement[]
   const visible = cands.filter((d) => {
     const r = d.getBoundingClientRect()
@@ -1571,7 +1573,9 @@ function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean 
       el.closest('[role="radio"], [role="checkbox"], label, [class*="item"], [class*="resume"]') ||
       el
     ) as HTMLElement
-    clickTarget.click()
+    // Resume rows are Vue-controlled radio/checkbox items; use the same
+    // real pointer sequence as the surrounding dialog buttons.
+    realClick(clickTarget)
     diag('CHAT', `已选择默认简历: ${targetName}`)
     return true
   }
@@ -1610,8 +1614,18 @@ async function completeResumeSend(
     const sendBtn = findDialogButton(dialog, /^(发送|确定)$/)
     if (sendBtn && !isDialogButtonDisabled(sendBtn)) {
       if (targetName) selectResumeInDialog(dialog, targetName)
-      sendBtn.click()
+      // BOSS uses delegated Vue handlers for the portal button. A bare
+      // HTMLElement.click() can update nothing even though the button is
+      // visible; dispatch the same pointer/mouse sequence as a user click.
+      realClick(sendBtn)
       await delay(1000, 1500)
+      if (findResumeDialog()) {
+        // Do not report success while the picker is still open. A swallowed
+        // click must remain retryable/manual rather than creating a false
+        // server-side "resume sent" record.
+        diag('CHAT', '已点击发送，但简历弹窗仍在，未确认发送')
+        return false
+      }
       diag('CHAT', `已发送简历（${targetName ? `默认: ${targetName}` : '未配置默认，用弹窗默认'}）`)
       return true
     }
@@ -1620,7 +1634,7 @@ async function completeResumeSend(
     if (!agreed) {
       const agreeBtn = findDialogButton(dialog, /^(同意|确定|确认)$/)
       if (agreeBtn && !isDialogButtonDisabled(agreeBtn)) {
-        agreeBtn.click()
+        realClick(agreeBtn)
         agreed = true
         await delay(900, 1300)
         diag('CHAT', '已点击简历确认（同意），等待选择弹窗')
@@ -1643,7 +1657,9 @@ async function sendResume(): Promise<boolean> {
     diag('CHAT', '「发简历」按钮处于禁用态，跳过', { cls: String(btn.className || '').slice(0, 60) })
     return false
   }
-  btn.click()
+  // The toolbar button is Vue-controlled as well; use the full pointer
+  // sequence so the resume picker is opened in the same way as a user click.
+  realClick(btn)
   await delay(1200, 1800)
 
   const cfg = loadConfig()
