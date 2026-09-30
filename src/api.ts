@@ -658,6 +658,44 @@ export async function reportOrchestratorEvent(
   }
 }
 
+/** POST /api/plugin/resume-test/result — 上报一次性定向简历测试结果。 */
+export async function reportResumeTestResult(
+  cfg: PluginConfig,
+  payload: {
+    test_id: string
+    command_id: number
+    success: boolean
+    stage: string
+    reason?: string
+    target_key?: string
+  },
+): Promise<boolean> {
+  try {
+    const resp = await network.request({
+      method: 'POST',
+      url: `${cfg.apiBase}/api/plugin/resume-test/result`,
+      headers: authHeaders(cfg),
+      data: JSON.stringify({
+        test_id: payload.test_id,
+        command_id: payload.command_id,
+        success: payload.success,
+        stage: payload.stage,
+        reason: (payload.reason || '').slice(0, 160),
+        target_key: (payload.target_key || '').slice(0, 255),
+      }),
+      timeout: 20000,
+    })
+    if (resp.status !== 200) {
+      diag('API', `resume-test/result 上报失败 HTTP ${resp.status}`)
+      return false
+    }
+    return true
+  } catch (e) {
+    diag('API', `resume-test/result 上报异常: ${(e as Error).message}`)
+    return false
+  }
+}
+
 /** POST /api/plugin/chat/snapshot — 上报会话行全量快照（评估状态标签/DOM 用） */
 export async function reportThreadSnapshot(
   cfg: PluginConfig,

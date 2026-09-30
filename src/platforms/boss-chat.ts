@@ -31,6 +31,7 @@ import {
   removeMirrorByKey,
 } from '../ledger'
 import { loadConfig } from '../config'
+import { storage } from '../platform-bridge'
 import {
   contactChannelFromQuestion,
   isAgentActionAllowed,
@@ -1552,7 +1553,8 @@ export function findResumeDialog(): HTMLElement | null {
 }
 
 /** 在简历选择弹窗里选目标简历：按归一化名称模糊匹配列表项，点其可点祖先；
- * 找不到则保持弹窗默认选中项（BOSS 默认第一份）。 */
+ * 找不到时返回 false；普通托管仍保留 BOSS 默认第一份的兼容行为，
+ * 定向测试则由调用方以严格模式拒绝继续。 */
 function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
   const targetNorm = normResumeName(targetName)
   if (!targetNorm) return false
@@ -1579,7 +1581,7 @@ function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean 
     diag('CHAT', `已选择默认简历: ${targetName}`)
     return true
   }
-  diag('CHAT', `弹窗里未匹配到默认简历「${targetName}」，用弹窗默认选中项`)
+  diag('CHAT', `弹窗里未匹配到默认简历「${targetName}」`)
   return false
 }
 
@@ -1603,6 +1605,7 @@ function dumpDialogCandidates(): string[] {
 async function completeResumeSend(
   targetName: string | null,
   alreadyAgreed = false,
+  strictTarget = false,
 ): Promise<boolean> {
   let agreed = alreadyAgreed
   for (let i = 0; i < 20; i++) {
@@ -1613,7 +1616,10 @@ async function completeResumeSend(
     // 发送按钮（选择弹窗/直接发送）
     const sendBtn = findDialogButton(dialog, /^(发送|确定)$/)
     if (sendBtn && !isDialogButtonDisabled(sendBtn)) {
-      if (targetName) selectResumeInDialog(dialog, targetName)
+      if (targetName && !selectResumeInDialog(dialog, targetName) && strictTarget) {
+        diag('CHAT', `定向简历测试中止：未匹配到指定简历「${targetName}」`)
+        return false
+      }
       // BOSS uses delegated Vue handlers for the portal button. A bare
       // HTMLElement.click() can update nothing even though the button is
       // visible; dispatch the same pointer/mouse sequence as a user click.
@@ -1646,7 +1652,7 @@ async function completeResumeSend(
 }
 
 /** 点「发简历」（HR 要简历时用）→ 确认 + 选择默认简历 + 发送 */
-async function sendResume(): Promise<boolean> {
+async function sendResume(targetNameOverride?: string | null, strictTarget = false): Promise<boolean> {
   // 按可见文本定位（"发简历" 这类文案比 class 稳定得多）
   const btn = findByText(/^(发简历|发送简历|附件简历)$/, { clickable: true })
   if (!btn) {
@@ -1663,11 +1669,117 @@ async function sendResume(): Promise<boolean> {
   await delay(1200, 1800)
 
   const cfg = loadConfig()
-  const targetName =
-    cfg.defaultSendResumeId && cfg.resumeNames
+  const targetName = targetNameOverride !== undefined
+    ? targetNameOverride
+    : cfg.defaultSendResumeId && cfg.resumeNames
       ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
       : null
-  return completeResumeSend(targetName)
+  return completeResumeSend(targetName, false, strictTarget)
+}
+
+export interface TargetedResumeTestTarget {
+  testId: string
+  platformJobId: string
+  company: string
+  jobTitle?: string
+  resumeName?: string | null
+}
+
+export interface TargetedResumeTestResult {
+  success: boolean
+  stage: string
+  reason: string
+  targetKey: string
+}
+
+const RESUME_TEST_DONE_PREFIX = 'aah_resume_test_done:'
+
+function normTargetText(value: string): string {
+  return (value || '').replace(/\s+/g, '').toLowerCase()
+}
+
+function targetCompanyMatches(actual: string, expected: string): boolean {
+  const a = normTargetText(actual)
+  const e = normTargetText(expected)
+  return !!a && !!e && (a.includes(e) || e.includes(a))
+}
+
+/**
+ * 执行一次性、目标限定的简历发送测试。
+ *
+ * 这是远程诊断动作，不进入常规会话托管：只按岗位 ID 定位一行，打开后
+ * 再确认头部身份和最后一条消息来自 HR，最后只调用「发简历」入口，不发文字。
+ */
+export async function runTargetedResumeTest(
+  target: TargetedResumeTestTarget,
+): Promise<TargetedResumeTestResult> {
+  const targetKey = `job:${target.platformJobId}`
+  const fail = (stage: string, reason: string): TargetedResumeTestResult => ({
+    success: false, stage, reason, targetKey,
+  })
+
+  const done = await storage.get<boolean>(`${RESUME_TEST_DONE_PREFIX}${target.testId}`, false)
+  if (done) return { success: true, stage: 'already_completed', reason: 'idempotent_replay', targetKey }
+  if (!onChatPage()) return fail('precondition', 'not_on_boss_chat_page')
+  if (!target.platformJobId.trim()) return fail('precondition', 'missing_platform_job_id')
+
+  const sources = readChatSources()
+  let hit: ChatThread | null = null
+  if (sources) {
+    const source = sources.find((item) => String(item.boss.encryptJobId || '') === target.platformJobId)
+    if (source) hit = await openThreadByIndex(source.index)
+  }
+  if (!hit) {
+    hit = await findThreadByScrolling((thread) => readRowJobInfo(thread.el).jobId === target.platformJobId)
+    if (hit) {
+      try {
+        if (!switchThreadViaVue(hit.el)) realClick(hit.el)
+        await delay(300, 550)
+      } catch {
+        return fail('open_thread', 'switch_failed')
+      }
+    }
+  }
+  if (!hit) return fail('target_not_found', 'platform_job_id_not_in_current_chat_list')
+
+  await delay(300, 550)
+  const info = currentThreadInfo()
+  if (!targetCompanyMatches(info.company, target.company)) {
+    return fail('identity_check', 'header_company_mismatch')
+  }
+  if (target.jobTitle) {
+    const actual = normTargetText(info.jobTitle)
+    const expected = normTargetText(target.jobTitle)
+    if (!actual || !(actual.includes(expected) || expected.includes(actual))) {
+      return fail('identity_check', 'header_job_title_mismatch')
+    }
+  }
+  const expectThread = currentThreadId()
+  const before = await readMessages()
+  // BOSS 会在对话尾部插入“已读/附件已送达”等系统行；门槛只看最后一条
+  // 有对话内容的消息，避免系统行被误当成对方发言。
+  const beforeConversation = before.filter((message) => message.sender !== 'system')
+  const last = beforeConversation[beforeConversation.length - 1]
+  if (!last || last.sender !== 'hr') {
+    return fail('message_check', 'last_message_is_not_hr')
+  }
+
+  const sent = await sendResume(target.resumeName, true)
+  if (!sent) return fail('resume_send', 'resume_dialog_send_not_confirmed')
+  if (currentThreadId() !== expectThread) return fail('identity_check', 'thread_changed_after_send')
+  const after = await readMessages()
+  const beforeMe = before.filter((m) => m.sender === 'me').length
+  const afterMe = after.filter((m) => m.sender === 'me').length
+  const resumeNotice = (message: { sender: string; content: string }): boolean =>
+    message.sender === 'system' && /(?:附件|简历).*(?:已发送|已送达)/.test(message.content)
+  const beforeResumeNotices = before.filter(resumeNotice).length
+  const afterResumeNotices = after.filter(resumeNotice).length
+  if (afterMe <= beforeMe && afterResumeNotices <= beforeResumeNotices) {
+    return fail('result_check', 'no_resume_message_or_system_confirmation_observed')
+  }
+
+  await storage.set(`${RESUME_TEST_DONE_PREFIX}${target.testId}`, true)
+  return { success: true, stage: 'sent_confirmed', reason: 'candidate_message_observed', targetKey }
 }
 
 /**

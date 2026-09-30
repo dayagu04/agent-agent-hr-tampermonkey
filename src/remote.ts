@@ -13,7 +13,8 @@ import { startDebugCapture } from './debug'
 import {
   flushOrchestratorEvents, getCurrentJob, getOrchestrator, getOrchestratorSnapshot, resumeOrchestrator,
 } from './orchestrator'
-import { runChatAudit } from './platforms/boss-chat'
+import { runChatAudit, runTargetedResumeTest } from './platforms/boss-chat'
+import { reportResumeTestResult } from './api'
 import { detectPlatform } from './platforms/factory'
 
 /** 当前页面平台代号（用于心跳上报） */
@@ -34,7 +35,7 @@ interface RemoteCommand {
 
 /** 与服务端 `/api/plugin/heartbeat` 协商的远程命令协议。 */
 const PLUGIN_PROTOCOL_VERSION = 2
-const PLUGIN_CAPABILITIES = ['command_ack_v2'] as const
+const PLUGIN_CAPABILITIES = ['command_ack_v2', 'resume_test_v1'] as const
 
 interface PluginCompatibility {
   can_receive_commands?: boolean
@@ -299,6 +300,29 @@ async function executeCommand(
           replyScope: cmd.payload?.reply_scope === 'this_round' ? 'this_round' : 'all',
         })
         break
+      case 'chat.resume_test': {
+        const p = cmd.payload || {}
+        const testId = typeof p.test_id === 'string' ? p.test_id : ''
+        const platformJobId = typeof p.platform_job_id === 'string' ? p.platform_job_id : ''
+        const result = await runTargetedResumeTest({
+          testId,
+          platformJobId,
+          company: typeof p.company === 'string' ? p.company : '',
+          jobTitle: typeof p.job_title === 'string' ? p.job_title : '',
+          resumeName: typeof p.resume_name === 'string' ? p.resume_name : null,
+        })
+        const reported = await reportResumeTestResult(cfg, {
+          test_id: testId,
+          command_id: cmd.id,
+          success: result.success,
+          stage: result.stage,
+          reason: result.reason,
+          target_key: result.targetKey,
+        })
+        // A terminal negative result is still ACK-able; a failed report must
+        // retry because otherwise the server would lose the only evidence.
+        return reported
+      }
       case 'config.reload':
         // 网页端改了核心配置(单轮投递上限/阈值等):通知面板静默重拉配置,实时生效
         window.dispatchEvent(new CustomEvent('aah:config-reload'))
