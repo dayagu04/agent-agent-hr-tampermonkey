@@ -27,6 +27,7 @@ vi.mock('./platforms/boss-chat', () => ({ runChatAudit: vi.fn() }))
 vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
 
 import { network, storage } from './platform-bridge'
+import { diag } from './logger'
 import { reportHeartbeatAndPoll } from './remote'
 import { detectPlatform } from './platforms/factory'
 import { getOrchestrator } from './orchestrator'
@@ -35,9 +36,21 @@ beforeEach(() => {
   vi.mocked(network.request).mockReset()
   vi.mocked(storage.get).mockReset()
   vi.mocked(storage.set).mockReset()
+  vi.mocked(diag).mockReset()
+  vi.mocked(getOrchestrator).mockReset()
+  vi.mocked(getOrchestrator).mockReturnValue({
+    getState: () => null,
+    isRunning: () => false,
+    applyBackendAction: vi.fn(async () => true),
+  } as never)
   vi.mocked(storage.get).mockResolvedValue({ epoch: '', id: 0 })
   vi.mocked(detectPlatform).mockReturnValue({} as ReturnType<typeof detectPlatform>)
 })
+
+const compatible = {
+  can_receive_commands: true,
+  status: 'compatible',
+}
 
 describe('远程心跳命令协议', () => {
   it('执行命令后持久化 ACK，并在请求中带上已有游标', async () => {
@@ -45,6 +58,7 @@ describe('远程心跳命令协议', () => {
       status: 200,
       responseText: JSON.stringify({
         command_epoch: 'server-a',
+        plugin_compatibility: compatible,
         commands: [{ id: 7, action: 'config.reload', payload: {} }],
       }),
     })
@@ -52,9 +66,132 @@ describe('远程心跳命令协议', () => {
     await reportHeartbeatAndPoll()
 
     const request = vi.mocked(network.request).mock.calls[0][0]
-    expect(JSON.parse(String(request.data)).ack_command_id).toBe(0)
+    const body = JSON.parse(String(request.data))
+    expect(body.ack_command_id).toBe(0)
+    expect(body.protocol_version).toBe(2)
+    expect(body.capabilities).toEqual(['command_ack_v2'])
     expect(storage.set).toHaveBeenCalledWith(
       expect.any(String), { epoch: 'server-a', id: 7 },
+    )
+  })
+
+  it('服务端明确拒绝命令时不执行也不推进 ACK', async () => {
+    const applyBackendAction = vi.fn(async () => true)
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-a',
+        plugin_compatibility: {
+          can_receive_commands: false,
+          status: 'upgrade_required',
+          reason: '插件版本过低',
+        },
+        commands: [{ id: 8, action: 'orchestrator.action', payload: { action: 'stop' } }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(applyBackendAction).not.toHaveBeenCalled()
+    expect(storage.set).not.toHaveBeenCalled()
+    expect(vi.mocked(diag)).toHaveBeenCalledWith(
+      'REMOTE', expect.stringContaining('插件版本过低'),
+    )
+  })
+
+  it('服务端漏发兼容性确认时 fail closed，不执行响应中的命令', async () => {
+    const applyBackendAction = vi.fn(async () => true)
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-a',
+        commands: [{ id: 9, action: 'orchestrator.action', payload: { action: 'stop' } }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(applyBackendAction).not.toHaveBeenCalled()
+    expect(storage.set).not.toHaveBeenCalled()
+    expect(vi.mocked(diag)).toHaveBeenCalledWith(
+      'REMOTE', expect.stringContaining('远程命令未执行'),
+    )
+  })
+
+  it('重复兼容性拒绝在 30 秒内只诊断一次，恢复后再次提示', async () => {
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-dedupe',
+        plugin_compatibility: {
+          can_receive_commands: false,
+          reason: '仅用于低噪声回归',
+        },
+        commands: [],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+    await reportHeartbeatAndPoll()
+    expect(vi.mocked(diag)).toHaveBeenCalledTimes(1)
+
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-dedupe',
+        plugin_compatibility: compatible,
+        commands: [],
+      }),
+    })
+    await reportHeartbeatAndPoll()
+    expect(vi.mocked(diag)).toHaveBeenCalledTimes(1)
+
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-dedupe',
+        plugin_compatibility: {
+          can_receive_commands: false,
+          reason: '仅用于低噪声回归',
+        },
+        commands: [],
+      }),
+    })
+    await reportHeartbeatAndPoll()
+    expect(vi.mocked(diag)).toHaveBeenCalledTimes(2)
+  })
+
+  it('握手许可但缺少 command_epoch 时仍不执行或 ACK', async () => {
+    const applyBackendAction = vi.fn(async () => true)
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        plugin_compatibility: compatible,
+        commands: [{ id: 10, action: 'orchestrator.action', payload: { action: 'stop' } }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(applyBackendAction).not.toHaveBeenCalled()
+    expect(storage.set).not.toHaveBeenCalled()
+    expect(vi.mocked(diag)).toHaveBeenCalledWith(
+      'REMOTE', expect.stringContaining('缺少 command_epoch'),
     )
   })
 
@@ -84,6 +221,7 @@ describe('远程心跳命令协议', () => {
       status: 200,
       responseText: JSON.stringify({
         command_epoch: 'server-a',
+        plugin_compatibility: compatible,
         commands: [
           { id: 1, action: 'orchestrator.start', payload: {} },
           { id: 2, action: 'config.reload', payload: {} },
@@ -107,6 +245,7 @@ describe('远程心跳命令协议', () => {
       status: 200,
       responseText: JSON.stringify({
         command_epoch: 'server-a',
+        plugin_compatibility: compatible,
         commands: [{
           id: 9,
           action: 'orchestrator.action',

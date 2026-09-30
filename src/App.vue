@@ -51,6 +51,10 @@ import {
 
 const platform = detectPlatform()
 const config = reactive<PluginConfig>(loadConfig())
+const apiEnvironmentLabel = computed(() => {
+  const local = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?(?:\/|$)/i.test(config.apiBase)
+  return local ? '本地联调' : '服务器'
+})
 
 // ---- 悬浮球拖拽 + 位置记忆 ----
 const collapsed = ref(true)
@@ -1205,9 +1209,12 @@ watch(activeTab, (tab) => {
           <!-- 两列栅格：简单字段并排，复合/长字段用 .aah-field-wide 跨整行。
                button / p / .aah-loggedin 在 CSS 里默认跨整行，不用逐个标。 -->
           <div v-if="activeTab === 'settings'" key="settings" class="aah-tab-pane aah-form-grid">
-            <!-- 服务器地址构建期固定,无需用户填写(测试版指向本机后端) -->
+            <!-- 服务器地址构建期固定,无需用户填写；本地联调通过 build:local 切换 -->
             <div class="aah-field aah-field-wide">
-              <span>服务器地址</span>
+              <span>连接环境</span>
+              <span class="aah-env-badge" :class="{ local: apiEnvironmentLabel === '本地联调' }">
+                {{ apiEnvironmentLabel }}
+              </span>
               <code class="aah-static-value">{{ config.apiBase }}</code>
             </div>
 
@@ -1809,6 +1816,8 @@ watch(activeTab, (tab) => {
 .aah-field { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }
 .aah-field > span { font-size:12px; color:#374151; }
 .aah-field input, .aah-field select { padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; }
+.aah-env-badge { align-self:flex-start; display:inline-flex; align-items:center; padding:2px 7px; border-radius:999px; font-size:11px; font-weight:600; color:#92400e; background:#fffbeb; border:1px solid #fde68a; }
+.aah-env-badge.local { color:#065f46; background:#ecfdf5; border-color:#a7f3d0; }
 .aah-row { display:flex; align-items:center; gap:6px; }
 .aah-btn-primary { width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-weight:600; cursor:pointer; }
 .aah-btn-primary:hover { background:#1d4ed8; }

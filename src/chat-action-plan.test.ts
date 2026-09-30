@@ -114,6 +114,36 @@ describe('structured BOSS fact/action response', () => {
     expect(plan.replyText).toBe('')
   })
 
+  it('does not fall back to a legacy contact allow when an authoritative plan omits it', () => {
+    const plan = normalizeChatActionPlan({
+      action_plan_version: 1,
+      actions_authoritative: true,
+      contact_exchange: { allowed: true, channels: ['phone'] },
+      reply: '不能从旧字段发送这段话。',
+      send_resume: true,
+      actions: [],
+    })
+
+    expect(plan.contactAction).toBeNull()
+    expect(plan.replyText).toBe('')
+    expect(plan.sendResume).toBe(false)
+    expect(cardActionAllowed(plan, 'contact_exchange')).toBe(false)
+  })
+
+  it('fails closed when an authoritative response omits its action list', () => {
+    const plan = normalizeChatActionPlan({
+      action_plan_version: 1,
+      contact_exchange: { allowed: true, channels: ['phone'] },
+      reply: '不能从旧字段发送这段话。',
+      send_resume: true,
+    })
+
+    expect(plan.contactAction).toBeNull()
+    expect(plan.replyText).toBe('')
+    expect(plan.sendResume).toBe(false)
+    expect(cardActionAllowed(plan, 'contact_exchange')).toBe(false)
+  })
+
   it('retains v0.6.8 top-level compatibility when no versioned plan is present', () => {
     const plan = normalizeChatActionPlan({
       reply: '收到，我会补充简历。',

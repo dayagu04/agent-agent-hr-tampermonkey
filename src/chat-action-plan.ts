@@ -344,24 +344,31 @@ function responseFacts(response: ChatActionPlanResponse): ChatFactContext {
 
 /** Normalize old top-level fields and the versioned action plan into one view. */
 export function normalizeChatActionPlan(response: ChatActionPlanResponse): ChatActionPlan {
-  const rawActions = Array.isArray(response.actions) ? response.actions : null
+  const hasActionList = Array.isArray(response.actions)
+  const rawActions = hasActionList ? response.actions as unknown[] : null
   const actions = (rawActions || []).map(normalizeAction).filter((item): item is NormalizedChatAction => !!item)
   const hasVersion = Number(response.action_plan_version) > 0
   const authoritative = response.actions_authoritative === true || hasVersion
   const replyCandidates = actions.filter((item) => item.type === 'reply_text')
   const replyAction = replyCandidates.find((item) => item.allowed)
   const structuredReply = replyAction?.text
-  const replyText = authoritative && rawActions
-    ? (replyAction ? (structuredReply || text(response.reply, 2000) || '') : '')
+  const replyText = authoritative
+    ? (hasActionList && replyAction ? (structuredReply || text(response.reply, 2000) || '') : '')
     : (structuredReply || text(response.reply, 2000) || '')
 
   // A structured plan is authoritative for side effects.  For unversioned
   // responses retain the v0.6.8 top-level compatibility fields.
   const resumeAction = actions.find((item) => item.type === 'send_resume')
-  const sendResume = rawActions
-    ? (resumeAction ? resumeAction.allowed : (authoritative ? false : response.send_resume === true))
-    : response.send_resume === true
-  const contactAction = actions.find((item) => item.type === 'exchange_contact') || legacyContactAction(response)
+  const sendResume = authoritative
+    ? (hasActionList ? (resumeAction?.allowed === true) : false)
+    : (hasActionList
+      ? (resumeAction ? resumeAction.allowed : response.send_resume === true)
+      : response.send_resume === true)
+  // An explicit action list is the complete plan. Falling back to a legacy
+  // top-level flag here would let a stale ``contact_exchange.allowed`` value
+  // authorize a card that the authoritative plan intentionally omitted.
+  const contactAction = actions.find((item) => item.type === 'exchange_contact') ||
+    (authoritative ? null : legacyContactAction(response))
   if (authoritative && contactAction && contactAction.channels === undefined) {
     // A modern contact action must name the permitted channel(s).  A generic
     // allow flag cannot silently widen the user's configured contact policy.
