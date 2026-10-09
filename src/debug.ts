@@ -1,9 +1,9 @@
 // 手动调试采集 —— 记录当前页 DOM 结构与用户操作，供开发者适配选择器
 //
 // 用法：用户手动打开目标弹窗（如发简历的选择框）后点「开始调试」，
-// 插件立即 dump 当前可见的 dialog/modal 结构与简历相关元素，
+// 插件立即记录当前可见的 dialog/modal 结构与简历相关元素，
 // 并在窗口期内记录 DOM 变化（MutationObserver）与点击操作，
-// 全部写入插件日志（DBG 标签，批量上传后端 plugin_logs）。
+// 只上传标签/class/尺寸/文本长度等结构摘要，绝不上传 DOM 文本或 HTML。
 import { diag } from './logger'
 
 const DEBUG_TAG = 'DBG'
@@ -25,7 +25,7 @@ function ownText(el: Element): string {
 interface NodeInfo {
   tag: string
   cls: string
-  text: string
+  textLength: number
   rect: string
 }
 
@@ -45,7 +45,7 @@ function describe(
     out.push({
       tag: el.tagName.toLowerCase(),
       cls: String(el.className || '').slice(0, 60),
-      text: own.replace(/\s+/g, ' ').slice(0, 60),
+      textLength: own.length,
       rect: `${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`,
     })
   }
@@ -53,7 +53,7 @@ function describe(
 }
 
 function dumpVisibleDialogs(): void {
-  diag(DEBUG_TAG, `=== 调试开始 url=${location.href} ===`)
+  diag(DEBUG_TAG, `=== 调试开始 path=${location.pathname} ===`)
 
   const sel =
     '[class*="dialog"],[class*="modal"],[class*="Dialog"],[class*="Modal"],[class*="layer"],[class*="popup"]'
@@ -61,12 +61,12 @@ function dumpVisibleDialogs(): void {
   diag(DEBUG_TAG, `可见 dialog/modal/popup 候选 ${dlg.length} 个`)
   for (let i = 0; i < Math.min(dlg.length, 8); i++) {
     const d = dlg[i]
-    const t = (d.textContent || '').replace(/\s+/g, ' ').slice(0, 200)
-    diag(DEBUG_TAG, `--- dialog#${i} class="${String(d.className || '').slice(0, 80)}" text="${t}"`)
+    const textLength = (d.textContent || '').length
+    diag(DEBUG_TAG, `--- dialog#${i} class="${String(d.className || '').slice(0, 80)}" textLength=${textLength}`)
     const nodes: NodeInfo[] = []
     describe(d, 0, 6, 120, nodes)
     for (const n of nodes) {
-      diag(DEBUG_TAG, `  <${n.tag} class="${n.cls}" rect="${n.rect}"> ${n.text}`)
+      diag(DEBUG_TAG, `  <${n.tag} class="${n.cls}" rect="${n.rect}" textLength="${n.textLength}">`)
     }
   }
 
@@ -83,7 +83,7 @@ function dumpVisibleDialogs(): void {
     diag(DEBUG_TAG,
       `  <${el.tagName.toLowerCase()} class="${String(el.className || '').slice(0, 60)}" ` +
       `rect="${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}"> ` +
-      `${(el.textContent || '').replace(/\s+/g, ' ').slice(0, 40)}`)
+      `textLength=${(el.textContent || '').length}`)
   }
 }
 
@@ -100,9 +100,10 @@ export function startDebugCapture(windowMs = DEFAULT_WINDOW_MS): void {
       for (const n of m.addedNodes) {
         if (n.nodeType !== Node.ELEMENT_NODE) continue
         const el = n as Element
-        const t = (el.textContent || '').replace(/\s+/g, ' ').slice(0, 30)
         const cls = String(el.className || '').slice(0, 50)
-        if (added.length < 400) added.push(`+<${el.tagName.toLowerCase()} class="${cls}"> ${t}`)
+        if (added.length < 400) {
+          added.push(`+<${el.tagName.toLowerCase()} class="${cls}" textLength="${(el.textContent || '').length}">`)
+        }
       }
     }
   })
@@ -114,11 +115,11 @@ export function startDebugCapture(windowMs = DEFAULT_WINDOW_MS): void {
     if (!el || !el.tagName) return
     if (String(el.className || '').startsWith('aah-')) return
     const r = el.getBoundingClientRect()
-    const t = (el.textContent || '').replace(/\s+/g, ' ').slice(0, 30)
     if (clicks.length < 300) {
       clicks.push(
         `click <${el.tagName.toLowerCase()} class="${String(el.className || '').slice(0, 50)}" ` +
-        `rect="${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}"> ${t}`,
+        `rect="${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}" ` +
+        `textLength="${(el.textContent || '').length}">`,
       )
     }
   }

@@ -27,8 +27,8 @@ vi.mock('./platforms/boss-chat', () => ({ runChatAudit: vi.fn() }))
 vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
 
 import { network, storage } from './platform-bridge'
-import { diag } from './logger'
-import { reportHeartbeatAndPoll } from './remote'
+import { diag, flushLogs } from './logger'
+import { reportHeartbeatAndPoll, startRemoteLoop } from './remote'
 import { detectPlatform } from './platforms/factory'
 import { getOrchestrator } from './orchestrator'
 
@@ -37,6 +37,8 @@ beforeEach(() => {
   vi.mocked(storage.get).mockReset()
   vi.mocked(storage.set).mockReset()
   vi.mocked(diag).mockReset()
+  vi.mocked(flushLogs).mockReset()
+  vi.mocked(flushLogs).mockResolvedValue(undefined)
   vi.mocked(getOrchestrator).mockReset()
   vi.mocked(getOrchestrator).mockReturnValue({
     getState: () => null,
@@ -100,7 +102,9 @@ describe('远程心跳命令协议', () => {
     expect(applyBackendAction).not.toHaveBeenCalled()
     expect(storage.set).not.toHaveBeenCalled()
     expect(vi.mocked(diag)).toHaveBeenCalledWith(
-      'REMOTE', expect.stringContaining('插件版本过低'),
+      'REMOTE',
+      '远程命令未执行：服务端未确认兼容协议',
+      { status: 'upgrade_required', reasonLength: 6 },
     )
   })
 
@@ -124,7 +128,9 @@ describe('远程心跳命令协议', () => {
     expect(applyBackendAction).not.toHaveBeenCalled()
     expect(storage.set).not.toHaveBeenCalled()
     expect(vi.mocked(diag)).toHaveBeenCalledWith(
-      'REMOTE', expect.stringContaining('远程命令未执行'),
+      'REMOTE',
+      expect.stringContaining('远程命令未执行'),
+      { status: 'unconfirmed', reasonLength: 0 },
     )
   })
 
@@ -260,5 +266,58 @@ describe('远程心跳命令协议', () => {
       action: 'apply_batch', command_id: 'cmd-9',
     })
     expect(storage.set).not.toHaveBeenCalled()
+  })
+
+  it('远程命令失败时强制日志冲刷不阻塞命令终态', async () => {
+    const applyBackendAction = vi.fn(async () => {
+      throw new Error('sensitive response body')
+    })
+    vi.mocked(getOrchestrator).mockReturnValue({
+      getState: () => null,
+      isRunning: () => false,
+      applyBackendAction,
+    } as never)
+    vi.mocked(flushLogs).mockImplementation(() => new Promise<void>(() => undefined))
+    vi.mocked(network.request).mockResolvedValue({
+      status: 200,
+      responseText: JSON.stringify({
+        command_epoch: 'server-a',
+        plugin_compatibility: compatible,
+        commands: [{
+          id: 11,
+          action: 'orchestrator.action',
+          payload: { action: 'apply_batch', command_id: 'cmd-11' },
+        }],
+      }),
+    })
+
+    await reportHeartbeatAndPoll()
+
+    expect(vi.mocked(flushLogs)).toHaveBeenCalledWith({ force: true })
+    expect(storage.set).not.toHaveBeenCalled()
+    expect(vi.mocked(diag)).toHaveBeenCalledWith(
+      'REMOTE',
+      '命令执行失败 orchestrator.action',
+      { errorType: 'Error' },
+    )
+    expect(JSON.stringify(vi.mocked(diag).mock.calls)).not.toContain('sensitive response body')
+  })
+
+  it('页面离开前请求强制冲刷最后一批诊断', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(network.request).mockResolvedValue({ status: 500, responseText: '' })
+      startRemoteLoop(60_000)
+      await Promise.resolve()
+      await Promise.resolve()
+      vi.mocked(flushLogs).mockClear()
+
+      window.dispatchEvent(new Event('pagehide'))
+
+      expect(vi.mocked(flushLogs)).toHaveBeenCalledWith({ force: true })
+      vi.clearAllTimers()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

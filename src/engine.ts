@@ -389,7 +389,7 @@ export class ApplyEngine {
           progress.skipped++
           this.attemptedIds.push(job.platformJobId)
           this.platform.markCard(job, '#d1d5db')
-          log(`跳过: ${job.title} @ ${job.company}（Agent 策略禁止投递）`)
+          log('跳过岗位（Agent 策略禁止投递）')
           void logDecision(this.config, {
             run_id: this.runId,
             platform: this.platform.code,
@@ -406,8 +406,9 @@ export class ApplyEngine {
         this.onProgress({ ...progress })
 
         log(
-          `投递: ${job.title} @ ${job.company}` +
-            (this.config.matchEnabled ? ` (${score}分)` : '（匹配度已关闭）'),
+          this.config.matchEnabled
+            ? `准备投递岗位（匹配分 ${score}）`
+            : '准备投递岗位（匹配度已关闭）',
         )
         let outcome: ApplyOutcome = 'failed'
         let message = ''
@@ -457,7 +458,7 @@ export class ApplyEngine {
               new URLSearchParams(location.search).get('query') || '',
             )
           } catch (e) {
-            log(`  ↳ 记账失败: ${(e as Error).message}`)
+            log(`  ↳ 记账失败（${(e as Error).name || 'Error'}）`)
           }
           this.onProgress({ ...progress })
           continue
@@ -467,17 +468,17 @@ export class ApplyEngine {
         if (outcome === 'applied') {
           progress.applied++
           this.platform.markCard(job, '#3b82f6') // 蓝色=已投
-          log(`  ↳ 成功${message ? '：' + message : ''}`)
+          log(`  ↳ 成功${message ? `（平台消息长度 ${message.length}）` : ''}`)
         } else if (outcome === 'unknown') {
           // 未确认的尝试不推进投递目标（不 applied++），也不污染失败计数；
           // 后端记 real_applied=False，两者口径一致。
           progress.unknown++
           this.platform.markCard(job, '#a855f7') // 紫色=待核对
-          log(`  ↳ 未能确认${message ? '：' + message : ''}（请在平台核对）`)
+          log(`  ↳ 未能确认${message ? `（平台消息长度 ${message.length}）` : ''}，请在平台核对`)
         } else {
           progress.failed++
           this.platform.markCard(job, '#f59e0b') // 橙色=失败
-          log(`  ↳ 失败${message ? '：' + message : ''}`)
+          log(`  ↳ 失败${message ? `（平台消息长度 ${message.length}）` : ''}`)
         }
 
         // 上报记账：outcome 如实传，unknown/failed 不会写成 real_applied
@@ -487,9 +488,12 @@ export class ApplyEngine {
             this.orchestratorRunId,
             new URLSearchParams(location.search).get('query') || '',
           )
-          if (rec.duplicate) log(`  ↳ 该岗位之前已投递过`)
+          // 新服务端会把历史 failed/unknown 行升级成真实成功。该响应为了兼容
+          // 旧客户端仍可能带 duplicate=true，必须先看 upgraded，避免误报“已投过”。
+          if (rec.upgraded === true) log('  ↳ 记账结果已更新')
+          else if (rec.duplicate) log('  ↳ 该岗位之前已投递过')
         } catch (e) {
-          log(`  ↳ 记账失败: ${(e as Error).message}`)
+          log(`  ↳ 记账失败（${(e as Error).name || 'Error'}）`)
         }
         this.onProgress({ ...progress })
 
@@ -510,7 +514,7 @@ export class ApplyEngine {
       log(`本页完成：累计投递 ${progress.applied}，跳过 ${progress.skipped}，失败 ${progress.failed}`)
     } catch (e) {
       // 单页出错不终止整个任务（下一页可能正常），只记日志
-      log(`本页出错: ${(e as Error).message}`)
+      log(`本页出错（${(e as Error).name || 'Error'}）`)
     }
     this.onProgress({ ...progress })
   }

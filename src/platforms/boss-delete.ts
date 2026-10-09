@@ -164,7 +164,9 @@ export function deleteViaRowVue(item: HTMLElement): boolean {
     const bossName = String(found.obj.name || found.obj.bossName || '').replace(/\s/g, '')
     const rowText = (item.textContent || '').replace(/\s/g, '')
     if (bossName && !rowText.includes(bossName)) {
-      diag('CHAT', 'deleteViaRowVue 已放弃：boss 对象与本行不匹配（防删错）', { bossName })
+      diag('CHAT', 'deleteViaRowVue 已放弃：boss 对象与本行不匹配（防删错）', {
+        bossNameLength: bossName.length,
+      })
       continue
     }
 
@@ -172,11 +174,13 @@ export function deleteViaRowVue(item: HTMLElement): boolean {
       vm.deleteBoss(found.obj)
       diag('CHAT', 'deleteViaRowVue 已调用行组件 deleteBoss(boss)', {
         bossFrom: found.path,
-        name: bossName || '-',
+        bossNamePresent: !!bossName,
       })
       return true
     } catch (e) {
-      diag('CHAT', `deleteViaRowVue 调用 deleteBoss() 抛异常: ${(e as Error).message}`)
+      diag('CHAT', 'deleteViaRowVue 调用 deleteBoss() 抛异常', {
+        errorType: (e as Error).name || 'Error',
+      })
     }
   }
   return false
@@ -265,7 +269,13 @@ export function dumpDeleteDiagnostics(item: HTMLElement, phase: string): void {
     elementAtIconCenter: atPoint,
     operationContainers: document.querySelectorAll('.operation-container').length,
   })
-  diag('CHAT', `删除取证[${phase}] 行 HTML`, (item.outerHTML || '').slice(0, 1800))
+  diag('CHAT', `删除取证[${phase}] 行结构摘要`, {
+    tag: item.tagName.toLowerCase(),
+    cls: String(item.className || '').slice(0, 80),
+    descendantCount: item.querySelectorAll('*').length,
+    htmlLength: (item.outerHTML || '').length,
+    textLength: (item.textContent || '').length,
+  })
 }
 
 /** 定位「确认删除吗？」弹窗：文案匹配且尺寸合理（避免命中 body） */

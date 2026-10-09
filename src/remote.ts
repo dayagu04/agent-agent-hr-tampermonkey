@@ -72,7 +72,11 @@ function authHeaders(cfg: ReturnType<typeof loadConfig>): Record<string, string>
 }
 
 /** 协议降级每秒随心跳返回时只保留低噪声诊断；原因变化或 30s 后再提示。 */
-function protocolDiagnostic(key: string, message: string): void {
+function protocolDiagnostic(
+  key: string,
+  message: string,
+  fields?: Record<string, unknown>,
+): void {
   const now = Date.now()
   if (
     key === lastProtocolDiagnosticKey &&
@@ -82,7 +86,8 @@ function protocolDiagnostic(key: string, message: string): void {
   }
   lastProtocolDiagnosticKey = key
   lastProtocolDiagnosticAt = now
-  diag('REMOTE', message)
+  if (fields) diag('REMOTE', message, fields)
+  else diag('REMOTE', message)
 }
 
 function clearProtocolDiagnostic(): void {
@@ -160,10 +165,13 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
     // epoch 都按不兼容处理：不执行命令、不推进本地 ACK，等待下一次握手。
     // 这样旧服务端、代理截断响应和部分部署都不会意外放行远程动作。
     if (!compatibility || compatibility.can_receive_commands !== true) {
-      const reason = (compatibility?.reason || '服务端未确认远程命令协议')
-        .replace(/[\r\n]+/g, ' ')
-        .slice(0, 120)
-      protocolDiagnostic(`compatibility:${reason}`, `远程命令未执行：${reason}`)
+      const reasonLength = compatibility?.reason?.length || 0
+      const status = compatibility?.status || 'unconfirmed'
+      protocolDiagnostic(
+        `compatibility:${status}:${reasonLength}`,
+        '远程命令未执行：服务端未确认兼容协议',
+        { status, reasonLength },
+      )
     } else if (!commandEpoch) {
       protocolDiagnostic('missing-command-epoch', '远程命令未执行：服务端缺少 command_epoch')
     } else {
@@ -314,8 +322,11 @@ async function executeCommand(
     }
     return true
   } catch (e) {
-    console.warn('[remote] 命令执行失败', cmd.action, e)
-    diag('REMOTE', `命令执行失败 ${cmd.action}: ${(e as Error).message}`)
+    console.warn('[remote] 命令执行失败', cmd.action, (e as Error).name || 'Error')
+    diag('REMOTE', `命令执行失败 ${cmd.action}`, {
+      errorType: (e as Error).name || 'Error',
+    })
+    void flushLogs({ force: true }).catch(() => undefined)
     return false
   }
 }
@@ -333,12 +344,23 @@ export function startRemoteLoop(intervalMs = 1000): void {
   // 休眠唤醒恢复：浏览器后台标签页的定时器会被节流（可能 1 分钟才一跳），
   // 切回标签页/获得焦点/bfcache 恢复时立即补一次心跳，网页端状态马上回连。
   // 运行中的编排在冻结恢复后 JS 会自行继续，这里只补心跳、不重复 resume。
-  const onWake = (): void => {
+  const onVisibilityChange = (): void => {
     if (document.visibilityState === 'visible') {
       void reportHeartbeatAndPoll()
+    } else {
+      // hidden 比 pagehide 更早，异步 GM 请求更有机会完成；仍只是 best effort。
+      void flushLogs({ force: true }).catch(() => undefined)
     }
   }
-  document.addEventListener('visibilitychange', onWake)
+  const onWake = (): void => {
+    void reportHeartbeatAndPoll()
+  }
+  const onPageExit = (): void => {
+    void flushLogs({ force: true }).catch(() => undefined)
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('focus', onWake)
   window.addEventListener('pageshow', onWake)
+  window.addEventListener('pagehide', onPageExit)
+  window.addEventListener('beforeunload', onPageExit)
 }

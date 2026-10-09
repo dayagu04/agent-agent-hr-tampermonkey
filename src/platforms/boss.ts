@@ -87,7 +87,7 @@ export class BossPlatform extends BasePlatform {
     }
 
     const jobs: JobCard[] = []
-    const dropped: string[] = []
+    const dropped: Array<{ missingId: boolean; missingTitle: boolean }> = []
 
     for (const card of cards) {
       const link = card.querySelector(
@@ -146,7 +146,7 @@ export class BossPlatform extends BasePlatform {
         .join(' ')
 
       if (!title || !platformJobId) {
-        dropped.push(`title="${title}" id="${platformJobId}" href="${href.slice(0, 50)}"`)
+        dropped.push({ missingId: !platformJobId, missingTitle: !title })
         continue
       }
 
@@ -163,10 +163,18 @@ export class BossPlatform extends BasePlatform {
     }
 
     if (dropped.length) {
-      diag('BOSS', `${dropped.length} 张卡片缺 id/标题被跳过`, dropped.slice(0, 5))
+      diag('BOSS', `${dropped.length} 张卡片缺 id/标题被跳过`, {
+        missingId: dropped.filter((item) => item.missingId).length,
+        missingTitle: dropped.filter((item) => item.missingTitle).length,
+      })
     }
     diag('BOSS', `有效岗位 ${jobs.length} 个`, jobs[0]
-      ? { id: jobs[0].platformJobId, title: jobs[0].title, company: jobs[0].company, salary: jobs[0].salary }
+      ? {
+          idPresent: !!jobs[0].platformJobId,
+          titleLength: jobs[0].title.length,
+          companyPresent: !!jobs[0].company,
+          salaryPresent: !!jobs[0].salary,
+        }
       : null)
     return jobs
   }
@@ -185,16 +193,16 @@ export class BossPlatform extends BasePlatform {
         clickTarget.scrollIntoView({ block: 'center' })
         await this.delay(400, 900)
         clickTarget.click()
-        diag('BOSS', `点击卡片加载详情: ${card.title}`)
+        diag('BOSS', '点击卡片加载详情', { titleLength: card.title.length })
         // 等右侧详情渲染出沟通按钮
         btn = await this.waitForChatButton(8000)
       }
     }
 
     if (!btn) {
-      diag('BOSS', `"${card.title}" 详情区未出现沟通按钮`, {
-        url: location.href,
-        detailTexts: this.sampleDetailTexts(),
+      diag('BOSS', '详情区未出现沟通按钮', {
+        path: location.pathname,
+        detailCandidateCount: this.sampleDetailTexts().length,
       })
       return { outcome: 'failed', message: '未找到「立即沟通」按钮（详情未加载或已下线）' }
     }
@@ -211,7 +219,7 @@ export class BossPlatform extends BasePlatform {
 
     btn.scrollIntoView({ block: 'center' })
     await this.delay(500, 1200)
-    diag('BOSS', `点击沟通按钮: ${card.title}`)
+    diag('BOSS', '点击沟通按钮', { titleLength: card.title.length })
     btn.click()
 
     // 先处理确认弹窗，再等聊天框：弹窗带遮罩，不关掉会挡住后续操作。
@@ -221,7 +229,7 @@ export class BossPlatform extends BasePlatform {
     // 避免 HR 收到两条寒暄。
       return {
         outcome: 'applied',
-        message: `已建立会话，BOSS 已发送招呼语：${bossSent.slice(0, 20)}`,
+        message: '已建立会话，BOSS 已发送默认招呼语',
         greetingSent: true,
       }
     }
@@ -236,7 +244,7 @@ export class BossPlatform extends BasePlatform {
     if (!input) {
     // 可能被风控页拦截，或按钮点击未生效
       if (/_security_check|security-check/.test(location.href)) {
-        diag('BOSS', '触发风控验证页', { url: location.href })
+        diag('BOSS', '触发风控验证页', { path: location.pathname })
         return { outcome: 'failed', message: '触发风控验证页，请手动完成验证后重试' }
       }
 
@@ -245,7 +253,7 @@ export class BossPlatform extends BasePlatform {
       const inputs = Array.from(document.querySelectorAll('textarea, [contenteditable=true], input[type=text]'))
         .map((el) => `${el.tagName}.${String((el as HTMLElement).className || '').slice(0, 40)}`)
         .slice(0, 10)
-      diag('BOSS', '点击后未出现聊天输入框', { url: location.href, inputs })
+      diag('BOSS', '点击后未出现聊天输入框', { path: location.pathname, inputs })
       return {
         outcome: 'unknown',
         message: '已点「立即沟通」但未见聊天框；请到消息页核对并手动发送招呼语',
@@ -287,9 +295,11 @@ export class BossPlatform extends BasePlatform {
         // 校验：招呼语是否出现在聊天记录里
         const body = document.body.textContent || ''
         greetingSent = body.includes(greeting.slice(0, 10))
-        diag('BOSS', `招呼语${greetingSent ? '已上屏' : '未确认'}`, { greeting })
+        diag('BOSS', `招呼语${greetingSent ? '已上屏' : '未确认'}`, {
+          greetingLength: greeting.length,
+        })
       } catch (e) {
-        diag('BOSS', `发送招呼语异常: ${(e as Error).message}`)
+        diag('BOSS', '发送招呼语异常', { errorType: (e as Error).name || 'Error' })
       }
     }
 
@@ -406,7 +416,10 @@ export class BossPlatform extends BasePlatform {
           .map((el) => this.text(el).replace(/\s/g, ''))
           .filter((t) => t && t.length < 10),
       ))
-      diag('BOSS', '未找到沟通按钮，候选文本采样', texts.slice(0, 20))
+      diag('BOSS', '未找到沟通按钮，记录候选文本长度', {
+        candidateCount: texts.length,
+        lengths: texts.slice(0, 20).map((value) => value.length),
+      })
     }
     return hit || null
   }
@@ -421,9 +434,9 @@ export class BossPlatform extends BasePlatform {
    *   - 不处理 → 弹窗遮罩挡住页面，后续岗位全部报「未出现聊天输入框」
    *   - 点「继续沟通」→ 跳转 /web/geek/chat，投递循环中断
    *
-   * @returns 弹窗中已发出的招呼语文本；未出现弹窗返回 null
+   * @returns 是否出现发送确认弹窗
    */
-  private async dismissGreetingSentDialog(timeout = 6000): Promise<string | null> {
+  private async dismissGreetingSentDialog(timeout = 6000): Promise<boolean> {
     const start = Date.now()
     while (Date.now() - start < timeout) {
       // 限制容器体积，避免命中整个 body（但弹窗内容可能较长，放宽到 800）
@@ -438,17 +451,6 @@ export class BossPlatform extends BasePlatform {
       )
 
       if (dialog) {
-        // 招呼语正文＝弹窗内最长的那段文本（排除标题、提示与按钮）
-        const sentText =
-          Array.from(dialog.querySelectorAll('p, div, span'))
-            .map((el) => (el.textContent || '').trim())
-            .filter(
-              (t) =>
-                t.length > 8 &&
-                !/已向BOSS发送消息|如需修改打招呼内容|留在此页|继续沟通/i.test(t),
-            )
-            .sort((a, b) => b.length - a.length)[0] || ''
-
         const stay = (
           Array.from(dialog.querySelectorAll('button, a, div, span')) as HTMLElement[]
         ).find((el) => {
@@ -461,25 +463,24 @@ export class BossPlatform extends BasePlatform {
         if (stay) {
           stay.click()
           await this.delay(600, 1000)
-          diag('BOSS', 'BOSS 已自动发招呼语，点「留在此页」关闭弹窗', {
-            sent: sentText.slice(0, 40),
-          })
-          return sentText || '(BOSS 默认招呼语)'
+          diag('BOSS', 'BOSS 已自动发招呼语，点「留在此页」关闭弹窗')
+          return true
         } else {
           // 找不到按钮也要把情况记下来，否则下次只能看到「未出现聊天输入框」
+          const candidates = Array.from(dialog.querySelectorAll('button, a, span, div'))
+            .map((el) => (el.textContent || '').replace(/\s/g, ''))
+            .filter((t) => t && t.length < 20)
           diag('BOSS', '发现发送确认弹窗但无「留在此页」按钮', {
-            texts: Array.from(dialog.querySelectorAll('button, a, span, div'))
-              .map((el) => (el.textContent || '').replace(/\s/g, ''))
-              .filter((t) => t && t.length < 20)
-              .slice(0, 15),
+            candidateCount: candidates.length,
+            textLengths: candidates.slice(0, 15).map((value) => value.length),
           })
-          // 找不到按钮也视为弹窗存在，返回招呼语（避免走入队逻辑重复发送）
-          return sentText || '(BOSS 默认招呼语，但未找到关闭按钮)'
+          // 找不到按钮也视为弹窗存在，避免走入队逻辑重复发送。
+          return true
         }
       }
       await this.delay(300, 500)
     }
-    return null
+    return false
   }
 
   /** 轮询等待详情区的沟通按钮出现（点卡片后详情异步加载） */

@@ -320,7 +320,7 @@ async function dumpDom() {
     try {
       await probeChatPage()
     } catch (e) {
-      diag('DOM', `采集异常：${(e as Error).message}`)
+      diag('DOM', '采集异常', { errorType: (e as Error).name || 'Error' })
     }
   }
 
@@ -338,7 +338,10 @@ async function dumpDom() {
   const nodes = dumpStructure(panel || document.body, 70)
   diag('DOM', `结构 dump（${nodes.length} 节点）`)
   nodes.forEach((n) =>
-    diag('DOM', `  ${'·'.repeat(Math.min(n.depth, 8))}${n.tag}.${n.cls} [${n.rect}] ${n.text}`),
+    diag(
+      'DOM',
+      `  ${'·'.repeat(Math.min(n.depth, 8))}${n.tag}.${n.cls} [${n.rect}] textLength=${n.text.length}`,
+    ),
   )
   domCopyMsg.value = '结构已记录，请点复制'
   setTimeout(() => (domCopyMsg.value = ''), 3000)
@@ -544,7 +547,7 @@ async function openHRThread(msg: HRMessageSummary): Promise<void> {
   openThreadMsg.value = ''
   if (!onChatPage()) {
     await setPendingOpen(msg.company, msg.jobTitle)
-    diag('UI', `待打开会话已落盘: ${msg.company}，跳转聊天页`)
+    diag('UI', '待打开会话已落盘，跳转聊天页')
     gotoChatPage()
     return
   }
@@ -663,7 +666,7 @@ async function consumePendingOpen(): Promise<void> {
   if (!onChatPage()) return
   const pending = await takePendingOpen()
   if (!pending) return
-  diag('UI', `消费跨页交接单: ${pending.company}`)
+  diag('UI', '消费跨页交接单')
   for (let i = 0; i < 24; i++) {
     const r = openThread(pending.company, pending.jobTitle)
     if (r === 'ok') {
@@ -676,7 +679,7 @@ async function consumePendingOpen(): Promise<void> {
   }
   activeTab.value = 'chat'
   openThreadMsg.value = `未能自动打开「${pending.company}」，请在左侧会话列表手动选择`
-  diag('UI', `跨页打开会话失败: ${pending.company}`)
+  diag('UI', '跨页打开会话失败')
 }
 
 /**
@@ -806,7 +809,7 @@ const listeningScroll = ref(false)
 
 function doCollectListDom(): void {
   listDomText.value = collectListDom()
-  diag('PROBE', 'LISTDOM\n' + listDomText.value)
+  diag('PROBE', 'LISTDOM 已在本地采集', { textLength: listDomText.value.length })
 }
 
 function doToggleScrollListener(): void {

@@ -257,11 +257,14 @@ export async function startProbe(
       container: collectContainerInfo(),
     }
     await storage.set(PROBE_KEY, state)
-    diag('PROBE', `开始滚动采集：keyword=${state.keyword} maxSteps=${state.maxSteps}`)
+    diag('PROBE', '开始滚动采集', {
+      keywordLength: state.keyword.length,
+      maxSteps: state.maxSteps,
+    })
     void runProbeLoop(state)
     return { ok: true, message: '' }
   } catch (e) {
-    diag('PROBE', `启动失败: ${(e as Error).message}`)
+    diag('PROBE', '启动失败', { errorType: (e as Error).name || 'Error' })
     return { ok: false, message: `启动失败：${(e as Error).message}` }
   }
 }
@@ -330,7 +333,7 @@ async function runProbeLoop(initial: ProbeState): Promise<void> {
       await storage.set(PROBE_KEY, final)
     }
   } catch (e) {
-    diag('PROBE', `采集中断: ${(e as Error).message}`)
+    diag('PROBE', '采集中断', { errorType: (e as Error).name || 'Error' })
     state.active = false
     state.done = true
     state.doneReason = `采集异常中断：${(e as Error).message}`
@@ -354,6 +357,6 @@ export async function stopProbe(): Promise<void> {
     }
     diag('PROBE', '滚动采集已手动停止')
   } catch (e) {
-    diag('PROBE', `停止失败: ${(e as Error).message}`)
+    diag('PROBE', '停止失败', { errorType: (e as Error).name || 'Error' })
   }
 }

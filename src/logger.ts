@@ -24,51 +24,109 @@ interface LogEntry {
 
 let buffer: LogEntry[] = []
 let lastFlush = 0
-let flushing = false
 let currentRunId = ''
+
+interface PendingLogBatch {
+  batchId: string
+  logs: LogEntry[]
+}
+
+/**
+ * 已从 buffer 取出、但尚未得到服务端 200 确认的批次。
+ *
+ * 网络超时并不代表服务端没收到；重试必须复用同一个 batch_id，让服务端可以
+ * 幂等去重。旧实现把失败批次塞回 buffer、下次生成新 id，存在重复入库风险。
+ */
+let pendingBatch: PendingLogBatch | null = null
+let flushPromise: Promise<void> | null = null
+let forceRequested = false
 
 /** Attach each event to the active orchestration round at the time it occurs. */
 export function setLogRunId(runId: string): void {
   currentRunId = /^[A-Za-z0-9_-]{1,64}$/.test(runId) ? runId : ''
 }
 
-/** 上报缓冲日志；未到阈值/间隔时跳过（非实时）。失败保留待下次重试。 */
-export function flushLogs(): Promise<void> {
-  if (flushing || buffer.length === 0) return Promise.resolve()
-  const now = Date.now()
-  if (buffer.length < FLUSH_THRESHOLD && now - lastFlush < FLUSH_INTERVAL_MS) {
+export interface FlushLogsOptions {
+  /** 忽略 50 条/60 秒门槛，并把当前缓冲全部分批送出。 */
+  force?: boolean
+}
+
+/**
+ * 上报缓冲日志。普通调用受 50 条/60 秒门控；force 用于终态、关键失败和
+ * 页面卸载前的 best effort。
+ *
+ * 并发调用共享同一个 Promise。若上传途中收到 force，请求循环会在当前批次
+ * 结束后继续排空，而不是因为 flushing=true 静默丢掉这次强制语义。
+ */
+export function flushLogs(options: FlushLogsOptions = {}): Promise<void> {
+  if (options.force) forceRequested = true
+  if (flushPromise) return flushPromise
+  if (!pendingBatch && buffer.length === 0) {
+    forceRequested = false
     return Promise.resolve()
   }
 
-  const cfg = loadConfig()
-  if (!isConfigReady(cfg)) return Promise.resolve()
+  flushPromise = (async () => {
+    while (pendingBatch || buffer.length > 0) {
+      const forceThisPass = forceRequested
+      forceRequested = false
+      const now = Date.now()
+      if (
+        !forceThisPass &&
+        buffer.length < FLUSH_THRESHOLD &&
+        now - lastFlush < FLUSH_INTERVAL_MS
+      ) {
+        break
+      }
 
-  const batch = buffer.splice(0, FLUSH_THRESHOLD)
-  const batchId = `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-  flushing = true
-  return network.request({
-    method: 'POST',
-    url: `${cfg.apiBase}/api/plugin/logs`,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.token}`,
-    },
-    data: JSON.stringify({ batch_id: batchId, logs: batch }),
-    timeout: 15000,
+      const cfg = loadConfig()
+      if (!isConfigReady(cfg)) break
+
+      if (!pendingBatch) {
+        pendingBatch = {
+          batchId: `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+          logs: buffer.splice(0, FLUSH_THRESHOLD),
+        }
+      }
+      const batch = pendingBatch
+      let accepted = false
+      try {
+        const resp = await network.request({
+          method: 'POST',
+          url: `${cfg.apiBase}/api/plugin/logs`,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${cfg.token}`,
+          },
+          data: JSON.stringify({ batch_id: batch.batchId, logs: batch.logs }),
+          timeout: 15000,
+        })
+        accepted = resp.status === 200
+      } catch {
+        accepted = false
+      }
+      lastFlush = Date.now()
+      if (!accepted) {
+        // pendingBatch 原样保留；后续重试复用同一 batch_id。
+        break
+      }
+      pendingBatch = null
+
+      // force 要排空调用时已经在缓冲里的小尾批；上传期间新到达的日志若触发
+      // 另一次 force，forceRequested 也会让循环继续。普通模式只自动续传满批。
+      if (!forceThisPass && !forceRequested && buffer.length < FLUSH_THRESHOLD) break
+      if (forceThisPass && buffer.length > 0) forceRequested = true
+    }
+  })().finally(() => {
+    flushPromise = null
+    // Promise 收尾的同一微任务里仍可能新来日志/force；再接一轮，避免竞态。
+    if (!pendingBatch && buffer.length === 0) {
+      forceRequested = false
+    } else if (forceRequested || buffer.length >= FLUSH_THRESHOLD) {
+      void flushLogs({ force: forceRequested })
+    }
   })
-    .then((resp) => {
-      if (resp.status !== 200) buffer = [...batch, ...buffer].slice(-MAX_BUFFER)
-      lastFlush = Date.now()
-    })
-    .catch(() => {
-      // 网络/后端不可达：放回缓冲下次再传
-      buffer = [...batch, ...buffer].slice(-MAX_BUFFER)
-      lastFlush = Date.now()
-    })
-    .finally(() => {
-      flushing = false
-      if (buffer.length >= FLUSH_THRESHOLD) void flushLogs()
-    })
+  return flushPromise
 }
 
 /**

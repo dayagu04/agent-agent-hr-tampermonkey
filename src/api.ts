@@ -112,11 +112,14 @@ export async function matchJobs(
       url: j.url || '',
     })),
   }
-  // 提交的载荷进日志：岗位 id/标题为空是「扫描到岗位但匹配 0」的最常见原因
+  // 仅记录结构摘要；岗位标题、公司、JD 与响应正文不得进入普通日志。
   diag(
     'API',
     `match 提交 ${payload.jobs.length} 个岗位 threshold=${payload.threshold} evaluate=${evaluateMatch}`,
-    payload.jobs.slice(0, 3).map((j) => ({ id: j.platform_job_id, t: j.title })),
+    {
+      missingId: payload.jobs.filter((job) => !job.platform_job_id).length,
+      missingTitle: payload.jobs.filter((job) => !job.title).length,
+    },
   )
 
   const resp = await network.request({
@@ -127,16 +130,8 @@ export async function matchJobs(
     timeout: DEFAULT_TIMEOUT,
   })
   if (resp.status !== 200) {
-    // 带上后端响应体：422 校验错误会明确指出哪个字段缺失
-    diag('API', `match 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 300))
-    let detail = ''
-    try {
-      const err = JSON.parse(resp.responseText)
-      detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail)
-    } catch {
-      detail = (resp.responseText || '').slice(0, 200)
-    }
-    throw new Error(`匹配请求失败 (${resp.status}): ${detail}`)
+    diag('API', `match 失败 HTTP ${resp.status}`)
+    throw new Error(`匹配请求失败 (${resp.status})`)
   }
   const data = JSON.parse(resp.responseText)
   diag('API', `match 返回 ${(data.results || []).length} 条评分`)
@@ -158,12 +153,12 @@ export async function fetchRules(cfg: PluginConfig): Promise<ApplyRule[] | null>
       timeout: 30000,
     })
     if (resp.status !== 200) {
-      diag('API', `rules 拉取失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      diag('API', `rules 拉取失败 HTTP ${resp.status}`)
       return null
     }
     return JSON.parse(resp.responseText).rules || []
   } catch (e) {
-    diag('API', `rules 拉取异常: ${(e as Error).message}`)
+    diag('API', 'rules 拉取异常', { errorType: (e as Error).name || 'Error' })
     return null
   }
 }
@@ -292,12 +287,12 @@ export async function syncChatOne(
       timeout: 60000,
     })
     if (resp.status !== 200) {
-      diag('API', `chat/sync 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      diag('API', `chat/sync 失败 HTTP ${resp.status}`)
       return null
     }
     return JSON.parse(resp.responseText)
   } catch (e) {
-    diag('API', `chat/sync 异常: ${(e as Error).message}`)
+    diag('API', 'chat/sync 异常', { errorType: (e as Error).name || 'Error' })
     return null
   }
 }
@@ -333,7 +328,7 @@ export async function fetchChatPlan(
     timeout: 20000,
   })
   if (resp.status !== 200) {
-    diag('API', `chat/plan 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+    diag('API', `chat/plan 失败 HTTP ${resp.status}`)
     return { pending: 0, reply_scope: opts.reply_scope, targets: [] }
   }
   const data = JSON.parse(resp.responseText) as ChatPlan
@@ -377,7 +372,7 @@ export async function reportChatAudit(
     })
     return resp.status === 200
   } catch (e) {
-    diag('API', `chat/audit 上报异常: ${(e as Error).message}`)
+    diag('API', 'chat/audit 上报异常', { errorType: (e as Error).name || 'Error' })
     return false
   }
 }
@@ -419,12 +414,12 @@ export async function judgeJobs(
       timeout: 120000,
     })
     if (resp.status !== 200) {
-      diag('API', `judge-jobs 失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      diag('API', `judge-jobs 失败 HTTP ${resp.status}`)
       return null
     }
     return JSON.parse(resp.responseText).results || []
   } catch (e) {
-    diag('API', `judge-jobs 异常: ${(e as Error).message}`)
+    diag('API', 'judge-jobs 异常', { errorType: (e as Error).name || 'Error' })
     return null
   }
 }
@@ -485,7 +480,7 @@ export async function fetchHRMessages(
     diag('API', `HR 消息拉取 ${out.length} 条（未读 ${out.filter((m) => m.unread).length}）`)
     return out
   } catch (e) {
-    diag('API', `conversations/list 异常: ${(e as Error).message}`)
+    diag('API', 'conversations/list 异常', { errorType: (e as Error).name || 'Error' })
     return null
   }
 }
@@ -565,13 +560,15 @@ export async function markConversationDeleted(
         timeout: 20000,
       })
       if (resp.status !== 200) {
-        diag('API', `chat/mark-deleted 返回 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+        diag('API', `chat/mark-deleted 返回 HTTP ${resp.status}`)
       } else {
         const data = JSON.parse(resp.responseText) as { marked?: number }
         return { marked: Number(data.marked) || 0 }
       }
     } catch (e) {
-      diag('API', `chat/mark-deleted 第 ${attempt + 1} 次尝试失败: ${(e as Error).message}`)
+      diag('API', `chat/mark-deleted 第 ${attempt + 1} 次尝试失败`, {
+        errorType: (e as Error).name || 'Error',
+      })
     }
     if (attempt === 0) await new Promise((r) => setTimeout(r, 800))
   }
@@ -590,7 +587,7 @@ export async function recordApplication(
   greetingSent = false,
   runId = '',
   keyword = '',
-): Promise<{ success: boolean; duplicate: boolean; message: string }> {
+): Promise<{ success: boolean; duplicate: boolean; upgraded?: boolean; message?: string }> {
   const payload = {
     platform,
     platform_job_id: job.platformJobId,
@@ -678,10 +675,10 @@ export async function reportThreadSnapshot(
       timeout: 60000,
     })
     if (resp.status !== 200) {
-      diag('API', `chat/snapshot 上报失败 HTTP ${resp.status}`, (resp.responseText || '').slice(0, 200))
+      diag('API', `chat/snapshot 上报失败 HTTP ${resp.status}`)
     }
   } catch (e) {
-    diag('API', `chat/snapshot 上报异常: ${(e as Error).message}`)
+    diag('API', 'chat/snapshot 上报异常', { errorType: (e as Error).name || 'Error' })
   }
 }
 
@@ -707,7 +704,7 @@ export async function reconcileThreads(
     timeout: 60000,
   })
   if (resp.status !== 200) {
-    throw new Error(`reconcile HTTP ${resp.status}: ${(resp.responseText || '').slice(0, 200)}`)
+    throw new Error(`reconcile HTTP ${resp.status}`)
   }
   return JSON.parse(resp.responseText)
 }
