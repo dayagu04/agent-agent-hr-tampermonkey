@@ -80,7 +80,9 @@ export async function readFilterOptions(kind: FilterKind): Promise<string[]> {
   const after = snapshotVisibleLi()
   await closePanel()
   const options = Array.from(after).filter((t) => !before.has(t))
-  diag('FILTER', `${OPTION_LABEL[kind]}选项 ${options.length} 个（差分）`, options.slice(0, 30))
+  diag('FILTER', `${OPTION_LABEL[kind]}选项 ${options.length} 个（差分）`, {
+    optionLengths: options.slice(0, 30).map((option) => option.length),
+  })
   return options
 }
 
@@ -97,7 +99,7 @@ export async function applyFilterOption(kind: FilterKind, value: string): Promis
     return t === value && !before.has(value)
   })
   if (!target) {
-    diag('FILTER', `面板里未找到选项「${value}」`)
+    diag('FILTER', '面板里未找到目标选项', { kind, valueLength: value.length })
     await closePanel()
     return false
   }
@@ -107,7 +109,8 @@ export async function applyFilterOption(kind: FilterKind, value: string): Promis
   const ok = urlAfter !== urlBefore
   diag(
     'FILTER',
-    `点击选项「${value}」${ok ? '，URL 已更新' : '，URL 未变化（可能已生效或点击未响应）'}: ${urlAfter}`,
+    `点击目标选项${ok ? '，URL 已更新' : '，URL 未变化（可能已生效或点击未响应）'}`,
+    { kind, valueLength: value.length, queryLength: urlAfter.length },
   )
   return ok
 }

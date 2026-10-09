@@ -171,6 +171,63 @@ describe('ApplyEngine 投递结果口径', () => {
     expect(progress.unknown).toBe(0)
     expect(progress.failed).toBe(0)
   })
+
+  it('历史失败记录升级时不误报为之前已投递', async () => {
+    vi.mocked(recordApplication).mockResolvedValue({
+      success: true,
+      duplicate: true,
+      upgraded: true,
+      message: 'record upgraded',
+    })
+    const platform = new FakePlatform()
+    platform.setJobs([job])
+    platform.setResult({ outcome: 'applied' })
+
+    const progress = await runEngine(platform, makeConfig())
+
+    expect(progress.logs.join('\n')).toContain('记账结果已更新')
+    expect(progress.logs.join('\n')).not.toContain('该岗位之前已投递过')
+  })
+
+  it('旧服务端没有 upgraded 字段时仍按真实 duplicate 提示', async () => {
+    vi.mocked(recordApplication).mockResolvedValue({
+      success: true,
+      duplicate: true,
+      message: 'duplicate',
+    })
+    const platform = new FakePlatform()
+    platform.setJobs([job])
+    platform.setResult({ outcome: 'applied' })
+
+    const progress = await runEngine(platform, makeConfig())
+
+    expect(progress.logs.join('\n')).toContain('该岗位之前已投递过')
+    expect(progress.logs.join('\n')).not.toContain('记账结果已更新')
+  })
+
+  it('普通运行日志不包含岗位、公司或平台/服务端原文', async () => {
+    vi.mocked(recordApplication).mockResolvedValue({
+      success: true,
+      duplicate: false,
+      message: 'SECRET_SERVER_RESPONSE',
+    })
+    const platform = new FakePlatform()
+    platform.setJobs([{
+      ...job,
+      title: 'SECRET_JOB_TITLE',
+      company: 'SECRET_COMPANY_NAME',
+    }])
+    platform.setResult({ outcome: 'applied', message: 'SECRET_PLATFORM_MESSAGE' })
+
+    const progress = await runEngine(platform, makeConfig())
+    const logs = progress.logs.join('\n')
+
+    expect(logs).not.toContain('SECRET_JOB_TITLE')
+    expect(logs).not.toContain('SECRET_COMPANY_NAME')
+    expect(logs).not.toContain('SECRET_PLATFORM_MESSAGE')
+    expect(logs).not.toContain('SECRET_SERVER_RESPONSE')
+    expect(logs).toContain('平台消息长度')
+  })
 })
 
 describe('ApplyEngine 规则/质量降级', () => {

@@ -80,7 +80,7 @@ class GMNotificationAPI implements NotificationAPI {
       GM_notification({ title, text: message, timeout: 5000 })
     } else {
       // 降级：控制台输出
-      console.log(`[通知] ${title}: ${message}`)
+      console.log(`[通知] ${title}（正文仅在系统通知中显示，未写控制台）`)
     }
   }
 }

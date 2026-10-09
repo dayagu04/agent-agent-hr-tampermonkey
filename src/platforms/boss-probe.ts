@@ -1,7 +1,7 @@
 // BOSS 聊天页 DOM 采集模块
 //
 // BOSS 改版频繁，功能失效时第一步就该重新采集真实 DOM 结构再适配。
-// 本模块把会话列表/消息区/头部/操作菜单的结构 dump 进导出日志，
+// 本模块把会话列表/消息区/头部/操作菜单的脱敏结构写进诊断日志，
 // 挂在日志 Tab「聊天页结构」入口上，长期保留。
 import { diag } from '../logger'
 
@@ -54,15 +54,15 @@ function probeThreadList(): void {
   const endMarks = Array.from(document.querySelectorAll('div,p,span'))
     .filter((e) => /没有更多|没有更多了|加载中|到底了/.test(text(e)) && text(e).length < 20)
     .slice(0, 5)
-    .map((e) => ({ el: describe(e as HTMLElement), t: text(e) }))
+    .map((e) => ({ el: describe(e as HTMLElement), textLength: text(e).length }))
   diag('PROBE', '列表结束标记候选', endMarks)
 
   // 首项内部结构：删除功能要找的「···」按钮就在这里面
   const first = items[0]
-  diag('PROBE', '首个会话项自身', { el: describe(first), text: text(first).slice(0, 60) })
+  diag('PROBE', '首个会话项自身', { el: describe(first), textLength: text(first).length })
   const inner = Array.from(first.querySelectorAll('*'))
     .slice(0, 30)
-    .map((e) => ({ el: describe(e as HTMLElement), t: text(e).slice(0, 20) }))
+    .map((e) => ({ el: describe(e as HTMLElement), textLength: text(e).length }))
   diag('PROBE', '首个会话项内部节点（找操作按钮）', inner)
 }
 
@@ -96,7 +96,7 @@ function probeMessagePanel(): void {
   const more = Array.from(document.querySelectorAll('div,span,a'))
     .filter((e) => /查看更多|加载更多|历史消息|more/i.test(text(e)) && text(e).length < 20)
     .slice(0, 5)
-    .map((e) => ({ el: describe(e as HTMLElement), t: text(e) }))
+    .map((e) => ({ el: describe(e as HTMLElement), textLength: text(e).length }))
   diag('PROBE', '历史消息加载入口候选', more)
 }
 
@@ -115,10 +115,12 @@ async function probeThreadMenu(): Promise<void> {
     return
   }
 
-  // 首项完整 outerHTML：直接看悬停框的真实标签与 class，不必再猜
-  // （截断 3000 字符防灌满日志）
-  const html = first.outerHTML || ''
-  diag('PROBE', `首项 outerHTML（${html.length} 字符，截断 3000）`, html.slice(0, 3000))
+  diag('PROBE', '首项 DOM 结构摘要', {
+    el: describe(first),
+    descendantCount: first.querySelectorAll('*').length,
+    htmlLength: (first.outerHTML || '').length,
+    textLength: text(first).length,
+  })
 
   // dump Vue 实例的可用字段，确认悬停态标志位该改哪个
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -156,14 +158,14 @@ async function probeThreadMenu(): Promise<void> {
     (e) => !before.has(e),
   )
   diag('PROBE', `hover 右下角后新增节点 ${added.length} 个（>0 = 条件渲染）`,
-    added.map((e) => ({ el: describe(e), t: text(e).slice(0, 12) })).slice(0, 15))
+    added.map((e) => ({ el: describe(e), textLength: text(e).length })).slice(0, 15))
 
   // 该坐标处最上层是什么（这是 realClick 实际会点到的东西）
   const atCorner2 = document.elementFromPoint(hb.clientX, hb.clientY) as HTMLElement | null
   diag('PROBE', '右下角坐标处最上层元素', {
     el: describe(atCorner2),
     inItem: atCorner2 ? first.contains(atCorner2) : false,
-    t: text(atCorner2).slice(0, 20),
+    textLength: text(atCorner2).length,
   })
 
   const snapshot = () => document.querySelectorAll('*').length
@@ -198,8 +200,12 @@ async function probeThreadMenu(): Promise<void> {
     domDelta: snapshot() - n0,
     del: findDelete(),
     inner: Array.from(first.querySelectorAll('*'))
-      .map((e) => ({ el: describe(e as HTMLElement), t: text(e).slice(0, 12) }))
-      .filter((x) => /more|operate|action|dot|menu|icon/i.test(x.el) || /···|\.\.\.|…/.test(x.t))
+      .map((e) => ({
+        el: describe(e as HTMLElement),
+        textLength: text(e).length,
+        menuGlyph: /···|\.\.\.|…/.test(text(e)),
+      }))
+      .filter((x) => /more|operate|action|dot|menu|icon/i.test(x.el) || x.menuGlyph)
       .slice(0, 10),
   })
 
@@ -214,7 +220,7 @@ async function probeThreadMenu(): Promise<void> {
   diag('PROBE', 'hover 右上角后', {
     domDelta: snapshot() - n1,
     elementAtPoint: describe(atCorner),
-    atPointText: text(atCorner).slice(0, 20),
+    atPointTextLength: text(atCorner).length,
     del: findDelete(),
   })
 
@@ -232,7 +238,7 @@ async function probeThreadMenu(): Promise<void> {
 /**
  * 采集会话头部结构。
  *
- * 动机：日志里反复出现「头部公司名提取失败」（谭晓钥、曹婕两例），
+ * 动机：日志里反复出现「头部公司名提取失败」，
  * 这类会话的 company 变成 "-"，后端按公司名匹配投递记录必然失败。
  */
 function probeHeader(): void {

@@ -205,9 +205,9 @@ export async function reportThreadSnapshotOnce(
       captured_at: new Date().toISOString(),
       threads: rows,
     })
-    diag('SNAP', `会话快照已上报 ${rows.length} 行（${opts.reason}）`)
+    diag('SNAP', `会话快照已上报 ${rows.length} 行`, { reasonLength: opts.reason.length })
   } catch (e) {
-    diag('SNAP', `会话快照上报失败: ${(e as Error).message}`)
+    diag('SNAP', '会话快照上报失败', { errorType: (e as Error).name || 'Error' })
   }
   return rows.length
 }

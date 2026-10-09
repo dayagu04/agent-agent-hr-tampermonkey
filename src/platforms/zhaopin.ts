@@ -40,7 +40,7 @@ export class ZhaopinPlatform extends BasePlatform {
     diag('ZHAOPIN', `卡片选择器命中 "${usedSelector}" → ${cards.length} 个有效卡片`)
 
     const jobs: JobCard[] = []
-    const dropped: string[] = []
+    const dropped: Array<{ missingId: boolean; missingTitle: boolean }> = []
 
     for (const card of cards) {
       // 详情链接：新版可能是 /jobdetail/xxx.htm，也可能是 jobs.zhaopin.com/xxx.htm
@@ -78,7 +78,7 @@ export class ZhaopinPlatform extends BasePlatform {
 
       // 缺 id 或标题就跳过，并记录原因（否则静默丢弃很难排查）
       if (!title || !platformJobId) {
-        dropped.push(`title="${title}" id="${platformJobId}" href="${href.slice(0, 60)}"`)
+        dropped.push({ missingId: !platformJobId, missingTitle: !title })
         continue
       }
 
@@ -94,9 +94,16 @@ export class ZhaopinPlatform extends BasePlatform {
     }
 
     if (dropped.length) {
-      diag('ZHAOPIN', `${dropped.length} 张卡片缺 id/标题被跳过`, dropped.slice(0, 5))
+      diag('ZHAOPIN', `${dropped.length} 张卡片缺 id/标题被跳过`, {
+        missingId: dropped.filter((item) => item.missingId).length,
+        missingTitle: dropped.filter((item) => item.missingTitle).length,
+      })
     }
-    diag('ZHAOPIN', `有效岗位 ${jobs.length} 个`, jobs[0] ? { id: jobs[0].platformJobId, title: jobs[0].title, company: jobs[0].company } : null)
+    diag('ZHAOPIN', `有效岗位 ${jobs.length} 个`, jobs[0] ? {
+      idPresent: !!jobs[0].platformJobId,
+      titleLength: jobs[0].title.length,
+      companyPresent: !!jobs[0].company,
+    } : null)
     return jobs
   }
 
@@ -106,7 +113,7 @@ export class ZhaopinPlatform extends BasePlatform {
     if (!btn) {
       // 不再自动 window.open：批量投递时会刷出大量标签页，且新标签页
       // 无法在本上下文继续操作，等于白开。直接判为「需手动」交回引擎。
-      diag('ZHAOPIN', `"${card.title}" 卡片内无投递按钮`)
+      diag('ZHAOPIN', '卡片内无投递按钮', { titleLength: card.title.length })
       return { outcome: 'failed', message: '卡片内未找到投递按钮' }
     }
 
@@ -118,7 +125,7 @@ export class ZhaopinPlatform extends BasePlatform {
       /* ignore */
     }
 
-    diag('ZHAOPIN', `点击投递按钮: ${card.title}`)
+    diag('ZHAOPIN', '点击投递按钮', { titleLength: card.title.length })
     btn.click()
     await this.delay(1500, 2500)
 
@@ -138,14 +145,16 @@ export class ZhaopinPlatform extends BasePlatform {
     await this.delay(500, 1000)
     const afterText = this.text(btn).replace(/\s/g, '')
     const confirmed = /已投递|已申请/.test(afterText) || !document.contains(btn)
-    diag('ZHAOPIN', `投递后按钮文本="${afterText}" 判定=${confirmed ? '已确认' : '未确认'}`)
+    diag('ZHAOPIN', `投递后判定=${confirmed ? '已确认' : '未确认'}`, {
+      buttonTextLength: afterText.length,
+    })
 
     if (confirmed) {
       return { outcome: 'applied', message: '按钮已变为已投递' }
     }
     // 智联部分岗位投递后按钮不变，一律判失败会漏报；如实返回 unknown，
     // 由后端记为「未确认」而非真实投递，避免虚高统计。
-    diag('ZHAOPIN', `"${card.title}" 结果未确认，请在平台核对`)
+    diag('ZHAOPIN', '投递结果未确认，请在平台核对', { titleLength: card.title.length })
     return { outcome: 'unknown', message: '已点击但平台未反馈，请在平台核对' }
   }
 
@@ -201,7 +210,11 @@ export class ZhaopinPlatform extends BasePlatform {
       const texts = candidates
         .map((el) => this.text(el).replace(/\s/g, ''))
         .filter((t) => t && t.length < 12)
-      diag('ZHAOPIN', '卡片内未找到投递按钮，候选文本采样', Array.from(new Set(texts)).slice(0, 20))
+      const unique = Array.from(new Set(texts))
+      diag('ZHAOPIN', '卡片内未找到投递按钮，记录候选文本长度', {
+        candidateCount: unique.length,
+        lengths: unique.slice(0, 20).map((value) => value.length),
+      })
     }
     return hit || null
   }

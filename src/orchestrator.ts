@@ -416,7 +416,9 @@ export class Orchestrator {
     // 启动时优先捕获当前页已生效的筛选；没有则回落到设置里保存的筛选
     this.state.filterQuery = captureSearchFilterQuery() || this.config.searchFilterQuery || ''
     if (this.state.filterQuery) {
-      diag('ORCH', `搜索筛选参数: ${this.state.filterQuery}`)
+      diag('ORCH', '已捕获搜索筛选参数', {
+        keyCount: Array.from(new URLSearchParams(this.state.filterQuery).keys()).length,
+      })
     }
     await storage.set(STATE_KEY, this.state)
     this.running = true
@@ -460,9 +462,10 @@ export class Orchestrator {
     this.state.pendingAction = null
     await storage.set(STATE_KEY, this.state)
     await this._clearLease()
-    diag('ORCH', `执行器停止: ${reason}`)
+    diag('ORCH', '执行器停止', { reasonLength: reason.length })
     await this.reportEvent('stopped', { reason, stats: this.state.stats })
-    await flushLogs({ force: true })
+    // 终态动作不能等待日志网络；页面与服务端状态先完成，日志后台 best effort。
+    void flushLogs({ force: true }).catch(() => undefined)
     setLogRunId('')
     if (wasRunning) notification.notify('投递助手已停止', reason)
   }
@@ -478,9 +481,9 @@ export class Orchestrator {
     requestStopChatRound()
     await storage.set(STATE_KEY, this.state)
     await this._clearLease()
-    diag('ORCH', `执行器暂停: ${reason}`)
+    diag('ORCH', '执行器暂停', { reasonLength: reason.length })
     await this.reportEvent('paused', { reason })
-    await flushLogs({ force: true })
+    void flushLogs({ force: true }).catch(() => undefined)
     notification.notify('投递助手已暂停', reason)
   }
 
@@ -508,7 +511,9 @@ export class Orchestrator {
     // 或已有批次正在运行时，后端会误以为动作完成并永久清掉 next_action。
     if (!this.state || !this.running) return false
     if (this.busy) {
-      diag('ORCH', '已有指令在执行中，忽略新指令', action)
+      diag('ORCH', '已有指令在执行中，忽略新指令', {
+        action: typeof action.action === 'string' ? action.action : 'unknown',
+      })
       return false
     }
     // 跨标签页一致性：其他标签页停止/暂停/新开一轮时本页放弃旧轮
@@ -534,7 +539,7 @@ export class Orchestrator {
       return true
     } catch (e) {
       const msg = (e as Error).message
-      diag('ORCH', `指令执行失败: ${msg}`)
+      diag('ORCH', '指令执行失败', { errorType: (e as Error).name || 'Error' })
       if (this.state) {
         this.state.errors.push({ time: Date.now(), phase: this.state.phase, message: msg })
         await storage.set(STATE_KEY, this.state)
@@ -580,14 +585,17 @@ export class Orchestrator {
     // 目标页判定：不在目标搜索结果页就先跳转（跳转后由新页面 resume() 续跑）
     if (!onTargetSearchPage(keyword, cityCode, page)) {
       const wantUrl = buildSearchUrl(keyword, cityCode, page, this.state.filterQuery)
-      diag('ORCH', `执行 apply_batch：跳转到 ${wantUrl}`)
+      diag('ORCH', '执行 apply_batch：跳转到目标搜索页', {
+        path: new URL(wantUrl).pathname,
+        queryKeyCount: Array.from(new URL(wantUrl).searchParams.keys()).length,
+      })
       this.state.phase = 'search'
       await storage.set(STATE_KEY, this.state)
       window.location.href = wantUrl
       return
     }
 
-    diag('ORCH', `执行 apply_batch: keyword=${keyword} page=${page} limit=${limit}`)
+    diag('ORCH', '执行 apply_batch', { keywordLength: keyword.length, page, limit })
     this.busy = true
     try {
       if (this.detectRiskControl()) {
@@ -756,10 +764,10 @@ export class Orchestrator {
       )
     } catch (e) {
       const msg = (e as Error).message
-      diag('ORCH', `会话指令失败: ${msg}`)
+      diag('ORCH', '会话指令失败', { errorType: (e as Error).name || 'Error' })
       if (this.state) this.state.pendingAction = null
       await this.reportEvent('chat_failed', { error: msg })
-      await flushLogs({ force: true })
+      void flushLogs({ force: true }).catch(() => undefined)
       notification.notify('会话托管失效', msg)
     } finally {
       this.busy = false

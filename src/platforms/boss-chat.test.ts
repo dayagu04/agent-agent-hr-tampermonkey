@@ -127,6 +127,50 @@ describe('BOSS resume picker DOM handling', () => {
     expect(button.disabled).toBe(true)
   })
 
+  it('does not activate a disabled input submit control', async () => {
+    vi.useFakeTimers()
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <input type="submit" disabled value="发送">
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const submit = dialog.querySelector('input') as HTMLInputElement
+    setRect(dialog, 720, 398)
+    setRect(submit, 100, 40)
+    const clicks = vi.fn()
+    submit.addEventListener('click', clicks)
+
+    const result = completeResumeSend(null)
+    await vi.runAllTimersAsync()
+
+    await expect(result).resolves.toBe(false)
+    expect(clicks).not.toHaveBeenCalled()
+  })
+
+  it('honors disabled fieldset inheritance before dispatching a synthetic click', async () => {
+    vi.useFakeTimers()
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <fieldset disabled><button type="button">发送</button></fieldset>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const button = dialog.querySelector('button') as HTMLButtonElement
+    setRect(dialog, 720, 398)
+    setRect(button, 100, 40)
+    const clicks = vi.fn()
+    button.addEventListener('click', clicks)
+
+    const result = completeResumeSend(null)
+    await vi.runAllTimersAsync()
+
+    await expect(result).resolves.toBe(false)
+    expect(clicks).not.toHaveBeenCalled()
+  })
+
   it('finds an icon-only action by its accessible label', () => {
     document.body.innerHTML = `
       <div role="dialog">
@@ -183,6 +227,42 @@ describe('BOSS resume picker DOM handling', () => {
     expect(selectResumeInDialog(dialog, '指定的软件工程师简历.pdf')).toBe(false)
   })
 
+  it('fails closed when two resume rows normalize to the same best name', () => {
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <label class="resume-item"><input type="radio"><span>Java C.pdf</span></label>
+        <label class="resume-item"><input type="radio"><span>Java C++.pdf</span></label>
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const clicks = vi.fn()
+    for (const el of Array.from(dialog.querySelectorAll('*'))) {
+      setRect(el, 120, 40)
+      el.addEventListener('click', clicks)
+    }
+
+    expect(selectResumeInDialog(dialog, 'Java C++.pdf')).toBe(false)
+    expect(clicks).not.toHaveBeenCalled()
+  })
+
+  it('ignores a disabled matching resume row', () => {
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <label class="resume-item disabled" aria-disabled="true">
+          <input type="radio" disabled><span>后端工程师简历.pdf</span>
+        </label>
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    for (const el of Array.from(dialog.querySelectorAll('*'))) setRect(el, 120, 40)
+
+    expect(selectResumeInDialog(dialog, '后端工程师简历.pdf')).toBe(false)
+  })
+
   it('classifies an unknown resume form separately from safe picker/confirm flows', () => {
     document.body.innerHTML = `
       <div class="dialog-wrap active">
@@ -194,6 +274,78 @@ describe('BOSS resume picker DOM handling', () => {
     const dialog = document.querySelector('.dialog-wrap') as HTMLElement
 
     expect(resumeDialogKind(dialog)).toBe('unknown')
+  })
+
+  it('does not choose between two independent visible resume dialogs', () => {
+    document.body.innerHTML = `
+      <div role="dialog" id="one"><div>请选择要发送的简历</div><button>发送</button></div>
+      <div role="dialog" id="two"><div>确认发送简历</div><button>确认发送</button></div>
+    `
+    for (const el of Array.from(document.querySelectorAll('[role="dialog"], button'))) {
+      setRect(el, 120, 40)
+    }
+
+    expect(findResumeDialog()).toBeNull()
+  })
+
+  it('fails closed when an unrelated visible dialog competes with the resume dialog', () => {
+    document.body.innerHTML = `
+      <div role="dialog" id="resume"><div>请选择要发送的简历</div><button>发送</button></div>
+      <div role="dialog" id="question"><div>请确认其他事项</div><button>确定</button></div>
+    `
+    for (const el of Array.from(document.querySelectorAll('[role="dialog"], button'))) {
+      setRect(el, 120, 40)
+    }
+
+    expect(findResumeDialog()).toBeNull()
+  })
+
+  it('fails closed when a picker adds an unknown visible required field', async () => {
+    vi.useFakeTimers()
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <label class="resume-item selected"><input type="radio" checked><span>后端工程师简历.pdf</span></label>
+        <input type="text" required aria-label="新增必填字段">
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const button = dialog.querySelector('button') as HTMLButtonElement
+    setRect(dialog, 720, 398)
+    for (const el of Array.from(dialog.querySelectorAll('*'))) setRect(el, 120, 40)
+    const clicks = vi.fn()
+    button.addEventListener('click', clicks)
+
+    const result = completeResumeSend('后端工程师简历.pdf')
+    await vi.runAllTimersAsync()
+
+    await expect(result).resolves.toBe(false)
+    expect(clicks).not.toHaveBeenCalled()
+  })
+
+  it('does not treat an unrelated required checkbox as a resume option', async () => {
+    vi.useFakeTimers()
+    document.body.innerHTML = `
+      <div role="dialog">
+        <div>请选择要发送的简历</div>
+        <label class="resume-item selected"><input type="radio" checked><span>后端工程师简历.pdf</span></label>
+        <label><input type="checkbox" required>同意新增条款</label>
+        <button type="button">发送</button>
+      </div>
+    `
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+    const button = dialog.querySelector('button') as HTMLButtonElement
+    setRect(dialog, 720, 398)
+    for (const el of Array.from(dialog.querySelectorAll('*'))) setRect(el, 120, 40)
+    const clicks = vi.fn()
+    button.addEventListener('click', clicks)
+
+    const result = completeResumeSend('后端工程师简历.pdf')
+    await vi.runAllTimersAsync()
+
+    await expect(result).resolves.toBe(false)
+    expect(clicks).not.toHaveBeenCalled()
   })
 
   it('selects first, waits for enablement, then sends exactly once', async () => {

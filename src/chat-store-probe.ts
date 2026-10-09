@@ -26,13 +26,6 @@ function looksLikeBoss(v: unknown): boolean {
   )
 }
 
-function truncate(v: unknown, n = 40): string {
-  if (v === null || v === undefined) return String(v)
-  if (typeof v === 'string') return v.length > n ? v.slice(0, n) + '…' : v
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
-  return Object.prototype.toString.call(v)
-}
-
 function describe(v: unknown): string {
   if (v === null) return 'null'
   if (Array.isArray(v)) return `Array(${v.length})`
@@ -51,11 +44,14 @@ function safeKeys(v: unknown): string[] {
   }
 }
 
-function sampleFields(obj: unknown): string {
+/** 只记录字段名、类型与长度，绝不记录会话对象里的实际值。 */
+function sampleShape(obj: unknown): string {
   const keys = safeKeys(obj).slice(0, 24)
   const parts = keys.map((k) => {
     try {
-      return `${k}=${truncate((obj as Any)[k])}`
+      const value = (obj as Any)[k]
+      const length = typeof value === 'string' || Array.isArray(value) ? `:${value.length}` : ''
+      return `${k}=${describe(value)}${length}`
     } catch {
       return `${k}=<getter-throw>`
     }
@@ -104,14 +100,14 @@ function dumpStoreState(store: Any): void {
     if (Array.isArray(v)) {
       const first = v[0]
       diag('STORE', `  [0] ${describe(first)} keys: ${safeKeys(first).join(', ') || '(无)'}`)
-      if (looksLikeBoss(first)) diag('STORE', `  [0] boss 样例: ${sampleFields(first)}`)
-      else if (first && typeof first === 'object') diag('STORE', `  [0] 样例: ${sampleFields(first)}`)
+      if (looksLikeBoss(first)) diag('STORE', `  [0] boss 结构: ${sampleShape(first)}`)
+      else if (first && typeof first === 'object') diag('STORE', `  [0] 结构: ${sampleShape(first)}`)
     } else if (v && typeof v === 'object') {
       const subKeys = safeKeys(v).slice(0, 12)
       for (const sk of subKeys) {
         const sv = v[sk]
         diag('STORE', `  .${sk} → ${describe(sv)}`)
-        if (Array.isArray(sv) && looksLikeBoss(sv[0])) diag('STORE', `    [0] boss 样例: ${sampleFields(sv[0])}`)
+        if (Array.isArray(sv) && looksLikeBoss(sv[0])) diag('STORE', `    [0] boss 结构: ${sampleShape(sv[0])}`)
       }
     }
   }
@@ -143,7 +139,7 @@ function walkAncestors(vm: Any): void {
         const isFriendList = looksLikeBoss(v[0])
         diag('STORE', `  数组 props.${k}(${v.length})${isFriendList ? ' → 疑似会话列表！' : ''}`)
         if (isFriendList) {
-          diag('STORE', `  [0] 样例: ${sampleFields(v[0])}`)
+          diag('STORE', `  [0] 结构: ${sampleShape(v[0])}`)
           return
         }
       }
@@ -155,7 +151,7 @@ function walkAncestors(vm: Any): void {
         const v = cur[k]
         if (Array.isArray(v) && v.length >= 1 && looksLikeBoss(v[0])) {
           diag('STORE', `  computed.${k} → 会话数组(${v.length})`)
-          diag('STORE', `  [0] 样例: ${sampleFields(v[0])}`)
+          diag('STORE', `  [0] 结构: ${sampleShape(v[0])}`)
           return
         }
       } catch {
@@ -179,7 +175,7 @@ function walkAncestors(vm: Any): void {
           `  数组 ${k}(${v.length}) ${isFriendList ? '→ 疑似会话列表！' : ''} [0] keys=${safeKeys(first).join(', ')}`,
         )
         if (isFriendList) {
-          diag('STORE', `  [0] 样例: ${sampleFields(first)}`)
+          diag('STORE', `  [0] 结构: ${sampleShape(first)}`)
           return
         }
       }
@@ -220,7 +216,7 @@ function walkComponentTree(root: Any): void {
       if (!v) continue
       if (Array.isArray(v) && v.length >= 2 && looksLikeBoss(v[0])) {
         diag('STORE', `组件树 ${path} 的 ${key} → 会话数组(${v.length})`)
-        diag('STORE', `  [0] boss 样例: ${sampleFields(v[0])}`)
+        diag('STORE', `  [0] boss 结构: ${sampleShape(v[0])}`)
         return // 找到即可，避免刷屏
       }
       if (key === '$data' && typeof v === 'object') {
@@ -228,7 +224,7 @@ function walkComponentTree(root: Any): void {
           const sv = v[k]
           if (Array.isArray(sv) && sv.length >= 2 && looksLikeBoss(sv[0])) {
             diag('STORE', `组件树 ${path} 的 data.${k} → 会话数组(${sv.length})`)
-            diag('STORE', `  [0] boss 样例: ${sampleFields(sv[0])}`)
+            diag('STORE', `  [0] boss 结构: ${sampleShape(sv[0])}`)
             return
           }
         }
@@ -291,8 +287,8 @@ function dumpRowBossObject(): void {
     for (const k of ['boss', 'friend', 'item', 'data', 'conversation', 'chat', 'row']) {
       const v = hvm[k] || hvm.$props?.[k]
       if (looksLikeBoss(v)) {
-        diag('STORE', `行 boss 对象位置: ${k}（行内可见文本: ${(row.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}）`)
-        diag('STORE', `boss 字段: ${sampleFields(v)}`)
+        diag('STORE', `行 boss 对象位置: ${k}（行内文本长度: ${(row.textContent || '').length}）`)
+        diag('STORE', `boss 字段结构: ${sampleShape(v)}`)
         diag('STORE', `行组件其他 data keys: ${safeKeys(hvm.$data || hvm).filter((x) => !['_init'].includes(x)).join(', ')}`)
         return
       }
@@ -300,7 +296,7 @@ function dumpRowBossObject(): void {
     const all = { ...(hvm.$data || {}), ...(hvm.$props || {}) }
     const boss = Object.values(all).find((x) => looksLikeBoss(x))
     if (boss) {
-      diag('STORE', `行 boss 对象（遍历 data/$props 找到）: ${sampleFields(boss)}`)
+      diag('STORE', `行 boss 对象（遍历 data/$props 找到）: ${sampleShape(boss)}`)
       return
     }
   }
@@ -319,26 +315,26 @@ export function probeChatStore(): string {
         diag('STORE', `${r.label}：$store=${store ? '有' : '无'}`)
         if (store) dumpStoreState(store)
       } catch (e) {
-        diag('STORE', `store 探测异常: ${(e as Error).message}`)
+        diag('STORE', 'store 探测异常', { errorType: (e as Error).name || 'Error' })
       }
       try {
         walkAncestors(r.value)
       } catch (e) {
-        diag('STORE', `祖先链探测异常: ${(e as Error).message}`)
+        diag('STORE', '祖先链探测异常', { errorType: (e as Error).name || 'Error' })
       }
       try {
         walkComponentTree(r.value)
       } catch (e) {
-        diag('STORE', `组件树探测异常: ${(e as Error).message}`)
+        diag('STORE', '组件树探测异常', { errorType: (e as Error).name || 'Error' })
       }
     }
   } catch (e) {
-    diag('STORE', `根实例探测异常: ${(e as Error).message}`)
+    diag('STORE', '根实例探测异常', { errorType: (e as Error).name || 'Error' })
   }
   try {
     dumpRowBossObject()
   } catch (e) {
-    diag('STORE', `行对象探测异常: ${(e as Error).message}`)
+    diag('STORE', '行对象探测异常', { errorType: (e as Error).name || 'Error' })
   }
   diag('STORE', '==== 探测结束，日志已上传（tag=STORE） ====')
   void flushLogs()
