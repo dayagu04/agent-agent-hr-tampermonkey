@@ -27,8 +27,8 @@ vi.mock('./platforms/boss-chat', () => ({ runChatAudit: vi.fn() }))
 vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
 
 import { network, storage } from './platform-bridge'
-import { diag } from './logger'
-import { reportHeartbeatAndPoll } from './remote'
+import { diag, flushLogs } from './logger'
+import { reportHeartbeatAndPoll, startRemoteLoop } from './remote'
 import { detectPlatform } from './platforms/factory'
 import { getOrchestrator } from './orchestrator'
 
@@ -260,5 +260,23 @@ describe('远程心跳命令协议', () => {
       action: 'apply_batch', command_id: 'cmd-9',
     })
     expect(storage.set).not.toHaveBeenCalled()
+  })
+
+  it('页面离开前请求强制冲刷最后一批诊断', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(network.request).mockResolvedValue({ status: 500, responseText: '' })
+      startRemoteLoop(60_000)
+      await Promise.resolve()
+      await Promise.resolve()
+      vi.mocked(flushLogs).mockClear()
+
+      window.dispatchEvent(new Event('pagehide'))
+
+      expect(vi.mocked(flushLogs)).toHaveBeenCalledWith({ force: true })
+      vi.clearAllTimers()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

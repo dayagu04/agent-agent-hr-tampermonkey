@@ -1488,27 +1488,41 @@ async function handleCard(
 
 /** 按钮禁用判定（unable/disabled/aria/pointer-events） */
 function isDialogButtonDisabled(el: HTMLElement): boolean {
-  const cls = String(el.className || '')
+  const cls = String(el.className || '').toLowerCase()
   return (
-    /unable|disabled|is-disabled/.test(cls) ||
+    (el instanceof HTMLButtonElement && el.disabled) ||
+    /unable|disabled|is-disabled|(?:^|[-_\s])disable(?:$|[-_\s])/.test(cls) ||
     el.getAttribute('aria-disabled') === 'true' ||
+    el.getAttribute('aria-busy') === 'true' ||
     getComputedStyle(el).pointerEvents === 'none'
   )
 }
 
 /** 在弹窗里找按钮：只匹配叶子节点自身文本，排除 拒绝/取消，且可见 */
 export function findDialogButton(root: HTMLElement, re: RegExp): HTMLElement | null {
-  const els = Array.from(root.querySelectorAll('div,span,button,a,[role="button"]')) as HTMLElement[]
+  const els = Array.from(root.querySelectorAll(
+    'div,span,button,a,[role="button"],input[type="button"],input[type="submit"]',
+  )) as HTMLElement[]
   for (const el of els) {
-    const own = Array.from(el.childNodes)
+    const textOwn = Array.from(el.childNodes)
       .filter((n) => n.nodeType === Node.TEXT_NODE)
       .map((n) => (n.textContent || '').trim())
       .join('')
+    const own = (
+      textOwn ||
+      el.getAttribute('aria-label') ||
+      el.getAttribute('title') ||
+      (el instanceof HTMLInputElement ? el.value : '')
+    )
       .replace(/\s+/g, '')
     if (!own || !re.test(own)) continue
     if (/拒绝|取消/.test(own)) continue
-    const r = el.getBoundingClientRect()
-    if (r.width > 0 && r.height > 0) return el
+    // BOSS 常把文案放在 <button><span>发送</span></button> 内。返回 span 会
+    // 漏掉 button.disabled / aria-disabled，进而点击本应禁用的发送动作。
+    const action = (el.closest('button, a, [role="button"]') || el) as HTMLElement
+    if (!root.contains(action)) continue
+    const r = action.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) return action
   }
   return null
 }
@@ -1523,63 +1537,126 @@ function normResumeName(s: string): string {
     .replace(/[\s.+\-_]+/g, '')
 }
 
-/** 定位简历弹窗：优先「请选择要发送的简历」选择框，其次确认框，兜底 .dialog-wrap.active */
+function compactText(el: Element): string {
+  return (el.textContent || '').replace(/\s+/g, '')
+}
+
+function isVisibleDialog(el: HTMLElement): boolean {
+  if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false
+  const style = getComputedStyle(el)
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false
+  const r = el.getBoundingClientRect()
+  return r.width > 0 && r.height > 0
+}
+
+export function resumeDialogKind(dialog: HTMLElement): 'picker' | 'confirm' | 'unknown' {
+  const t = compactText(dialog)
+  if (/请选择(?:要发送的)?(?:附件)?简历|选择(?:一份)?(?:附件)?简历/.test(t)) return 'picker'
+  if (/确定向Boss发送简历|该附件简历将直接发送|确认发送(?:附件)?简历/i.test(t)) return 'confirm'
+  return 'unknown'
+}
+
+const RESUME_DIALOG_ACTION_RE = /^(发送|发送给Boss|发送简历|确认发送|确定发送|确定|同意|确认|继续发送)$/i
+
+/** 定位简历弹窗：语义锚点优先，允许选择框同时带「上传简历」入口。 */
 export function findResumeDialog(): HTMLElement | null {
   const cands = Array.from(document.querySelectorAll(
     '[role="dialog"], [class*="dialog"], [class*="modal"], [class*="layer"], [class*="popup"]',
   )) as HTMLElement[]
-  const visible = cands.filter((d) => {
-    const r = d.getBoundingClientRect()
-    return r.width > 0 && r.height > 0
+  const semantic = cands.filter((d) => {
+    if (!isVisibleDialog(d)) return false
+    const t = compactText(d)
+    if (!t || t.length >= 2000) return false
+    if (resumeDialogKind(d) === 'unknown') return false
+    // `.dialog-header` 自身也会命中 [class*=dialog] 且面积更小，但它不是
+    // 可操作弹窗。要求语义容器同时具备 dialog 身份/active 状态/动作按钮。
+    return d.getAttribute('role') === 'dialog' ||
+      d.classList.contains('active') ||
+      !!findDialogButton(d, RESUME_DIALOG_ACTION_RE)
   })
-  // 1) 简历选择弹窗（实测：.dialog-wrap.active，标题「请选择要发送的简历」）
-  const picker = visible.find((d) => {
-    const t = (d.textContent || '').replace(/\s+/g, '')
-    return t.length < 1500 && t.includes('请选择要发送的简历') && !t.includes('上传简历')
-  })
-  if (picker) return picker
-  // 2) 确认弹窗文案
-  const confirm = visible.find((d) => {
-    const t = (d.textContent || '').replace(/\s+/g, '')
-    return t.length < 500 && /确定向Boss发送简历|该附件简历将直接发送/.test(t)
-  })
-  if (confirm) return confirm
-  // 3) 兜底：带 active 且含「简历」的弹窗
-  for (const d of visible) {
-    if (d.classList.contains('active') && /简历/.test(d.textContent || '')) return d
+  if (semantic.length) {
+    // portal 外壳和内层 dialog 可能同时命中。取面积最小的语义容器，避免
+    // 外壳还包含隐藏旧弹窗/上传入口，导致后续按钮定位串台。
+    return semantic.sort((a, b) => {
+      const ar = a.getBoundingClientRect()
+      const br = b.getBoundingClientRect()
+      return ar.width * ar.height - br.width * br.height
+    })[0]
   }
-  return null
+
+  // 兼容旧结构：只在 active 容器里兜底，未知普通「简历」浮层不自动操作。
+  return cands.find((d) =>
+    isVisibleDialog(d) && d.classList.contains('active') && /简历/.test(d.textContent || ''),
+  ) || null
 }
 
 /** 在简历选择弹窗里选目标简历：按归一化名称模糊匹配列表项，点其可点祖先；
- * 找不到则保持弹窗默认选中项（BOSS 默认第一份）。 */
-function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
+ * 配置了目标却找不到时返回 false，由调用方安全停止，不能误发默认第一份。 */
+export function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
   const targetNorm = normResumeName(targetName)
   if (!targetNorm) return false
   // 只扫叶子节点（自身文本），避免父容器把整弹窗文本算进去
   const leaves = Array.from(dialog.querySelectorAll('*')) as HTMLElement[]
-  for (const el of leaves) {
+  const matches = leaves.flatMap((el) => {
     const own = Array.from(el.childNodes)
       .filter((n) => n.nodeType === Node.TEXT_NODE)
       .map((n) => (n.textContent || '').trim())
       .join('')
-    if (!own) continue
+    if (!own || /请选择|上传简历|发送|确定|取消/.test(own)) return []
     const norm = normResumeName(own)
-    if (!norm || norm.length < 3) continue
-    if (!(norm.includes(targetNorm) || targetNorm.includes(norm))) continue
+    if (!norm || norm.length < 3) return []
+    const exact = norm === targetNorm
+    const fuzzy = norm.includes(targetNorm) ||
+      (norm.length >= Math.max(4, Math.floor(targetNorm.length * 0.6)) && targetNorm.includes(norm))
+    if (!exact && !fuzzy) return []
     const r = el.getBoundingClientRect()
-    if (r.width <= 0 || r.height <= 0) continue
-    const clickTarget = (
-      el.closest('[role="radio"], [role="checkbox"], label, [class*="item"], [class*="resume"]') ||
-      el
-    ) as HTMLElement
+    if (r.width <= 0 || r.height <= 0) return []
+    return [{ el, score: exact ? 2 : 1, delta: Math.abs(norm.length - targetNorm.length) }]
+  }).sort((a, b) => b.score - a.score || a.delta - b.delta)
+
+  const match = matches[0]
+  if (match) {
+    const el = match.el
+    const ancestor = el.closest(
+      '[role="radio"], [role="option"], [role="checkbox"], label, li, [data-resume-id], ' +
+      '[class*="resume-item"], [class*="resume-row"], [class*="resume-card"]',
+    ) as HTMLElement | null
+    const row = ancestor && ancestor !== dialog && dialog.contains(ancestor) ? ancestor : el
+    // 点 label 会先触发 label.click，浏览器随后再替关联 input 触发一次 click；
+    // 委托在行上的 Vue handler 因冒泡可能收到两次。存在单选/复选 input 时
+    // 直接对控件派发一次，既保留 change/default activation，也避免双副作用。
+    const formControl = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
+    const clickTarget = formControl || row
+    const selectedScope = Array.from(new Set([
+      row,
+      clickTarget,
+      ...Array.from(row.querySelectorAll('input')),
+    ])) as HTMLElement[]
+    const alreadySelected = selectedScope.some((node) =>
+      node.getAttribute('aria-checked') === 'true' ||
+      node.getAttribute('aria-selected') === 'true' ||
+      (node instanceof HTMLInputElement && node.checked) ||
+      /(?:^|[-_\s])(selected|active|checked|current)(?:$|[-_\s])/.test(String(node.className || '')),
+    )
     // Resume rows are Vue-controlled radio/checkbox items; use the same
     // real pointer sequence as the surrounding dialog buttons.
-    realClick(clickTarget)
-    diag('CHAT', `已选择默认简历: ${targetName}`)
+    if (!alreadySelected) {
+      if (formControl) clickDirect(formControl)
+      else realClick(clickTarget)
+    }
+    // 简历文件名属于用户材料，不进入普通/上传日志。
+    diag('CHAT', alreadySelected ? '配置的默认简历已处于选中态' : '已选择配置的默认简历', {
+      normalizedLength: targetNorm.length,
+    })
     return true
   }
-  diag('CHAT', `弹窗里未匹配到默认简历「${targetName}」，用弹窗默认选中项`)
+  diag('CHAT', '弹窗里未匹配到配置的默认简历，安全停止发送', {
+    normalizedLength: targetNorm.length,
+    visibleOptionCount: leaves.filter((el) => {
+      const r = el.getBoundingClientRect()
+      return r.width > 0 && r.height > 0 && !!(el.textContent || '').trim()
+    }).length,
+  })
   return false
 }
 
@@ -1600,39 +1677,74 @@ function dumpDialogCandidates(): string[] {
  * 2. 简历选择弹窗：多份简历时默认选中第一个，点「发送」；
  * 账号有多份简历时，按用户配置的默认简历（defaultSendResumeId）选中后发送。
  */
-async function completeResumeSend(
+export async function completeResumeSend(
   targetName: string | null,
   alreadyAgreed = false,
 ): Promise<boolean> {
   let agreed = alreadyAgreed
-  for (let i = 0; i < 20; i++) {
+  const selectedPickers = new WeakSet<HTMLElement>()
+  let waitingForEnabledLogged = false
+  for (let i = 0; i < 24; i++) {
     await delay(400, 600)
     const dialog = findResumeDialog()
     if (!dialog) continue
 
+    const kind = resumeDialogKind(dialog)
+    if (kind === 'unknown') {
+      // 仅有「简历」字样的 active 浮层可能是上传表单、必填问卷或新版未知
+      // 流程。不能因里面恰好有“发送”就盲点；保留结构摘要后交给人工适配。
+      diag('CHAT', '发现未知简历弹窗，安全停止自动发送', {
+        role: dialog.getAttribute('role') || '',
+        cls: String(dialog.className || '').slice(0, 80),
+        controls: dialog.querySelectorAll('button, [role="button"], input, select, textarea').length,
+      })
+      return false
+    }
+    if (kind === 'picker' && targetName && !selectedPickers.has(dialog)) {
+      selectedPickers.add(dialog)
+      // 先选择再判断「发送」是否禁用。BOSS 在未预选简历时会禁用按钮；
+      // 旧逻辑先判 disabled，导致永远没有机会选择目标简历。
+      if (!selectResumeInDialog(dialog, targetName)) return false
+      await delay(350, 550)
+      continue
+    }
+
     // 发送按钮（选择弹窗/直接发送）
-    const sendBtn = findDialogButton(dialog, /^(发送|确定)$/)
-    if (sendBtn && !isDialogButtonDisabled(sendBtn)) {
-      if (targetName) selectResumeInDialog(dialog, targetName)
+    const sendBtn = findDialogButton(dialog, /^(发送|发送给Boss|发送简历|确认发送|确定发送|确定)$/i)
+    if (sendBtn) {
+      if (isDialogButtonDisabled(sendBtn)) {
+        if (!waitingForEnabledLogged) {
+          waitingForEnabledLogged = true
+          diag('CHAT', '简历发送按钮尚未启用，等待选择状态生效')
+        }
+        continue
+      }
       // BOSS uses delegated Vue handlers for the portal button. A bare
       // HTMLElement.click() can update nothing even though the button is
       // visible; dispatch the same pointer/mouse sequence as a user click.
       realClick(sendBtn)
-      await delay(1000, 1500)
-      if (findResumeDialog()) {
-        // Do not report success while the picker is still open. A swallowed
-        // click must remain retryable/manual rather than creating a false
-        // server-side "resume sent" record.
-        diag('CHAT', '已点击发送，但简历弹窗仍在，未确认发送')
+      // 不重试点击同一个发送按钮：第一次可能已到服务端但页面关闭稍慢，
+      // 再点会重复发送。只轮询弹窗是否关闭/切到下一阶段。
+      for (let wait = 0; wait < 12; wait++) {
+        await delay(250, 400)
+        const current = findResumeDialog()
+        if (!current) {
+          diag('CHAT', `已发送简历（${targetName ? '使用配置的默认简历' : '使用平台当前选中简历'}）`)
+          return true
+        }
+        if (resumeDialogKind(current) !== kind) break
+      }
+      const current = findResumeDialog()
+      if (current && resumeDialogKind(current) === kind) {
+        diag('CHAT', '已点击发送，但原简历弹窗仍在，未确认发送；不自动重复点击')
         return false
       }
-      diag('CHAT', `已发送简历（${targetName ? `默认: ${targetName}` : '未配置默认，用弹窗默认'}）`)
-      return true
+      continue
     }
 
     // 确认弹窗：BOSS 用「同意/拒绝」，点了之后等选择弹窗
     if (!agreed) {
-      const agreeBtn = findDialogButton(dialog, /^(同意|确定|确认)$/)
+      const agreeBtn = findDialogButton(dialog, /^(同意|确定|确认|继续发送)$/)
       if (agreeBtn && !isDialogButtonDisabled(agreeBtn)) {
         realClick(agreeBtn)
         agreed = true

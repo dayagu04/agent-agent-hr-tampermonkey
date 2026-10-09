@@ -316,6 +316,7 @@ async function executeCommand(
   } catch (e) {
     console.warn('[remote] 命令执行失败', cmd.action, e)
     diag('REMOTE', `命令执行失败 ${cmd.action}: ${(e as Error).message}`)
+    await flushLogs({ force: true })
     return false
   }
 }
@@ -333,12 +334,23 @@ export function startRemoteLoop(intervalMs = 1000): void {
   // 休眠唤醒恢复：浏览器后台标签页的定时器会被节流（可能 1 分钟才一跳），
   // 切回标签页/获得焦点/bfcache 恢复时立即补一次心跳，网页端状态马上回连。
   // 运行中的编排在冻结恢复后 JS 会自行继续，这里只补心跳、不重复 resume。
-  const onWake = (): void => {
+  const onVisibilityChange = (): void => {
     if (document.visibilityState === 'visible') {
       void reportHeartbeatAndPoll()
+    } else {
+      // hidden 比 pagehide 更早，异步 GM 请求更有机会完成；仍只是 best effort。
+      void flushLogs({ force: true })
     }
   }
-  document.addEventListener('visibilitychange', onWake)
+  const onWake = (): void => {
+    void reportHeartbeatAndPoll()
+  }
+  const onPageExit = (): void => {
+    void flushLogs({ force: true })
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('focus', onWake)
   window.addEventListener('pageshow', onWake)
+  window.addEventListener('pagehide', onPageExit)
+  window.addEventListener('beforeunload', onPageExit)
 }

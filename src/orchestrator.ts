@@ -12,7 +12,7 @@
 
 import type { ApplyProgress, PluginConfig } from './types'
 import { storage, notification } from './platform-bridge'
-import { diag, setLogRunId } from './logger'
+import { diag, flushLogs, setLogRunId } from './logger'
 import { saveConfig } from './config'
 import { ApplyEngine } from './engine'
 import { detectPlatform } from './platforms/factory'
@@ -462,6 +462,7 @@ export class Orchestrator {
     await this._clearLease()
     diag('ORCH', `执行器停止: ${reason}`)
     await this.reportEvent('stopped', { reason, stats: this.state.stats })
+    await flushLogs({ force: true })
     setLogRunId('')
     if (wasRunning) notification.notify('投递助手已停止', reason)
   }
@@ -479,6 +480,7 @@ export class Orchestrator {
     await this._clearLease()
     diag('ORCH', `执行器暂停: ${reason}`)
     await this.reportEvent('paused', { reason })
+    await flushLogs({ force: true })
     notification.notify('投递助手已暂停', reason)
   }
 
@@ -757,6 +759,7 @@ export class Orchestrator {
       diag('ORCH', `会话指令失败: ${msg}`)
       if (this.state) this.state.pendingAction = null
       await this.reportEvent('chat_failed', { error: msg })
+      await flushLogs({ force: true })
       notification.notify('会话托管失效', msg)
     } finally {
       this.busy = false

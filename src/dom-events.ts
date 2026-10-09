@@ -52,12 +52,11 @@ export function clickDirect(el: HTMLElement): void {
   el.dispatchEvent(new MouseEvent('mousedown', { ...baseEvent(pos), button: 0, buttons: 1 }))
   pointerEvent(el, 'pointerup', pos, 0)
   el.dispatchEvent(new MouseEvent('mouseup', { ...baseEvent(pos), button: 0, buttons: 0 }))
+  // 只派发一次终结 click。这里不能再补 el.click()：dispatchEvent(click)
+  // 已经会触发元素自身及祖先上的委托监听器，再调用 click() 会让不可撤回的
+  // 「同意 / 发送 / 删除」动作执行两次。前置 pointer/mouse 序列保留给依赖
+  // 按下/抬起状态的 Vue 监听器。
   el.dispatchEvent(new MouseEvent('click', { ...baseEvent(pos), button: 0, detail: 1 }))
-  try {
-    el.click()
-  } catch {
-    /* ignore */
-  }
 }
 
 /**
@@ -67,8 +66,13 @@ export function clickDirect(el: HTMLElement): void {
  * 因此用 elementFromPoint 找到实际可见节点再派发。
  */
 export function realClick(el: HTMLElement): void {
-  el.scrollIntoView({ block: 'center' })
+  // 脱敏 DOM fixture / 旧 WebView 可能没有 scrollIntoView；点击本身仍可执行。
+  el.scrollIntoView?.({ block: 'center' })
   const pos = centerOf(el)
-  const target = (document.elementFromPoint(pos.clientX, pos.clientY) as HTMLElement) || el
+  const target = (
+    typeof document.elementFromPoint === 'function'
+      ? document.elementFromPoint(pos.clientX, pos.clientY) as HTMLElement | null
+      : null
+  ) || el
   clickDirect(target)
 }
