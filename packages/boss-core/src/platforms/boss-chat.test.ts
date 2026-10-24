@@ -12,6 +12,7 @@ import {
   chatPageOperations,
   classifyCard,
   clickCard,
+  clickCardDetailed,
   completeResumeSend,
   countResumeSentMarks,
   currentThreadId,
@@ -21,6 +22,7 @@ import {
   isActionCardAllowed,
   isContactCardAllowed,
   listPendingCardKinds,
+  listPendingCardsStable,
   listResumeOptions,
   lastResumeSendState,
   openThread,
@@ -722,6 +724,11 @@ describe('pending card detection', () => {
     mockRects()
 
     expect(listPendingCardKinds()).toEqual([])
+    document.querySelector('.chat-conversation')!.insertAdjacentHTML('beforeend', `
+      <div class="item-friend"><div class="card"><p>我想要您的简历，您是否同意</p><button>拒绝</button><button>同意</button></div></div>
+      <div class="item-friend"><div class="card"><p>想和您交换微信，您是否同意</p><button>拒绝</button><button>同意</button></div></div>`)
+    mockRects()
+    expect(listPendingCardKinds().map(card => card.kind)).toEqual(['resume_request', 'contact_exchange'])
   })
 })
 
@@ -781,33 +788,114 @@ describe('choose-resume dialog (measured structure)', () => {
   })
 })
 
-describe('card handling is retryable', () => {
-  function box(top: number, height = 60) {
-    return { x: 0, y: top, top, left: 0, right: 400, bottom: top + height, width: 400, height, toJSON: () => ({}) }
-  }
-
-  it('unmarks the card when the resume never goes out', async () => {
+describe('card handling confirmation', () => {
+  it('binds explicit intent to one card and retains uncertainty after a dispatched click', async () => {
     vi.useFakeTimers()
-    document.body.innerHTML = `
-      <div class="chat-conversation">
-        <div class="item-friend"><div class="card">
-          <p>我想要一份您的附件简历，您是否同意</p>
-          <span class="card-btn" style="cursor:pointer">拒绝</span><span class="card-btn" style="cursor:pointer">同意</span>
-        </div></div>
-      </div>`
-    for (const el of Array.from(document.querySelectorAll('*')) as HTMLElement[]) {
-      const inCard = !!el.closest('.item-friend, .item-myself')
-      vi.spyOn(el, 'getBoundingClientRect').mockReturnValue(box(inCard ? 0 : 200))
+    const rectangle = { x: 100, y: 0, top: 0, left: 100, right: 500, bottom: 60, width: 400, height: 60, toJSON: () => ({}) }
+    const mount = (cards: string): void => {
+      document.body.innerHTML = `<section id="header"><span class="name-text">测试招聘者</span><span class="company">测试公司</span><span class="position-name">测试岗位</span></section>
+        <div class="chat-conversation">${cards}</div>`
+      for (const el of Array.from(document.querySelectorAll('*'))) vi.spyOn(el, 'getBoundingClientRect').mockReturnValue(rectangle)
+      vi.spyOn(document.querySelector('.chat-conversation')!, 'getBoundingClientRect').mockReturnValue({ ...rectangle, height: 800, bottom: 800, width: 800, right: 900 })
+      vi.spyOn(document.querySelector('#header .name-text')!, 'getBoundingClientRect').mockReturnValue({ ...rectangle, x: 0, left: 0, right: 80, width: 80 })
     }
-    vi.spyOn(document.querySelector('.chat-conversation')!, 'getBoundingClientRect')
-      .mockReturnValue({ ...box(0, 800), right: 800, width: 800 })
+    const resume = '<div id="resume" class="item-friend"><div class="card"><p>我想要一份您的附件简历，您是否同意</p><button>拒绝</button><button>同意</button></div></div>'
+    const contact = '<div id="contact" class="item-friend"><div class="card"><p>想和您交换微信，您是否同意</p><button>拒绝</button><button>同意</button></div></div>'
+    const location = (id: string, city: string) => `<div id="${id}" class="item-friend"><div class="card"><p>您是否接受此工作地点：${city}</p><button>暂不考虑</button><button>可以接受</button></div></div>`
+    try {
+      mount(resume)
+      const clicks = vi.fn()
+      document.querySelector('#resume button:last-child')!.addEventListener('click', clicks)
+      expect(await clickCardDetailed('unknown', true)).toMatchObject({ ok: false, reason: 'unknown_card', mayHaveExecuted: false })
+      expect(await clickCardDetailed('resume_request', undefined as unknown as boolean)).toMatchObject({ ok: false, reason: 'accept_required', mayHaveExecuted: false })
+      expect(clicks).not.toHaveBeenCalled()
+      const unconfirmed = clickCardDetailed('resume_request', true)
+      await vi.runAllTimersAsync()
+      expect(await unconfirmed).toEqual({ ok: false, reason: 'card_action_unconfirmed', mayHaveExecuted: true })
+      expect(clicks).toHaveBeenCalledTimes(1)
+      // The server may have accepted a send despite no receipt: keep the tombstone.
+      expect(listPendingCardKinds()).toEqual([])
+      const repeated = clickCard('resume_request', true)
+      await vi.runAllTimersAsync()
+      expect(await repeated).toBe(false)
+      expect(clicks).toHaveBeenCalledTimes(1)
+      const previousDispatch = clickCardDetailed('resume_request', true)
+      await vi.runAllTimersAsync()
+      expect(await previousDispatch).toEqual({ ok: false, reason: 'card_action_unconfirmed', mayHaveExecuted: true })
 
-    const result = clickCard('resume_request', true)
-    await vi.runAllTimersAsync()
-    await expect(result).resolves.toBe(false)
-    // 失败必须回滚，否则这张卡会被永久跳过
-    expect(listPendingCardKinds().map((c) => c.kind)).toEqual(['resume_request'])
-    vi.useRealTimers()
+      mount(resume + contact)
+      const wrongReject = vi.fn()
+      const reject = vi.fn(() => { for (const el of document.querySelectorAll('#contact button')) (el as HTMLButtonElement).disabled = true })
+      document.querySelector('#resume button')!.addEventListener('click', wrongReject)
+      document.querySelector('#contact button')!.addEventListener('click', reject)
+      const rejected = clickCardDetailed('contact_exchange', false)
+      await vi.runAllTimersAsync()
+      expect(await rejected).toEqual({ ok: true, mayHaveExecuted: true })
+      expect(reject).toHaveBeenCalledTimes(1)
+      expect(wrongReject).not.toHaveBeenCalled()
+
+      mount(location('first', '甲城市') + location('second', '乙城市'))
+      const actions = [vi.fn(), vi.fn()]
+      document.querySelector('#first button:last-child')!.addEventListener('click', actions[0])
+      document.querySelector('#second button:last-child')!.addEventListener('click', actions[1])
+      const ambiguous = clickCardDetailed('location_confirm', true)
+      await vi.runAllTimersAsync()
+      expect(await ambiguous).toEqual({ ok: false, reason: 'card_ambiguous', mayHaveExecuted: false })
+      expect(actions.every(action => action.mock.calls.length === 0)).toBe(true)
+      const reading = listPendingCardsStable()
+      await vi.runAllTimersAsync()
+      const cards = await reading
+      expect(cards).toHaveLength(2)
+      expect(cards[1]).toMatchObject({ question: expect.stringContaining('乙城市'), canAccept: true, canReject: true })
+      expect(cards[0].cardKey).not.toBe(cards[1].cardKey)
+      const secondCard = cards[1]
+      document.querySelector('#second button:last-child')!.addEventListener('click', () => { setTimeout(() => {
+        for (const el of document.querySelectorAll('#second button')) (el as HTMLButtonElement).disabled = true
+      }, 400) })
+      let finished = false
+      const selected = clickCardDetailed('location_confirm', true, { cardKey: secondCard.cardKey }).then(result => { finished = true; return result })
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.waitFor(() => expect(actions[1]).toHaveBeenCalledTimes(1))
+      expect(finished).toBe(false)
+      expect(actions[0]).not.toHaveBeenCalled()
+      expect(actions[1]).toHaveBeenCalledTimes(1)
+      await vi.runAllTimersAsync()
+      expect(await selected).toEqual({ ok: true, mayHaveExecuted: true })
+
+      // Core runner entry uses the same card key and confirmation, not a separate click-only path.
+      const current = await chatPageOperations['chat.current']({}) as { threadId: string }
+      const remaining = await chatPageOperations['chat.cards']({ expectedThread: current.threadId }) as Array<{ key: string; kind: string }>
+      expect(remaining).toHaveLength(1)
+      document.querySelector('#first button:last-child')!.addEventListener('click', () => {
+        for (const el of document.querySelectorAll('#first button')) (el as HTMLButtonElement).disabled = true
+      })
+      const core = chatPageOperations['chat.card']({ card: remaining[0], accept: true, expectedThread: current.threadId, resumeName: null })
+      await vi.waitFor(() => expect(actions[0]).toHaveBeenCalledTimes(1))
+      await vi.runAllTimersAsync()
+      expect(await core).toBe(true)
+
+      mount(location('first', '甲城市') + location('second', '甲城市'))
+      const duplicateRead = listPendingCardsStable()
+      await vi.runAllTimersAsync()
+      const duplicates = await duplicateRead
+      expect(duplicates[0].cardKey).toBe(duplicates[1].cardKey)
+      const duplicateAction = clickCardDetailed('location_confirm', true, { cardKey: duplicates[0].cardKey })
+      await vi.runAllTimersAsync()
+      expect(await duplicateAction).toMatchObject({ ok: false, reason: 'card_ambiguous', mayHaveExecuted: false })
+
+      mount(location('target', '甲城市'))
+      const switchClick = vi.fn()
+      document.querySelector('#target button:last-child')!.addEventListener('click', switchClick)
+      const switched = clickCardDetailed('location_confirm', true)
+      document.querySelector('#header .position-name')!.textContent = '其他岗位'
+      await vi.runAllTimersAsync()
+      expect(await switched).toEqual({ ok: false, reason: 'thread_changed', mayHaveExecuted: false })
+      expect(switchClick).not.toHaveBeenCalled()
+      // A key captured in another conversation cannot authorize this one.
+      const staleKey = clickCardDetailed('location_confirm', true, { cardKey: secondCard.cardKey })
+      await vi.runAllTimersAsync()
+      expect(await staleKey).toMatchObject({ ok: false, reason: 'card_not_found', mayHaveExecuted: false })
+    } finally { vi.useRealTimers() }
   })
 })
 

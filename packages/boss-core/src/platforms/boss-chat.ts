@@ -1518,82 +1518,82 @@ async function revealLatestMessages(): Promise<void> {
   await delay(150, 250)
 }
 
-/** 待处理卡片（会先滚动到消息底部，检测更稳定） */
-export async function listPendingCardsStable(): Promise<Array<{ kind: ChatCardKind; questionLength: number }>> {
-  await revealLatestMessages()
-  return listPendingCardKinds()
+/** 待处理卡片（会先滚动到消息底部；key 绑定当前会话及卡片问题）。 */
+export async function listPendingCardsStable(): Promise<Array<{ kind: ChatCardKind; questionLength: number; question: string; cardKey: string; canAccept: boolean; canReject: boolean }>> {
+  const expected = documentCurrent().threadId
+  return withinThread(expected, async () => {
+    await revealLatestMessages()
+    const cards = await Promise.all(findPendingCards().map(async (card) => ({
+      kind: card.kind, questionLength: card.question.length, question: card.question, cardKey: await cardKey(expected, card),
+      canAccept: !!card.acceptBtn, canReject: !!card.rejectBtn,
+    })))
+    assertChatExecutionActive()
+    return cards
+  }, [])
 }
 
-function findPendingCards(): ChatCard[] {
+function cardKey(expectedThread: string, card: ChatCard): Promise<string> {
+  return chatActionKey(expectedThread, card.kind, card.question)
+}
+
+/** Read every known action element; disabled first cards must not hide later cards. */
+function cardButtons(root: HTMLElement, pattern: RegExp): HTMLElement[] {
+  const buttons = new Set<HTMLElement>()
+  for (const el of Array.from(root.querySelectorAll('.card-btn, .btn-v2, button, span, a, [role="button"]')) as HTMLElement[]) {
+    const own = Array.from(el.childNodes).filter(node => node.nodeType === Node.TEXT_NODE)
+      .map(node => node.textContent || '').join('').replace(/\s/g, '')
+    if (!pattern.test(own)) continue
+    const action = (el.closest('.card-btn, .btn-v2, button, a, [role="button"]') || el) as HTMLElement
+    if (!root.contains(action) || !isVisibleDialog(action)) continue
+    if (!action.matches('.card-btn, .btn-v2, button, a, [role="button"]') && getComputedStyle(action).cursor !== 'pointer') continue
+    buttons.add(action)
+  }
+  return [...buttons]
+}
+
+function findPendingCards(includeHandled = false): ChatCard[] {
   const panel = findChatPanel()
   if (!panel) return []
-
   const cards: ChatCard[] = []
-  // 按钮对只用来「发现卡片」，类型一律由问题文本判定（见 classifyCard 注释：
-  // 同意/拒绝 这对按钮同时用于「要简历」和「交换联系方式」，按按钮判类型
-  // 会把联系方式当简历自动同意，已造成一次隐私泄露）。
+  const seen = new Set<HTMLElement>()
   const pairs: Array<[RegExp, RegExp]> = [
     [/^同意$/, /^拒绝$/],
     [/^可以接受$/, /^暂不考虑$/],
   ]
-
   for (const [acceptRe, rejectRe] of pairs) {
-    const accept = findByText(acceptRe, { clickable: true, root: panel })
-    if (!accept) continue
-    const reject = findByText(rejectRe, { clickable: true, root: panel })
-
-    // 卡片问题文本：从按钮往上找含问句的容器，同时记下容器用于判重。
-    //
-    // 不能一见到「长度 6~200 的文本」就收工：按钮行本身就满足
-    // （"暂不考虑可以接受" 恰好 8 字），于是取到的"问题"只有按钮文案、
-    // 认不出类型。继续往上爬直到文本里出现问句特征，爬不到再退回第一个候选。
-    let question = ''
-    let cardEl: HTMLElement | null = null
-    let fallbackQ = ''
-    let fallbackEl: HTMLElement | null = null
-    let cur: HTMLElement | null = accept.parentElement
-    for (let i = 0; i < 6 && cur; i++) {
-      const t = (cur.textContent || '').trim()
-      if (t.length > 6 && t.length < 300) {
+    for (const accept of cardButtons(panel, acceptRe)) {
+      let question = ''
+      let cardEl: HTMLElement | null = null
+      let fallbackQ = ''
+      let fallbackEl: HTMLElement | null = null
+      let cur: HTMLElement | null = accept.parentElement
+      for (let i = 0; i < 6 && cur && panel.contains(cur); i++, cur = cur.parentElement) {
+        // Never bind controls from a container holding several independent cards.
+        if (cardButtons(cur, acceptRe).length !== 1) break
+        const t = (cur.textContent || '').trim()
+        if (t.length <= 6 || t.length >= 300) continue
         const compact = t.replace(/\s+/g, ' ')
-        if (!fallbackQ) {
-          fallbackQ = compact
-          fallbackEl = cur
-        }
-        // 问句特征：含「是否」「我想要」等，说明爬到了真正的问题容器
+        if (!fallbackQ) { fallbackQ = compact; fallbackEl = cur }
         if (/是否|我想要|请问|想和您|想要您/.test(compact)) {
           question = compact
           cardEl = cur
           break
         }
       }
-      cur = cur.parentElement
+      question ||= fallbackQ
+      cardEl ||= fallbackEl
+      if (!cardEl || seen.has(cardEl)) continue
+      seen.add(cardEl)
+      if (isCardAnswered(cardEl, panel) || (!includeHandled && cardEl.dataset.aahCardHandled === '1')) continue
+      const rejects = cardButtons(cardEl, rejectRe)
+      const kind = classifyCard(question)
+      cards.push({ kind, question, element: cardEl,
+        acceptBtn: isDialogButtonDisabled(accept) ? null : accept,
+        rejectBtn: rejects.length === 1 && !isDialogButtonDisabled(rejects[0]) ? rejects[0] : null,
+      })
     }
-    if (!question) {
-      question = fallbackQ
-      cardEl = fallbackEl
-    }
-
-    const kind = classifyCard(question)
-
-    // 已答过的卡片必须排除：BOSS 不会移除按钮，重复点会重复发给 HR
-    if (cardEl && isCardAnswered(cardEl, panel)) {
-      diag('CHAT', `卡片已答过，跳过（${kind}）`, { questionLength: question.length })
-      continue
-    }
-
-    // 同一轮内 findPendingCards 可能在 BOSS 更新消息前再次执行；
-    // 标记放在卡片容器上，避免联系方式/简历卡被重复点击。
-    if (cardEl?.dataset.aahCardHandled === '1') continue
-    cards.push({ kind, question, acceptBtn: accept, rejectBtn: reject, element: cardEl })
   }
-
-  if (cards.length) {
-    diag('CHAT', `发现 ${cards.length} 个交互卡片`, cards.map((c) => ({
-      kind: c.kind,
-      questionLength: c.question.length,
-    })))
-  }
+  if (cards.length) diag('CHAT', `发现 ${cards.length} 个交互卡片`, cards.map(card => ({ kind: card.kind, questionLength: card.question.length })))
   return cards
 }
 
@@ -1610,49 +1610,83 @@ export function listPendingCardKinds(): Array<{ kind: ChatCardKind; questionLeng
   return findPendingCards().map((c) => ({ kind: c.kind, questionLength: c.question.length }))
 }
 
-/**
- * 直接点一张待处理卡片的「同意 / 拒绝」按钮（agent 工具用）。
- *
- * 不套用本地策略：回不回、同不同意由 agent 决策；这里只负责执行并记账，
- * 点击前打 handled 标记，避免同一张卡重复点。
- */
-export async function clickCard(
-  kind: ChatCardKind,
-  accept: boolean,
-  opts: { resumeName?: string | null; resumeIndex?: number | null } = {},
-): Promise<boolean> {
-  await revealLatestMessages()
-  const card = findPendingCards().find((c) => c.kind === kind)
-  if (!card) {
-    diag('CHAT', `card_click status=not_found kind=${kind}`)
-    return false
-  }
-  const btn = accept ? card.acceptBtn : card.rejectBtn
-  if (!btn) {
-    diag('CHAT', `card_click status=no_button kind=${kind} accept=${accept}`)
-    return false
-  }
-  // 先占位防止并发重复点击，但失败必须回滚：标记一旦留下，findPendingCards
-  // 会永远跳过这张卡，agent 再也没有重试机会（2026-10-20 实测踩到）。
-  markCardHandled(card)
-  const baseline = kind === 'resume_request' && accept ? countResumeSentMarks() : null
-  const hit = realClick(btn)
-  diag('CHAT', `card_click status=clicked kind=${kind} accept=${accept} hit=${hit}`)
+export interface CardClickOutcome {
+  ok: boolean
+  reason?: string
+  mayHaveExecuted: boolean
+}
+interface CardClickOptions {
+  resumeName?: string | null
+  resumeIndex?: number | null
+  cardKey?: string
+  /** Trusted runner already captured this identity; atomic calls capture it before awaiting. */
+  expectedThread?: string
+}
 
-  if (kind === 'resume_request' && accept) {
-    await delay(1200, 2000)
-    const cfg = loadConfig()
-    const target =
-      opts.resumeName ||
-      (cfg.defaultSendResumeId && cfg.resumeNames
-        ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
-        : null)
-    const sent = await completeResumeSend(target, false, baseline, opts.resumeIndex ?? null)
-    if (!sent) markCardHandled(card, false) // 简历没发出去 = 卡片没处理，允许重试
-    diag('CHAT', `card_click resume_send status=${sent ? 'sent' : 'failed_retryable'} target=${target ? 'named' : 'none'}`)
-    return sent
+/** Execute explicit intent against one card, retaining uncertainty after dispatch. */
+export async function clickCardDetailed(kind: ChatCardKind, accept: boolean, opts: CardClickOptions = {}): Promise<CardClickOutcome> {
+  const refused = (reason: string, mayHaveExecuted = false): CardClickOutcome => ({ ok: false, reason, mayHaveExecuted })
+  if (typeof accept !== 'boolean') return refused('accept_required')
+  if (!['resume_request', 'location_confirm', 'contact_exchange'].includes(kind)) return refused('unknown_card')
+  if (opts.cardKey !== undefined && (typeof opts.cardKey !== 'string' || opts.cardKey.length > 512)) return refused('invalid_card_key')
+  const requestedKey = opts.cardKey?.trim()
+  const expected = opts.expectedThread || documentCurrent().threadId
+  if (!expected) return refused('no_open_thread')
+  let dispatched = false
+  try {
+    const execute = async (): Promise<CardClickOutcome> => {
+      await revealLatestMessages()
+      const candidates = findPendingCards().filter(card => card.kind === kind)
+      const keyed = requestedKey
+        ? await Promise.all(candidates.map(async card => ({ card, key: await cardKey(expected, card) })))
+        : candidates.map(card => ({ card, key: '' }))
+      assertChatExecutionActive()
+      const matches = requestedKey ? keyed.filter(item => item.key === requestedKey) : keyed
+      if (!matches.length) {
+        const handled = findPendingCards(true).filter(card => card.kind === kind && card.element?.dataset.aahCardHandled === '1')
+        const previous = requestedKey ? (await Promise.all(handled.map(async card => await cardKey(expected, card) === requestedKey))).some(Boolean) : !!handled.length
+        assertChatExecutionActive()
+        return refused(previous ? 'card_action_unconfirmed' : 'card_not_found', previous)
+      }
+      if (matches.length !== 1) return refused('card_ambiguous')
+      const card = matches[0].card
+      const button = accept ? card.acceptBtn : card.rejectBtn
+      if (!button || !button.isConnected || isDialogButtonDisabled(button)) return refused('card_no_button')
+      const baseline = kind === 'resume_request' && accept ? countResumeSentMarks() : null
+      assertChatExecutionActive()
+      markCardHandled(card)
+      dispatched = true
+      realClick(button)
+      if (kind === 'resume_request' && accept) {
+        await delay(1200, 2000)
+        const cfg = loadConfig()
+        const target = opts.resumeName || (cfg.defaultSendResumeId && cfg.resumeNames ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null : null)
+        const sent = await completeResumeSend(target, false, baseline, opts.resumeIndex ?? null)
+        assertChatExecutionActive()
+        return sent ? { ok: true, mayHaveExecuted: true } : refused('card_action_unconfirmed', true)
+      }
+      for (let attempt = 0; attempt <= 15; attempt++) {
+        assertChatExecutionActive()
+        const panel = findChatPanel()
+        if (panel && card.element?.isConnected && panel.contains(card.element) && isCardAnswered(card.element, panel)) {
+          return { ok: true, mayHaveExecuted: true }
+        }
+        if (attempt < 15) await delay(200, 200)
+      }
+      return refused('card_action_unconfirmed', true)
+    }
+    // chat.resume may already hold this exact thread while falling back to a resume card.
+    return pageExpectedThread === expected ? await execute() : await withinThread(expected, execute, refused('thread_changed'))
+  } catch (error) {
+    // The click may already have reached BOSS. Keep handled; a new command must not retry it.
+    const reason = error instanceof Error && error.message === 'chat_thread_changed' ? 'thread_changed' : 'card_action_interrupted'
+    return refused(reason, dispatched)
   }
-  return true
+}
+
+/** Legacy boolean entry; no implicit decision or alternate card selection. */
+export async function clickCard(kind: ChatCardKind, accept: boolean, opts: CardClickOptions = {}): Promise<boolean> {
+  return (await clickCardDetailed(kind, accept, opts)).ok
 }
 
 /** 给当前会话发一条文本（agent 工具用），发送前核对会话未被切换。 */
@@ -3057,33 +3091,21 @@ async function pageOpen(target: ChatThreadTarget, guardMs?: number): Promise<Cha
   return current.threadId ? current : null
 }
 async function pageCards(expectedThread: string): Promise<ChatCardTarget[]> {
-  if (!expectedThread || documentCurrent().threadId !== expectedThread) return []
-  return Promise.all(findPendingCards().map(async (card) => ({
-    key: await chatActionKey(expectedThread, card.kind, card.question), kind: card.kind,
-    question: card.question, canAccept: !!card.acceptBtn, canReject: !!card.rejectBtn,
-  })))
+  return withinThread(expectedThread, async () => {
+    const cards = await Promise.all(findPendingCards().map(async card => ({
+      key: await cardKey(expectedThread, card), kind: card.kind,
+      question: card.question, canAccept: !!card.acceptBtn, canReject: !!card.rejectBtn,
+    })))
+    assertChatExecutionActive()
+    return cards
+  }, [])
 }
 async function pageCard(action: ChatCardAction): Promise<boolean> {
-  return withinThread(action.expectedThread, async () => {
-    const cards = findPendingCards()
-    const entries = await Promise.all(cards.map(async (card) => ({ card,
-      key: await chatActionKey(action.expectedThread, card.kind, card.question) })))
-    const match = entries.filter(entry => entry.key === action.card.key && entry.card.kind === action.card.kind)
-    if (match.length !== 1 || action.card.kind === 'unknown') return false
-    const card = match[0].card
-    const button = action.accept ? card.acceptBtn : card.rejectBtn
-    if (!button) return false
-    assertChatExecutionActive()
-    const baseline = card.kind === 'resume_request' && action.accept ? countResumeSentMarks() : 0
-    markCardHandled(card)
-    realClick(button)
-    await delay(1200, 2000)
-    if (card.kind !== 'resume_request' || !action.accept) return true
-    const sent = await completeResumeSend(action.resumeName, false, baseline)
-    if (!sent) markCardHandled(card, false)
-    return sent
-  }, false)
+  return (await clickCardDetailed(action.card.kind, action.accept, {
+    cardKey: action.card.key, expectedThread: action.expectedThread, resumeName: action.resumeName,
+  })).ok
 }
+
 async function pageDelete(action: ChatDeleteAction): Promise<boolean> {
   return withinThread(action.expectedThread, async () => {
     if (userRecentlyActive(action.guardMs)) return false
