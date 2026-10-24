@@ -3,19 +3,17 @@
 //
 // 列 tools.ts 里的全部标准工具，选中后填 JSON 参数执行，结果显示在下方。
 // 不可撤回的工具要点两次。整块可通过「关闭测试」收起，回到正常投递流程。
-import { computed, ref } from 'vue'
-import { callTool, toolSpecs } from './tools'
+import { computed, ref, onMounted } from 'vue'
+import { getUIHost, type UIToolSpec } from './ui-host'
+const ui = getUIHost()
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-interface Spec {
-  name: string
-  description: string
-  irreversible: boolean
-  exampleArgs: Record<string, unknown>
-}
-
-const specs = ref<Spec[]>(toolSpecs())
+const specs = ref<UIToolSpec[]>([])
+onMounted(async () => {
+  try { specs.value = await ui.toolSpecs() }
+  catch (error) { resultText.value = `工具清单加载失败：${(error as Error).message}` }
+})
 const activeName = ref('')
 const argsText = ref('{}')
 const resultText = ref('')
@@ -24,7 +22,7 @@ const armed = ref(false)
 
 const active = computed(() => specs.value.find((s) => s.name === activeName.value) || null)
 
-function selectTool(spec: Spec): void {
+function selectTool(spec: UIToolSpec): void {
   activeName.value = spec.name
   argsText.value = JSON.stringify(spec.exampleArgs, null, 2)
   resultText.value = ''
@@ -59,7 +57,7 @@ async function runTool(): Promise<void> {
   running.value = true
   resultText.value = '执行中…'
   try {
-    const r = await callTool(spec.name, args)
+    const r = await ui.callTool(spec.name, args)
     resultText.value = JSON.stringify(r, null, 2)
   } catch (e) {
     resultText.value = `执行异常：${(e as Error).message}`
@@ -103,6 +101,7 @@ async function runTool(): Promise<void> {
       </button>
       <pre v-if="resultText" class="aah-tt-result">{{ resultText }}</pre>
     </div>
+    <p v-else-if="resultText" class="aah-tt-hint">{{ resultText }}</p>
     <p v-else class="aah-tt-hint">选一个工具。参数是 JSON，按需修改后执行；结果同时写入插件日志。</p>
   </div>
 </template>

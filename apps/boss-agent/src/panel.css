@@ -1,0 +1,9 @@
+:root { color-scheme: light; --aah-page-height: 768px; --aah-flow-height: 552px; }
+html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+/* The iframe follows the real panel bounds. No full-viewport transparent hit target. */
+html .aah-root { transition: none; }
+html .aah-drawer { width: min(560px, calc(100vw - 18px)); max-height: calc(var(--aah-page-height) - 16px); display: flex; flex-direction: column; }
+html .aah-header { flex: 0 0 auto; }
+html .aah-flow { max-height: var(--aah-flow-height); min-height: 0; box-sizing: border-box; }
+html .aah-tabs-container { height: var(--aah-flow-height); }
+#aah-panel-error { margin: 8px; padding: 16px; border: 1px solid #fecaca; border-radius: 10px; background: #fff; color: #991b1b; font: 13px/1.5 sans-serif; }

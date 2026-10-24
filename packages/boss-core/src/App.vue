@@ -1,21 +1,11 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import type { PluginConfig, ApplyProgress, HRMessageSummary } from './types'
 import { loadConfig, saveConfig, isConfigReady, applyPluginPreferences } from './config'
 import { fetchPluginConfig, login } from './api'
-import { detectPlatform } from './platforms/factory'
+import { getUIHost } from './ui-host'
 import TestTools from './TestTools.vue'
 import { diag } from './logger'
-import { detectNavUnread } from './nav-unread'
-import { probeSearchFiltersOnce } from './search-filters'
-import {
-  currentThreadInfo,
-  deleteThread,
-  listThreads,
-  onChatPage,
-  openThread,
-  readRowJobInfo,
-} from './platforms/boss-chat'
 import { setPendingOpen, takePendingOpen } from './chat-store'
 import {
   flushConversationDeletedMarks,
@@ -31,7 +21,10 @@ import { getOrchestrator, resumeOrchestrator } from './orchestrator'
 import { storage } from './platform-bridge'
 import { VERSION_LABEL } from './version'
 
-const platform = detectPlatform()
+const ui = getUIHost()
+const platform = ui.platform()
+const pageUrl = () => new URL(ui.pageUrl())
+const onChatPage = () => /\/web\/geek\/chat\b/.test(pageUrl().pathname)
 const config = reactive<PluginConfig>(loadConfig())
 const apiEnvironmentLabel = computed(() => {
   const local = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?(?:\/|$)/i.test(config.apiBase)
@@ -44,6 +37,16 @@ const collapsed = ref(true)
 const DEFAULT_BALL_POS = { top: 80, right: 20 }
 const ballPosition = ref({ ...DEFAULT_BALL_POS })
 const dragging = ref(false)
+let dragged = false
+let expandTimer: number | undefined
+let releaseDrag: (() => void) | undefined
+const rootPosition = computed(() => ui.layout
+  ? { top: '8px', right: '8px' }
+  : { top: ballPosition.value.top + 'px', right: ballPosition.value.right + 'px' })
+watch(collapsed, () => { ballPosition.value = clampBallPosition(ballPosition.value) })
+watch([collapsed, ballPosition], () => {
+  ui.layout?.({ collapsed: collapsed.value, position: { ...ballPosition.value } })
+}, { deep: true, immediate: true })
 
 /** 悬浮球尺寸（与 .aah-ball 的 48px 对应，留 12px 余量避免贴边） */
 const BALL_MARGIN = 60
@@ -59,9 +62,11 @@ function clampBallPosition(pos: { top: number; right: number }): { top: number; 
   // 展开态按抽屉尺寸夹边：抽屉 560px 宽，若沿用悬浮球的 60px 余量，
   // 往右一拖整块面板就出了视口，标题栏和收起按钮都点不到，只能刷新页面。
   // 留 120px 可见宽度作为「还能抓回来」的把手。
-  const w = collapsed.value ? BALL_MARGIN : 120
-  const maxTop = Math.max(BALL_MARGIN, window.innerHeight - BALL_MARGIN)
-  const maxRight = Math.max(20, window.innerWidth - w)
+  const viewport = ui.viewport()
+  const w = collapsed.value ? BALL_MARGIN : ui.layout ? Math.min(570, viewport.width) : 120
+  const bottomMargin = ui.layout && !collapsed.value ? Math.min(viewport.height, viewport.height * 0.72 + 64) : BALL_MARGIN
+  const maxTop = Math.max(0, viewport.height - bottomMargin)
+  const maxRight = Math.max(0, viewport.width - w)
   return {
     top: Math.max(0, Math.min(pos.top, maxTop)),
     right: Math.max(0, Math.min(pos.right, maxRight)),
@@ -98,6 +103,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  releaseDrag?.()
+  if (expandTimer !== undefined) clearTimeout(expandTimer)
   window.removeEventListener('resize', onWindowResize)
   if (resizeTimer !== undefined) clearTimeout(resizeTimer)
   if (statsTimer !== undefined) clearInterval(statsTimer)
@@ -113,38 +120,57 @@ onUnmounted(() => {
  * 展开态也必须能拖：抽屉 560px 宽，固定在右侧会挡住 BOSS 的会话列表和
  * 消息区，用户想看被遮住的内容只能收起面板 —— 而收起就看不到运行状态了。
  */
-function onDragStart(e: MouseEvent) {
-  if (e.button !== 0) return
-  // 标题栏里的按钮（设置/收起）不触发拖拽，否则按下即进入拖拽、click 被吞掉
-  if ((e.target as HTMLElement).closest('button')) return
+function onDragStart(e: PointerEvent) {
+  if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return
   e.preventDefault()
+  releaseDrag?.()
+  const handle = e.currentTarget as HTMLElement
+  handle.setPointerCapture(e.pointerId)
   dragging.value = true
-  const startX = e.clientX
-  const startY = e.clientY
+  dragged = false
+  // Screen coordinates remain stable while the native iframe itself moves.
+  const startX = e.screenX
+  const startY = e.screenY
   const startTop = ballPosition.value.top
   const startRight = ballPosition.value.right
-
-  const onMove = (me: MouseEvent) => {
-    const dx = me.clientX - startX
-    const dy = me.clientY - startY
-    ballPosition.value = clampBallPosition({
-      top: startTop + dy,
-      right: startRight - dx,
-    })
+  const onMove = (event: PointerEvent) => {
+    if (event.pointerId !== e.pointerId) return
+    const dx = event.screenX - startX
+    const dy = event.screenY - startY
+    if (Math.abs(dx) + Math.abs(dy) > 4) dragged = true
+    ballPosition.value = clampBallPosition({ top: startTop + dy, right: startRight - dx })
   }
-
-  const onUp = async () => {
+  const cleanup = () => {
     dragging.value = false
-    document.removeEventListener('mousemove', onMove)
-    document.removeEventListener('mouseup', onUp)
-    await storage.set('aah_panel_position', ballPosition.value)
+    document.removeEventListener('pointermove', onMove)
+    document.removeEventListener('pointerup', onUp)
+    document.removeEventListener('pointercancel', onUp)
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId)
+    releaseDrag = undefined
   }
+  const onUp = (event: PointerEvent) => {
+    if (event.pointerId !== e.pointerId) return
+    cleanup()
+    void storage.set('aah_panel_position', { ...ballPosition.value }).catch(() => undefined)
+  }
+  releaseDrag = cleanup
+  document.addEventListener('pointermove', onMove)
+  document.addEventListener('pointerup', onUp)
+  document.addEventListener('pointercancel', onUp)
+}
 
-  document.addEventListener('mousemove', onMove)
-  document.addEventListener('mouseup', onUp)
+function onBallClick(): void {
+  if (dragged) { dragged = false; return }
+  if (expandTimer !== undefined) clearTimeout(expandTimer)
+  // Delay single-click expansion so the existing double-click reset remains reachable.
+  expandTimer = window.setTimeout(() => {
+    collapsed.value = false
+    if (ready.value) void loadHRMessages()
+  }, 240)
 }
 
 async function resetBallPosition() {
+  if (expandTimer !== undefined) clearTimeout(expandTimer)
   ballPosition.value = clampBallPosition({ ...DEFAULT_BALL_POS })
   await storage.set('aah_panel_position', ballPosition.value)
 }
@@ -203,14 +229,14 @@ let navPath = ''
 /** 每秒同步一次「跟路由/存储走」的状态（SPA 换页不重新挂载，只能轮询） */
 function syncRouteState(): void {
   isChatPage.value = onChatPage()
-  const r = detectNavUnread()
+  const r = ui.navUnread()
   navUnread.value = r.count
 
   // BOSS 页开 DevTools 会被风控关页，只能靠自动上报核对：
   //  - 换页后等 3 秒再报，给导航渲染时间；
   //  - 每个路径报一次结论（含命中路径和脱敏结构），数值变化再报；
   //  - 未命中也报，否则日志里没有任何线索。
-  const path = location.pathname
+  const path = pageUrl().pathname
   if (path !== navPath) {
     navPath = path
     navPathTicks = 0
@@ -279,8 +305,8 @@ function threadDisplayKey(company: string, jobTitle: string): string {
  * 调用方（loadHRMessages）会把结果通过 upsertMirrorFromDom 落进本地镜像，
  * 让镜像以页面为准、后端只做富化。
  */
-function mergeChatListWithDom(backendList: HRMessageSummary[]): HRMessageSummary[] {
-  const dom = listThreads()
+async function mergeChatListWithDom(backendList: HRMessageSummary[]): Promise<HRMessageSummary[]> {
+  const dom = await ui.listThreads()
   if (dom.length === 0) return backendList
 
   const byKey = new Map(backendList.map((m) => [threadDisplayKey(m.company, m.jobTitle), m]))
@@ -354,7 +380,7 @@ async function loadHRMessages(): Promise<void> {
     // 聊天页：以 BOSS 页面 DOM 为真相源对齐列表（见 mergeChatListWithDom 注释），
     // 并把结果落进本地镜像——镜像以页面为准，后端只做富化（非聊天页也渲染一致列表）
     if (isChatPage.value) {
-      recentHRMessages.value = mergeChatListWithDom(list)
+      recentHRMessages.value = await mergeChatListWithDom(list)
       await upsertMirrorFromDom(recentHRMessages.value)
     } else {
       recentHRMessages.value = list
@@ -407,14 +433,14 @@ async function openHRThread(msg: HRMessageSummary): Promise<void> {
   if (!onChatPage()) {
     await setPendingOpen(msg.company, msg.jobTitle)
     diag('UI', '待打开会话已落盘，跳转聊天页')
-    gotoChatPage()
+    await gotoChatPage()
     return
   }
-  const r = openThread(msg.company, msg.jobTitle)
+  const r = await ui.openThread(msg.company, msg.jobTitle)
   if (r === 'ok') {
     openThreadMsg.value = `已打开「${msg.company}」的会话`
     // 列表项没有岗位名（只在打开的会话头部），打开后回填到镜像
-    const info = currentThreadInfo()
+    const info = await ui.currentThreadInfo()
     if (info.jobTitle || info.salary) {
       await updateMirrorJobTitle(msg.id, info.jobTitle, info.salary)
       recentHRMessages.value = await renderableMirror()
@@ -435,12 +461,12 @@ async function backfillChatJobTitles(): Promise<void> {
   }
   backfillJobTitlesRunning = true
   try {
-    const threads = listThreads()
+    const threads = await ui.threadRows()
     if (!threads.length) return
     let filled = 0
     for (const t of threads) {
       // 行组件数据（纯内存、极快）：岗位名/薪资/干净公司/HR名 + encryptJobId
-      const info = readRowJobInfo(t.el)
+      const info = t.info
       let title = info.title
       let salary = info.salary
       // boss 对象没有岗位名字段时，用 encryptJobId 查「投递扫描岗位缓存」
@@ -499,7 +525,7 @@ async function deleteHRThread(msg: HRMessageSummary, event: Event): Promise<void
     // 身份（BOSS 原生 id / 后端岗位 id）随删除链路传递：定位与对账都精确到
     // 这一条，同公司多会话不会误删误标。
     const identity = { bossId: msg.bossId, encryptJobId: msg.encryptJobId }
-    const r = await deleteThread(msg.company, msg.jobTitle, identity)
+    const r = await ui.deleteThread(msg.company, msg.jobTitle, identity)
     if (r === 'ok') {
       openThreadMsg.value = `已删除「${msg.company}」的会话`
       // 页面已删：同步从本地镜像移除，避免非聊天页再渲染出这条死会话
@@ -527,7 +553,7 @@ async function consumePendingOpen(): Promise<void> {
   if (!pending) return
   diag('UI', '消费跨页交接单')
   for (let i = 0; i < 24; i++) {
-    const r = openThread(pending.company, pending.jobTitle)
+    const r = await ui.openThread(pending.company, pending.jobTitle)
     if (r === 'ok') {
       openThreadMsg.value = `已打开「${pending.company}」的会话`
       return
@@ -546,8 +572,8 @@ async function consumePendingOpen(): Promise<void> {
  * 拿不到全局 location（编译期不报错、运行时才 undefined）。
  * 用平台适配器给的地址而非写死域名，将来接入别的平台不必改模板。
  */
-function gotoChatPage(): void {
-  if (platform?.chatUrl) window.location.href = platform.chatUrl
+async function gotoChatPage(): Promise<void> {
+  if (platform?.chatUrl) await ui.navigate(platform.chatUrl)
 }
 
 /** 相对时间文案（占位数据 timestamp=0 时不显示时间） */
@@ -819,7 +845,7 @@ function updateOrchestratorStats() {
 
 onMounted(() => {
   // 注入确认 + 平台识别结果，便于「面板没出现/平台判错」类问题定位
-  diag('INIT', `插件已注入 ${VERSION_LABEL}：平台=${platform?.name || '不支持'} url=${location.host}${location.pathname}`)
+  diag('INIT', `插件已注入 ${VERSION_LABEL}：平台=${platform?.name || '不支持'} url=${pageUrl().host}${pageUrl().pathname}`)
   if (config.apiBase && config.token) loadRemoteConfig()
 
   // 编排器内部自建 ApplyEngine，进度要回灌到面板，否则顶部五格恒为 0
@@ -869,8 +895,8 @@ onMounted(() => {
 
   // 职位列表页：只读探测筛选区结构（城市/求职类型/薪资/经验…），结果进日志，
   // 用于把「筛选条件」做成 agent 可控的工具；不点击任何控件。
-  if (/\/web\/geek\/jobs?\b/.test(location.pathname)) {
-    window.setTimeout(() => probeSearchFiltersOnce('page_load'), 3000)
+  if (/\/web\/geek\/jobs?\b/.test(pageUrl().pathname)) {
+    window.setTimeout(() => void ui.probeSearchFilters('page_load').catch(() => undefined), 3000)
   }
 
   // 聊天页：延迟后台静默回填岗位名（列表项无岗位名，需短暂打开会话读头部）
@@ -881,14 +907,14 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="aah-root" :style="{ top: ballPosition.top + 'px', right: ballPosition.right + 'px' }">
+  <div class="aah-root" :style="rootPosition">
     <!-- 折叠态：悬浮球（可拖拽） -->
     <div
       v-if="collapsed"
       class="aah-ball"
       :class="{ dragging }"
-      @mousedown="onDragStart"
-      @click.stop="collapsed = false; ready && loadHRMessages()"
+      @pointerdown="onDragStart"
+      @click.stop="onBallClick"
       @dblclick="resetBallPosition"
       title="智能投递助手（拖动调位置，双击重置）"
     >
@@ -904,7 +930,7 @@ onMounted(() => {
       <div
         class="aah-header"
         :class="{ dragging }"
-        @mousedown="onDragStart"
+        @pointerdown="onDragStart"
         @dblclick="resetBallPosition"
         title="拖动标题栏移动面板，双击复位"
       >
@@ -1170,7 +1196,7 @@ onMounted(() => {
 
 <style>
 .aah-root { position: fixed; z-index: 999999; font-size: 13px; font-family: -apple-system, sans-serif; transition: top 0.1s, right 0.1s; }
-.aah-ball { width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg,#3b82f6,#2563eb); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; cursor:move; box-shadow:0 4px 12px rgba(0,0,0,.2); user-select: none; }
+.aah-ball { touch-action:none; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg,#3b82f6,#2563eb); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:bold; cursor:move; box-shadow:0 4px 12px rgba(0,0,0,.2); user-select: none; }
 .aah-ball.dragging { cursor: grabbing; box-shadow:0 8px 24px rgba(0,0,0,.3); }
 .aah-drawer { width: 560px; background:#fff; border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,.18); overflow:hidden; border:1px solid #e5e7eb; }
 
@@ -1275,7 +1301,7 @@ onMounted(() => {
 .aah-hr-content { font-size:12px; color:#6b7280; line-height:1.6; word-break:break-all; }
 
 /* cursor:move 是「这里能拖」的唯一可见提示，缺了用户不会去试 */
-.aah-header { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#2563eb; color:#fff; cursor:move; user-select:none; }
+.aah-header { touch-action:none; display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#2563eb; color:#fff; cursor:move; user-select:none; }
 .aah-header.dragging { cursor:grabbing; }
 /* 按钮区恢复默认指针：那里点击不拖拽 */
 .aah-header-btns button { cursor:pointer; }
