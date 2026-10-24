@@ -37,6 +37,7 @@ import {
 } from './boss-chat'
 import { normalizeAgentPolicy } from '../contact-policy'
 import { installToolExecutionGuard } from '../tool-execution-guard'
+import { configuration } from '../platform-bridge'
 
 describe('BOSS interaction card classification', () => {
   it('does not classify phone interview cards as contact exchange', () => {
@@ -448,6 +449,26 @@ describe('BOSS resume picker DOM handling', () => {
     expect(selections).toHaveBeenCalledTimes(1)
     expect(sends).toHaveBeenCalledTimes(1)
     expect(lastResumeSendState()).toEqual({ attempted: true, confirmed: true })
+
+    for (const target of ['name', 'index']) {
+      document.body.innerHTML = `<div role="dialog"><h3>请选择要发送的简历</h3><ul>
+        <li class="list-item selected"><div class="item-body">原先附件.pdf</div></li>
+        <li class="list-item"><div class="item-body">后端工程师简历.pdf</div></li>
+        </ul><button>发送</button></div>`
+      const picker = document.querySelector<HTMLElement>('[role="dialog"]')!
+      for (const el of Array.from(picker.querySelectorAll('*')).concat(picker)) setRect(el, 300, 40)
+      const targetRow = picker.querySelectorAll('li')[1]
+      const select = vi.fn() // Vue did not reflect the selection; the old row remains selected.
+      targetRow.addEventListener('click', select)
+      const send = vi.fn()
+      picker.querySelector('button')!.addEventListener('click', send)
+      mountResumeThread()
+      const failed = completeResumeSend(target === 'name' ? '后端工程师简历.pdf' : null, false, null, target === 'index' ? 1 : null)
+      await vi.runAllTimersAsync()
+      await expect(failed).resolves.toBe(false)
+      expect(select).toHaveBeenCalledTimes(1)
+      expect(send).not.toHaveBeenCalled()
+    }
   })
 
   it('does not retry an unconfirmed send click', async () => {
@@ -561,6 +582,29 @@ describe('BOSS resume picker DOM handling', () => {
 
     await expect(result).resolves.toMatchObject({ ok: true })
     expect(sends).toHaveBeenCalledTimes(1)
+
+    const config = vi.spyOn(configuration, 'get').mockReturnValue(JSON.stringify({
+      defaultSendResumeId: 7, resumeNames: { '7': '配置附件.pdf' },
+    }))
+    try {
+      document.body.innerHTML = `<div role="dialog"><h3>请选择要发送的简历</h3><ul>
+        <li class="list-item selected"><div class="item-body">原先附件.pdf</div></li>
+        <li class="list-item"><div class="item-body">配置附件.pdf</div></li>
+        </ul><button>发送</button></div>`
+      const picker = document.querySelector<HTMLElement>('[role="dialog"]')!
+      for (const el of Array.from(picker.querySelectorAll('*')).concat(picker)) setRect(el, 300, 40)
+      const rows = picker.querySelectorAll('li')
+      const select = vi.fn(() => { rows[0].classList.remove('selected'); rows[1].classList.add('selected') })
+      rows[1].addEventListener('click', select)
+      const send = vi.fn(() => { picker.remove(); addResumeMark() })
+      picker.querySelector('button')!.addEventListener('click', send)
+      mountResumeThread()
+      const configured = sendResumeDetailed()
+      await vi.runAllTimersAsync()
+      await expect(configured).resolves.toMatchObject({ ok: true })
+      expect(select).toHaveBeenCalledTimes(1)
+      expect(send).toHaveBeenCalledTimes(1)
+    } finally { config.mockRestore() }
   })
 
   it('recognizes the 2026-10 picker that has no role, no active class and no send button', () => {
@@ -606,6 +650,15 @@ describe('BOSS resume picker DOM handling', () => {
 
     expect(selectResumeInDialog(dialog, '261011.pdf')).toBe(true)
     expect(rowClicks).toEqual(['b'])
+    const rows = dialog.querySelectorAll<HTMLElement>('.row')
+    rows.forEach(row => row.classList.add('resume-item'))
+    setRect(rows[0], 300, 20) // Old generic indexing omitted this short file row and selected B instead.
+    setRect(rows[1], 300, 80)
+    expect(readResumeState().options.map(({ index, name }) => ({ index, name }))).toEqual([
+      { index: 0, name: '蔡韬的简历-agent.pdf' }, { index: 1, name: '261011.pdf' },
+    ])
+    expect(selectResumeRowByIndex(dialog, 0)).toBe(true)
+    expect(rowClicks).toEqual(['b', 'a'])
   })
 
   it('treats a new "已发送给Boss" mark as success when BOSS sends a single attachment without any dialog', async () => {

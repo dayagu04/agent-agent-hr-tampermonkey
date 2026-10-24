@@ -2033,11 +2033,10 @@ function resumeFileLeaves(root: HTMLElement): HTMLElement[] {
   })
 }
 
-/** 在简历选择弹窗里选目标简历：按归一化名称模糊匹配列表项，点其可点祖先；
- * 配置了目标却找不到时返回 false，由调用方安全停止，不能误发默认第一份。 */
-export function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
+/** Resolve a unique named row using the same normalization for selection and final confirmation. */
+function findResumeRowByName(dialog: HTMLElement, targetName: string): HTMLElement | null {
   const targetNorm = normResumeName(targetName)
-  if (!targetNorm) return false
+  if (!targetNorm) return null
   // 新版附件行（文件名 + 更新时间 + 大小，没有 radio/label）：按文件名匹配整行。
   // 点整行而不是文件名文字——文件名本身可能是「预览」链接，会打开 PDF 而不是选中。
   const fileRows = resumeFileRows(dialog)
@@ -2053,22 +2052,9 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
     const top = scored.filter((x) => x.score === best)
     if (top.length !== 1) {
       diag('CHAT', `resume_select status=${top.length ? 'ambiguous' : 'not_found'} rows=${fileRows.length} matches=${top.length}`)
-      return false
+      return null
     }
-    const { row } = top[0]
-    if (optionState(row).selected) {
-      diag('CHAT', `resume_select status=already_selected rows=${fileRows.length}`)
-    } else {
-      // 行里有 radio/checkbox 时直接点控件：点 label 会被浏览器再转发一次给 input，
-      // 行上的 Vue handler 收到两次（与下方旧版行逻辑同一处理）
-      const formControl = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
-      assertChatExecutionActive()
-      resumeSendState.attempted = true // A picker may send immediately on row selection.
-      if (formControl) clickDirect(formControl)
-      else realClick(row)
-      diag('CHAT', `resume_select status=clicked rows=${fileRows.length} score=${best} control=${formControl ? 1 : 0}`)
-    }
-    return true
+    return top[0].row
   }
   // 只扫叶子节点（自身文本），避免父容器把整弹窗文本算进去
   const leaves = Array.from(dialog.querySelectorAll('*')) as HTMLElement[]
@@ -2114,38 +2100,9 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
         candidateCount: matches.filter((candidate) => candidate.score === match.score).length,
         normalizedLength: targetNorm.length,
       })
-      return false
+      return null
     }
-    const row = match.row
-    // 点 label 会先触发 label.click，浏览器随后再替关联 input 触发一次 click；
-    // 委托在行上的 Vue handler 因冒泡可能收到两次。存在单选/复选 input 时
-    // 直接对控件派发一次，既保留 change/default activation，也避免双副作用。
-    const formControl = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
-    const clickTarget = formControl || row
-    const selectedScope = Array.from(new Set([
-      row,
-      clickTarget,
-      ...Array.from(row.querySelectorAll('input')),
-    ])) as HTMLElement[]
-    const alreadySelected = selectedScope.some((node) =>
-      node.getAttribute('aria-checked') === 'true' ||
-      node.getAttribute('aria-selected') === 'true' ||
-      (node instanceof HTMLInputElement && node.checked) ||
-      /(?:^|[-_\s])(selected|active|checked|current)(?:$|[-_\s])/.test(String(node.className || '')),
-    )
-    // Resume rows are Vue-controlled radio/checkbox items; use the same
-    // real pointer sequence as the surrounding dialog buttons.
-    if (!alreadySelected) {
-      assertChatExecutionActive()
-      resumeSendState.attempted = true
-      if (formControl) clickDirect(formControl)
-      else realClick(clickTarget)
-    }
-    // 简历文件名属于用户材料，不进入普通/上传日志。
-    diag('CHAT', alreadySelected ? '配置的默认简历已处于选中态' : '已选择配置的默认简历', {
-      normalizedLength: targetNorm.length,
-    })
-    return true
+    return match.row
   }
   diag('CHAT', '弹窗里未匹配到配置的默认简历，安全停止发送', {
     normalizedLength: targetNorm.length,
@@ -2154,7 +2111,20 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
       return r.width > 0 && r.height > 0 && !!(el.textContent || '').trim()
     }).length,
   })
-  return false
+  return null
+}
+
+export function selectResumeInDialog(dialog: HTMLElement, targetName: string): boolean {
+  const row = findResumeRowByName(dialog, targetName)
+  if (!row) return false
+  if (!optionState(row).selected) {
+    const control = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
+    assertChatExecutionActive()
+    resumeSendState.attempted = true // A picker may send immediately on row selection.
+    if (control) clickDirect(control)
+    else realClick(row)
+  }
+  return true
 }
 
 /** 不依赖文件名的行元素（字体混淆时的兜底） */
@@ -2174,41 +2144,26 @@ function genericRowEls(dialog: HTMLElement): HTMLElement[] {
   return rows.filter((r) => !rows.some((o) => o !== r && r.contains(o))).slice(0, 10)
 }
 
-function listRowsGeneric(dialog: HTMLElement): ResumeOption[] {
-  return genericRowEls(dialog).map((row) => ({ name: 'row', ...optionState(row) }))
-}
-
-/** 按序号点选（字体混淆导致名字不可靠时用） */
+/** Indexes use exactly the same row enumeration exposed by readResumeState. */
 export function selectResumeRowByIndex(dialog: HTMLElement, index: number): boolean {
-  const listItems = Array.from(dialog.querySelectorAll('li.list-item')) as HTMLElement[]
-  const pick = listItems[index]
-  if (pick) {
-    if (!isVisibleDialog(pick) || optionState(pick).disabled) return false
-    if (!optionState(pick).selected) {
-      assertChatExecutionActive()
-      resumeSendState.attempted = true
-      realClick(pick)
-    }
-    diag('CHAT', `resume_select status=clicked_list_item index=${index} rows=${listItems.length}`)
-    return true
-  }
-  if (listItems.length) return false
-  const rows = genericRowEls(dialog)
-  const row = rows[index]
-  if (!row) {
-    diag('CHAT', `resume_select status=index_out_of_range index=${index} rows=${rows.length}`)
-    return false
-  }
-  if (optionState(row).disabled) return false
-  const input = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
+  const row = resumeOptionRows(dialog)[index]?.row
+  if (!row || !isVisibleDialog(row) || optionState(row).disabled) return false
   if (!optionState(row).selected) {
+    const control = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
     assertChatExecutionActive()
     resumeSendState.attempted = true
-    if (input) clickDirect(input)
+    if (control) clickDirect(control)
     else realClick(row)
   }
-  diag('CHAT', `resume_select status=clicked_by_index index=${index} rows=${rows.length}`)
   return true
+}
+
+function resumeSelectionConfirmed(dialog: HTMLElement, targetName: string | null, targetIndex: number | null, expected: HTMLElement | undefined): boolean {
+  const row = targetIndex !== null ? resumeOptionRows(dialog)[targetIndex]?.row
+    : targetName ? findResumeRowByName(dialog, targetName) : null
+  if (!row || row !== expected || !isVisibleDialog(row)) return false
+  const state = optionState(row)
+  return state.selected && !state.disabled
 }
 
 /** picker 出现未识别的可见必填控件时，不猜字段语义，不继续发送。 */
@@ -2305,7 +2260,7 @@ function optionState(row: HTMLElement): { selected: boolean; disabled: boolean }
  * 优先按附件文件名（xxx.pdf）圈行——这是 2026-10 实测的新版结构；
  * 没有文件名时退回旧版 li/label/radio 行。
  */
-export function listResumeOptions(dialog: HTMLElement): ResumeOption[] {
+function resumeOptionRows(dialog: HTMLElement): Array<{ row: HTMLElement; name: string }> {
   // 实测结构：li.list-item，.item-body 是名字/更新时间/大小，.selected 表示选中
   const listItems = Array.from(dialog.querySelectorAll('li.list-item')) as HTMLElement[]
   if (listItems.length) {
@@ -2316,17 +2271,17 @@ export function listResumeOptions(dialog: HTMLElement): ResumeOption[] {
       const name = raw.split(/更新于|\d+(?:\.\d+)?\s*(?:KB|MB|K|M)\b/i)[0].trim().slice(0, 120)
       return {
         name: name || 'row',
-        ...optionState(li),
+        row: li,
       }
     })
   }
   const fileRows = resumeFileRows(dialog)
   if (fileRows.length) {
-    return fileRows.map(({ row, name }) => ({ name, ...optionState(row) }))
+    return fileRows
   }
   // 附件名被字体混淆时没有 ".pdf" 字样，按结构找行：
   // 选择框内可见、高度够、文本短、可点击的行，按 DOM 顺序编号。
-  const structural = listRowsGeneric(dialog)
+  const structural = genericRowEls(dialog).map(row => ({ row, name: 'row' }))
   if (structural.length) return structural
   const rows = new Map<HTMLElement, string>()
   for (const el of Array.from(dialog.querySelectorAll('*')) as HTMLElement[]) {
@@ -2345,7 +2300,11 @@ export function listResumeOptions(dialog: HTMLElement): ResumeOption[] {
   const entries = Array.from(rows.entries()).filter(
     ([row]) => !Array.from(rows.keys()).some((other) => other !== row && row.contains(other)),
   )
-  return entries.map(([row, name]) => ({ name, ...optionState(row) }))
+  return entries.map(([row, name]) => ({ row, name }))
+}
+
+export function listResumeOptions(dialog: HTMLElement): ResumeOption[] {
+  return resumeOptionRows(dialog).map(({ row, name }) => ({ name, ...optionState(row) }))
 }
 
 /** 工具栏「发简历」入口。跳过消息流里 HR 卡片上的同名文字，避免误点卡片。 */
@@ -2436,7 +2395,8 @@ async function completeResumeSendInThread(
   targetIndex: number | null,
 ): Promise<boolean> {
   let agreed = alreadyAgreed
-  const selectedPickers = new WeakSet<HTMLElement>()
+  const selectedPickers = new WeakMap<HTMLElement, HTMLElement>()
+  let selectionAttempted = false
   const clickedStages = new Set<'picker' | 'confirm'>()
   let waitingForEnabledLogged = false
   let sawDialog = false
@@ -2490,13 +2450,21 @@ async function completeResumeSendInThread(
       }
     }
     if (kind === 'picker' && targetIndex !== null && !selectedPickers.has(dialog)) {
-      selectedPickers.add(dialog)
+      if (selectionAttempted) return false
+      selectionAttempted = true
+      const row = resumeOptionRows(dialog)[targetIndex]?.row
+      if (!row) return false
+      selectedPickers.set(dialog, row)
       if (!selectResumeRowByIndex(dialog, targetIndex)) return false
       await delay(350, 550)
       continue
     }
     if (kind === 'picker' && targetName && !selectedPickers.has(dialog)) {
-      selectedPickers.add(dialog)
+      if (selectionAttempted) return false
+      selectionAttempted = true
+      const row = findResumeRowByName(dialog, targetName)
+      if (!row) return false
+      selectedPickers.set(dialog, row)
       // 先选择再判断「发送」是否禁用。BOSS 在未预选简历时会禁用按钮；
       // 旧逻辑先判 disabled，导致永远没有机会选择目标简历。
       if (!selectResumeInDialog(dialog, targetName)) return false
@@ -2515,6 +2483,11 @@ async function completeResumeSendInThread(
         continue
       }
       if (clickedStages.has(kind)) return false
+      if (kind === 'picker' && (targetName || targetIndex !== null) &&
+          !resumeSelectionConfirmed(dialog, targetName, targetIndex, selectedPickers.get(dialog))) {
+        diag('CHAT', 'resume_send status=selection_unconfirmed')
+        return false
+      }
       // BOSS uses delegated Vue handlers for the portal button. A bare
       // HTMLElement.click() can update nothing even though the button is
       // visible; dispatch the same pointer/mouse sequence as a user click.
@@ -2613,6 +2586,11 @@ export async function sendResumeDetailed(
   targetIndex?: number | null,
 ): Promise<ResumeSendOutcome> {
   resumeSendState = { attempted: false, confirmed: false }
+  if (!targetName && targetIndex == null) {
+    const cfg = loadConfig()
+    targetName = cfg.defaultSendResumeId && cfg.resumeNames
+      ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null : null
+  }
   return inResumeThread(documentCurrent().threadId,
     () => sendResumeDetailedInThread(targetName, targetIndex), { ok: false, reason: 'send_failed' })
 }
@@ -2664,16 +2642,7 @@ async function sendResumeDetailedInThread(
   realClick(btn)
   await delay(1200, 1800)
 
-  if (targetName || targetIndex != null) {
-    const ok = await completeResumeSendInThread(targetName || null, false, baseline, targetIndex ?? null)
-    return { ok, reason: ok ? undefined : 'send_failed' }
-  }
-  const cfg = loadConfig()
-  const configured =
-    cfg.defaultSendResumeId && cfg.resumeNames
-      ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
-      : null
-  const ok = await completeResumeSendInThread(configured, false, baseline, null)
+  const ok = await completeResumeSendInThread(targetName || null, false, baseline, targetIndex ?? null)
   return { ok, reason: ok ? undefined : 'send_failed' }
 }
 
