@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
+
+// DOM 契约使用未登录的宿主配置快照。
+vi.mock('../platform-bridge', () => ({
+  configuration: { get: (_key: string, fallback: string) => fallback, set: vi.fn() },
+}))
 import { deleteViaRowVue, findBossObject } from './boss-delete'
 
 describe('findBossObject', () => {

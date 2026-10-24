@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-// 把 GM 桥接层换成内存假实现：ledger 的删除标记队列/镜像移除逻辑不碰真 GM API
+// 把宿主接口换成内存假实现：ledger 的删除标记队列/镜像移除逻辑不依赖浏览器宿主
 vi.mock('./platform-bridge', () => ({
   storage: {
     get: vi.fn(),
@@ -10,6 +10,7 @@ vi.mock('./platform-bridge', () => ({
   },
   network: { request: vi.fn() },
   notification: { notify: vi.fn() },
+  configuration: { get: (_key: string, fallback: string) => fallback, set: vi.fn() },
 }))
 
 import { network, storage } from './platform-bridge'

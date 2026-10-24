@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PluginConfig } from './types'
 
-// 把 GM 桥接层换成假实现，专门测 API 失败时不再静默返回空数组
+// 把宿主接口换成假实现，专门测 API 失败时不再静默返回空数组
 vi.mock('./platform-bridge', () => ({
   storage: {
     get: vi.fn(),
@@ -11,6 +11,7 @@ vi.mock('./platform-bridge', () => ({
   },
   network: { request: vi.fn() },
   notification: { notify: vi.fn() },
+  configuration: { get: (_key: string, fallback: string) => fallback, set: vi.fn() },
 }))
 
 import { network } from './platform-bridge'
