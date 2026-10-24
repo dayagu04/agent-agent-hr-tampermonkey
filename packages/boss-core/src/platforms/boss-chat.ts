@@ -2770,10 +2770,25 @@ export function readRowLastTS(li: HTMLElement): number | null {
 
 
 const identityText = (value: string) => value.replace(/\s+/g, '').toLowerCase()
+function conflictingHeaderIdentity(info: ChatCurrent['info']): boolean {
+  const matches = (company: string, jobTitle: string, name: string) =>
+    identityText(company) === identityText(info.company) &&
+    identityText(jobTitle) === identityText(info.jobTitle) &&
+    (!name || identityText(name) === identityText(info.hrName))
+  // A native row ID cannot be verified from a header that only exposes text. Do not
+  // accept that header when another row could represent the same company/HR/job.
+  const sources = readChatSources()
+  if (sources && sources.filter(({ boss }) => matches(String(boss.brandName || boss.company || ''),
+    String(boss.positionName || boss.title || ''), String(boss.name || boss.bossName || ''))).length > 1) return true
+  return listThreadsQuiet().filter(row => {
+    const actual = readRowJobInfo(row.el)
+    return matches(actual.brandName || row.company, actual.title || row.jobTitle, actual.hrName || row.name)
+  }).length > 1
+}
 function documentCurrent(): ChatCurrent {
   const info = currentThreadInfo()
   const identity = [info.company, info.hrName, info.jobTitle].map(identityText)
-  return { info, threadId: identity.every(Boolean) ? `chat:${JSON.stringify(identity)}` : '' }
+  return { info, threadId: identity.every(Boolean) && !conflictingHeaderIdentity(info) ? `chat:${JSON.stringify(identity)}` : '' }
 }
 function rowTarget(row: ChatThread): ChatThreadTarget {
   const info = readRowJobInfo(row.el)
@@ -2823,7 +2838,8 @@ async function resolveDriverTarget(target: ChatThreadTarget): Promise<ChatThread
 async function pageOpen(target: ChatThreadTarget): Promise<ChatCurrent | null> {
   const row = await resolveDriverTarget(target)
   if (!row || await confirmThreadRow(row) !== 'ok') return null
-  return documentCurrent()
+  const current = documentCurrent()
+  return current.threadId ? current : null
 }
 async function pageCards(expectedThread: string): Promise<ChatCardTarget[]> {
   if (!expectedThread || documentCurrent().threadId !== expectedThread) return []
