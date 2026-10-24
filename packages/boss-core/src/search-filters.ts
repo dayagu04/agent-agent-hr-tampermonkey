@@ -168,68 +168,145 @@ function groupPanel(label: HTMLElement): HTMLElement | null {
   return panels.length === 1 ? panels[0] as HTMLElement : null
 }
 
-/** 隐藏下拉也可能有非零 rect；点击前必须同时核对自身及祖先的 CSS。 */
-function actionable(el: HTMLElement): boolean {
-  if (!visible(el)) return false
-  for (let current: HTMLElement | null = el; current; current = current.parentElement) {
-    const style = getComputedStyle(current)
-    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false
-  }
-  return getComputedStyle(el).pointerEvents !== 'none'
+type FilterRejectStage = 'group_missing' | 'group_hidden' | 'group_shape' | 'panel_count' |
+  'option_count' | 'stale' | 'disabled' | 'panel_shape' | 'expand_timeout' | 'selection_not_confirmed'
+
+interface FilterNodeDiagnostic {
+  role: 'label' | 'target' | 'ul' | 'panel' | 'group' | 'ancestor'
+  display: string
+  visibility: string
+  opacity: string
+  pointerEvents: string
+  width: number
+  height: number
 }
 
-function disabled(el: HTMLElement): boolean {
+interface FilterApplyDiagnostic {
+  stage: FilterRejectStage
+  connected: { group: boolean; panel: boolean; option: boolean }
+  shape: { groupFound: boolean; panelCount: number; optionCount: number; panelOwned: boolean; directUlLi: boolean }
+  blocker?: FilterNodeDiagnostic
+  panelBefore?: FilterNodeDiagnostic
+  panelAfter?: FilterNodeDiagnostic
+  waitCount?: number
+}
+
+/** 隐藏下拉也可能有非零 rect；点击前必须同时核对自身及祖先的 CSS。 */
+function actionBlocker(el: HTMLElement): HTMLElement | null {
+  if (!visible(el)) return el
+  for (let current: HTMLElement | null = el; current; current = current.parentElement) {
+    const style = getComputedStyle(current)
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return current
+  }
+  return getComputedStyle(el).pointerEvents === 'none' ? el : null
+}
+
+function actionable(el: HTMLElement): boolean {
+  return actionBlocker(el) === null
+}
+
+function disabledBlocker(el: HTMLElement): HTMLElement | null {
   for (let current: HTMLElement | null = el; current; current = current.parentElement) {
     if (current.hasAttribute('disabled') || current.getAttribute('aria-disabled') === 'true' ||
-      /(^|[-_\s])disabled([-_\s]|$)/.test(current.className)) return true
+      /(^|[-_\s])disabled([-_\s]|$)/.test(current.className)) return current
   }
-  return false
+  return null
+}
+
+function optionMatches(panel: HTMLElement, optionText: string): HTMLElement[] {
+  const want = optionText.replace(/\s/g, '')
+  return (Array.from(panel.querySelectorAll('li')) as HTMLElement[]).filter((el) => ownText(el) === want)
+}
+
+function findOptionInPanel(panel: HTMLElement, optionText: string): HTMLElement | null {
+  const matches = optionMatches(panel, optionText)
+  return matches.length === 1 ? matches[0] : null
+}
+
+function nodeDiagnostic(el: HTMLElement, role: FilterNodeDiagnostic['role']): FilterNodeDiagnostic {
+  const style = getComputedStyle(el)
+  const rect = el.getBoundingClientRect()
+  return {
+    role, display: style.display, visibility: style.visibility, opacity: style.opacity,
+    pointerEvents: style.pointerEvents, width: Math.round(rect.width), height: Math.round(rect.height),
+  }
+}
+
+/** 只输出固定枚举、布尔、数量和样式；不返回文本、HTML、URL 或任意属性。 */
+function filterDiagnostic(
+  stage: FilterRejectStage, label: HTMLElement | null, panel: HTMLElement | null,
+  target: HTMLElement | null, option: string, blocker?: HTMLElement | null,
+): FilterApplyDiagnostic {
+  const group = label?.closest('.current-select')?.parentElement
+  const panelCount = group ? Array.from(group.children).filter((el) => el.matches('.filter-select-dropdown')).length : 0
+  const result: FilterApplyDiagnostic = {
+    stage,
+    connected: { group: !!group?.isConnected, panel: !!panel?.isConnected, option: !!target?.isConnected },
+    shape: {
+      groupFound: !!group, panelCount, optionCount: panel ? optionMatches(panel, option).length : 0,
+      panelOwned: !!label && !!panel && groupPanel(label) === panel,
+      directUlLi: !!target && target.parentElement?.tagName === 'UL' && target.parentElement.parentElement === panel,
+    },
+  }
+  if (blocker) {
+    const role = blocker === label ? 'label' : blocker === target ? 'target' :
+      blocker === panel ? 'panel' : blocker === group ? 'group' :
+      blocker === target?.parentElement && blocker.tagName === 'UL' ? 'ul' : 'ancestor'
+    result.blocker = nodeDiagnostic(blocker, role)
+  }
+  return result
 }
 
 /** 仅放行实测 hover 下拉：恢复 CSS 继承后重查目标，独立隐藏/禁用选项仍拒绝。 */
-async function clickOptionInPanel(label: HTMLElement, panel: HTMLElement, target: HTMLElement): Promise<boolean> {
-  if (!label.isConnected || !panel.isConnected || !target.isConnected || groupPanel(label) !== panel) return false
-  if (!actionable(label) || !panel.parentElement || !actionable(panel.parentElement)) return false
-  if (disabled(target)) return false
+async function clickOptionInPanel(
+  label: HTMLElement, panel: HTMLElement, target: HTMLElement, option: string,
+): Promise<FilterApplyDiagnostic | null> {
+  const reject = (stage: FilterRejectStage, blocker?: HTMLElement | null) => filterDiagnostic(stage, label, panel, target, option, blocker)
+  if (!label.isConnected || !panel.isConnected || !target.isConnected || groupPanel(label) !== panel) return reject('stale')
+  const groupBlocker = actionBlocker(label) || (panel.parentElement ? actionBlocker(panel.parentElement) : panel)
+  if (groupBlocker) return reject('group_hidden', groupBlocker)
+  const disabled = disabledBlocker(target)
+  if (disabled) return reject('disabled', disabled)
   if (actionable(target)) {
     realClick(target)
-    return true
+    return null
   }
   // command 53: dropdown=block/hidden/0/auto，直属 ul/li 继承 hidden，但自身 opacity=1。
   // 合成鼠标事件不建立 CSS :hover；只临时展开这个已绑定面板，不修改其他隐藏结构。
   const style = getComputedStyle(panel)
   if (!visible(panel) || style.display !== 'block' || style.visibility !== 'hidden' ||
     style.opacity !== '0' || style.pointerEvents !== 'auto' ||
-    target.parentElement?.tagName !== 'UL' || target.parentElement.parentElement !== panel) return false
+    target.parentElement?.tagName !== 'UL' || target.parentElement.parentElement !== panel) {
+    return { ...reject('panel_shape', actionBlocker(target)), panelBefore: nodeDiagnostic(panel, 'panel') }
+  }
+  const panelBefore = nodeDiagnostic(panel, 'panel')
   const previous = ['visibility', 'opacity'].map((name) => ({
     name, value: panel.style.getPropertyValue(name), priority: panel.style.getPropertyPriority(name),
   }))
+  const expandedRejection = (stage: FilterRejectStage, waitCount: number, blocker?: HTMLElement | null): FilterApplyDiagnostic => ({
+    ...reject(stage, blocker), panelBefore, panelAfter: nodeDiagnostic(panel, 'panel'), waitCount,
+  })
   try {
     panel.style.setProperty('visibility', 'visible', 'important')
     panel.style.setProperty('opacity', '1', 'important')
     // 计算样式可能仍在 opacity transition 的起点；只等待状态，不重新触发点击。
     for (let i = 0; i <= 12; i++) {
-      if (!target.isConnected || groupPanel(label) !== panel || disabled(target)) return false
+      if (!target.isConnected || groupPanel(label) !== panel) return expandedRejection('stale', i)
+      const disabled = disabledBlocker(target)
+      if (disabled) return expandedRejection('disabled', i, disabled)
       if (actionable(target)) {
         realClick(target)
-        return true
+        return null
       }
       if (i < 12) await sleep(200)
     }
-    return false
+    return expandedRejection('expand_timeout', 12, actionBlocker(target))
   } finally {
     for (const { name, value, priority } of previous) {
       if (value) panel.style.setProperty(name, value, priority)
       else panel.style.removeProperty(name)
     }
   }
-}
-
-function findOptionInPanel(panel: HTMLElement, optionText: string): HTMLElement | null {
-  const want = optionText.replace(/\s/g, '')
-  const matches = (Array.from(panel.querySelectorAll('li')) as HTMLElement[])
-    .filter((el) => ownText(el) === want)
-  return matches.length === 1 ? matches[0] : null
 }
 
 /** 清空筛选时不限自身可能没有 active；本组已选项、计数和 is-select 必须同时清空。 */
@@ -249,6 +326,7 @@ export interface FilterApplyResult {
   option: string
   status: 'ok' | 'no_trigger' | 'no_panel' | 'no_option' | 'selection_not_confirmed'
   urlChanged: boolean
+  diagnostic?: FilterApplyDiagnostic
 }
 
 /** 只点请求分组里的唯一匹配项，重复请求已选项不再切换；未知结果不报成功。 */
@@ -260,11 +338,13 @@ export async function selectSearchFilter(
   const trigger = findGroupLabel(group)
   if (!trigger || !actionable(trigger)) {
     diag('FILTER', `filter_apply group=${group} status=no_trigger`)
-    return { group, option, status: 'no_trigger', urlChanged: false }
+    return { group, option, status: 'no_trigger', urlChanged: false,
+      diagnostic: filterDiagnostic(trigger ? 'group_hidden' : 'group_missing', trigger, null, null, option, trigger ? actionBlocker(trigger) : null) }
   }
   if (!trigger.closest('.current-select')) {
     diag('FILTER', `filter_apply group=${group} status=no_panel`)
-    return { group, option, status: 'no_panel', urlChanged: false }
+    return { group, option, status: 'no_panel', urlChanged: false,
+      diagnostic: filterDiagnostic('group_shape', trigger, null, null, option) }
   }
   let panel = groupPanel(trigger)
   if (panel && selectionConfirmed(trigger, panel, option)) {
@@ -275,22 +355,26 @@ export async function selectSearchFilter(
   diag('FILTER', `filter_apply group=${group} step=click_trigger hit=${hit}`)
 
   let target: HTMLElement | null = null
+  let diagnostic: FilterApplyDiagnostic | undefined
   for (let i = 0; i < 12 && !target; i++) {
     await sleep(200)
     const label = findGroupLabel(group)
     panel = label ? groupPanel(label) : null
     const candidate = panel ? findOptionInPanel(panel, option) : null
     if (label && panel && candidate) {
-      if (await clickOptionInPanel(label, panel, candidate)) target = candidate
+      const rejection = await clickOptionInPanel(label, panel, candidate, option)
+      if (rejection) diagnostic = rejection
+      else { target = candidate; diagnostic = undefined }
       break
     }
+    diagnostic = filterDiagnostic(!label ? 'group_missing' : !panel ? 'panel_count' : 'option_count', label, panel, candidate, option)
   }
   if (!target || !panel) {
     const panelOpen = panel && actionable(panel)
     const status = panelOpen ? 'no_option' : 'no_panel'
     diag('FILTER', `filter_apply group=${group} option=${option} status=${status} ` +
       `panels=${panelOpen ? 1 : 0} chain=${panel ? describeChain(panel) : '-'}`)
-    return { group, option, status, urlChanged: location.search !== urlBefore }
+    return { group, option, status, urlChanged: location.search !== urlBefore, diagnostic }
   }
 
   await sleep(350)
@@ -314,7 +398,14 @@ export async function selectSearchFilter(
   const status = confirmed ? 'ok' : 'selection_not_confirmed'
   diag('FILTER', `filter_apply group=${group} option=${option} status=${status} ` +
     `urlChanged=${urlChanged} params=${filterKeys.join(',') || '-'}`)
-  return { group, option, status, urlChanged }
+  if (!confirmed) {
+    const label = findGroupLabel(group)
+    const currentPanel = label ? groupPanel(label) : null
+    const candidate = currentPanel ? findOptionInPanel(currentPanel, option) : null
+    diagnostic = filterDiagnostic('selection_not_confirmed', label, currentPanel, candidate, option,
+      candidate ? actionBlocker(candidate) : null)
+  }
+  return { group, option, status, urlChanged, ...(diagnostic ? { diagnostic } : {}) }
 }
 
 /** 标签链（tag.class，不含文案），用于面板没认出来时取证 */
