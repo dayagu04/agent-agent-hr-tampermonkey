@@ -15,6 +15,7 @@ function visibleAll(): void {
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
   document.body.innerHTML = ''
   diag.mockClear()
 })
@@ -119,6 +120,22 @@ describe('selecting a filter (click → panel → option)', () => {
     window.history.replaceState({}, '', '/web/geek/jobs?query=test&experience=105')
     const group = document.querySelector('#experience') as HTMLElement
     const panel = group.querySelector('.filter-select-dropdown') as HTMLElement
+    // command 76: computed panel visibility/opacity stay hidden/0 after inline writes.
+    // jsdom has no transition engine, so retain that computed state until this panel's transition is disabled.
+    panel.style.setProperty('transition-duration', '4s', 'important')
+    const originalComputedStyle = window.getComputedStyle.bind(window)
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((el, pseudo) => {
+      const actual = originalComputedStyle(el, pseudo)
+      if (el !== panel || panel.style.getPropertyValue('transition') === 'none') return actual
+      return new Proxy(actual, {
+        get(style, property) {
+          if (property === 'visibility') return 'hidden'
+          if (property === 'opacity') return '0'
+          const value = Reflect.get(style, property, style)
+          return typeof value === 'function' ? value.bind(style) : value
+        },
+      })
+    })
     const salaryClick = vi.fn()
     document.querySelector('#salary li')!.addEventListener('click', salaryClick)
     const selectedOptions: string[] = []
@@ -144,6 +161,9 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(salaryClick).not.toHaveBeenCalled()
     expect(panel.style.getPropertyValue('visibility')).toBe('')
     expect(panel.style.getPropertyValue('opacity')).toBe('')
+    expect(panel.style.getPropertyValue('transition')).toBe('')
+    expect(panel.style.getPropertyValue('transition-duration')).toBe('4s')
+    expect(panel.style.getPropertyPriority('transition-duration')).toBe('important')
     expect(getComputedStyle(panel).visibility).toBe('hidden')
     expect(readSearchFilters().find((g) => g.name === '工作经验')?.options.some((o) => o.selected)).toBe(false)
 
@@ -161,7 +181,17 @@ describe('selecting a filter (click → panel → option)', () => {
     experienceOption.style.visibility = 'hidden'
     const independentlyHidden = selectSearchFilter('工作经验', '3-5年')
     await vi.runAllTimersAsync()
-    expect(await independentlyHidden).toMatchObject({ status: 'no_panel', urlChanged: false })
+    expect(await independentlyHidden).toMatchObject({
+      status: 'no_panel', urlChanged: false,
+      diagnostic: {
+        stage: 'expand_timeout',
+        panelInlineAfter: {
+          visibility: { present: true, matchesExpected: true, important: true },
+          opacity: { present: true, matchesExpected: true, important: true },
+          transition: { present: true, matchesExpected: true, important: true },
+        },
+      },
+    })
     experienceOption.style.removeProperty('visibility')
     experienceOption.setAttribute('aria-disabled', 'true')
     const disabled = selectSearchFilter('工作经验', '3-5年')
@@ -170,6 +200,9 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(selectedOptions).toEqual(['不限', '3-5年'])
     expect(panel.style.getPropertyValue('visibility')).toBe('')
     expect(panel.style.getPropertyValue('opacity')).toBe('')
+    expect(panel.style.getPropertyValue('transition')).toBe('')
+    expect(panel.style.getPropertyValue('transition-duration')).toBe('4s')
+    expect(panel.style.getPropertyPriority('transition-duration')).toBe('important')
   })
 
   it('stops and says why when the group label is missing', async () => {

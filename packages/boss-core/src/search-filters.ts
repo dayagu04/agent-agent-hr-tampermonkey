@@ -188,6 +188,7 @@ interface FilterApplyDiagnostic {
   blocker?: FilterNodeDiagnostic
   panelBefore?: FilterNodeDiagnostic
   panelAfter?: FilterNodeDiagnostic
+  panelInlineAfter?: Record<'visibility' | 'opacity' | 'transition', { present: boolean; matchesExpected: boolean; important: boolean }>
   waitCount?: number
 }
 
@@ -280,13 +281,27 @@ async function clickOptionInPanel(
     return { ...reject('panel_shape', actionBlocker(target)), panelBefore: nodeDiagnostic(panel, 'panel') }
   }
   const panelBefore = nodeDiagnostic(panel, 'panel')
-  const previous = ['visibility', 'opacity'].map((name) => ({
+  // transition 的部分长属性也可能单独内联设置；保存完整值/优先级，避免恢复 shorthand 时丢失。
+  const previous = ['visibility', 'opacity', 'transition', 'transition-property', 'transition-duration',
+    'transition-timing-function', 'transition-delay', 'transition-behavior'].map((name) => ({
     name, value: panel.style.getPropertyValue(name), priority: panel.style.getPropertyPriority(name),
   }))
+  const inlineOverride = (name: string, expected: string) => ({
+    present: panel.style.getPropertyValue(name) !== '',
+    matchesExpected: panel.style.getPropertyValue(name) === expected,
+    important: panel.style.getPropertyPriority(name) === 'important',
+  })
   const expandedRejection = (stage: FilterRejectStage, waitCount: number, blocker?: HTMLElement | null): FilterApplyDiagnostic => ({
     ...reject(stage, blocker), panelBefore, panelAfter: nodeDiagnostic(panel, 'panel'), waitCount,
+    panelInlineAfter: {
+      visibility: inlineOverride('visibility', 'visible'),
+      opacity: inlineOverride('opacity', '1'),
+      transition: inlineOverride('transition', 'none'),
+    },
   })
   try {
+    // command 76: 同组面板展开后的计算值仍 hidden/0；过渡可覆盖内联 important，先停本面板过渡。
+    panel.style.setProperty('transition', 'none', 'important')
     panel.style.setProperty('visibility', 'visible', 'important')
     panel.style.setProperty('opacity', '1', 'important')
     // 计算样式可能仍在 opacity transition 的起点；只等待状态，不重新触发点击。
