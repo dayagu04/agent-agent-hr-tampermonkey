@@ -136,6 +136,14 @@ describe('deleteViaRowVue', () => {
       expect(await wrongHeader).toBe('failed')
       expect(remove).toHaveBeenCalledTimes(1)
       document.querySelector('#header .position-name')!.textContent = '客服'
+      select.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .position-name')!.textContent = '其他岗位'
+      }, 100) })
+      const staleMatchingHeader = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await staleMatchingHeader).toBe('failed')
+      expect(remove).toHaveBeenCalledTimes(1)
+      document.querySelector('#header .position-name')!.textContent = '客服'
       const confirmation = document.createElement('section')
       confirmation.innerHTML = '确认删除吗？<button>确定</button>'
       const finalConfirm = vi.fn()
@@ -157,7 +165,13 @@ describe('deleteViaRowVue', () => {
       confirmation.remove()
       document.querySelector('#header .position-name')!.textContent = '客服'
       Object.assign(rows[0], { __vue__: { boss: targetBoss, handleClick: select, deleteBoss: remove, $parent: listVm } })
+      const selectionsBeforeDelete = select.mock.calls.length
       const identified = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(select).toHaveBeenCalledTimes(selectionsBeforeDelete + 1)
+      expect(remove).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(199)
+      expect(remove).toHaveBeenCalledTimes(1)
       await vi.runAllTimersAsync()
       expect(await identified).toBe('ok')
       expect(remove).toHaveBeenCalledTimes(2)

@@ -427,7 +427,7 @@ async function deleteThreadImpl(
   if (!sameRow()) return 'failed'
   let confirmedHeader: ReturnType<typeof currentThreadInfo> | undefined
   if (explicitJobId || (!info.title && !hit.jobTitle)) {
-    if ((!jobTitle && !info.title && !hit.jobTitle) || await confirmThreadRow(hit, company, jobTitle, sameRow) !== 'ok') return 'failed'
+    if ((!jobTitle && !info.title && !hit.jobTitle) || await confirmThreadRow(hit, company, jobTitle, sameRow, !!explicitJobId) !== 'ok') return 'failed'
     confirmedHeader = currentThreadInfo()
     headerRequired = !!explicitJobId
   }
@@ -888,7 +888,7 @@ export async function openThreadConfirmed(company: string, jobTitle = '', jobId 
     const candidate = await findThreadForDelete(company, jobTitle, { encryptJobId: jobId.trim() })
     if (candidate === 'ambiguous') return candidate
     if (!candidate) return 'not-found'
-    return confirmThreadRow(candidate.row, company, jobTitle, () => explicitThreadIdentityValid(candidate, company))
+    return confirmThreadRow(candidate.row, company, jobTitle, () => explicitThreadIdentityValid(candidate, company), true)
   }
   // Resolve uniqueness even when a matching header is already open: company alone cannot identify an HR.
   let target: ReturnType<typeof findUnknownJobThread> = findThreadToOpen(company, jobTitle)
@@ -947,19 +947,23 @@ function threadHeaderMatches(expected: ReturnType<typeof threadHeaderIdentity>):
     confirmationCompany(header.company) === expected.company && identityText(header.hrName) === expected.hrName && identityText(header.jobTitle) === expected.jobTitle
 }
 
-async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle, verifyIdentity: () => boolean = () => true): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
+async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle, verifyIdentity: () => boolean = () => true, activateBeforeConfirm = false): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
   const expected = threadHeaderIdentity(target, company, jobTitle)
   // Missing identity is not evidence that the current conversation is the requested one.
   if (!expected.company || !expected.hrName || !expected.jobTitle || !verifyIdentity()) return 'thread_not_confirmed'
   const confirmed = () => threadHeaderMatches(expected)
-  if (confirmed()) return 'ok'
+  if (!activateBeforeConfirm && confirmed()) return 'ok'
   const activated = activateThread(target)
   assertChatExecutionActive()
   if (activated !== 'ok') return activated
+  // A matching old header cannot prove activation of an explicit stable ID.
+  // Observe the pinned target and requested header across a polling interval.
+  let confirmations = 0
   for (let attempt = 0; attempt <= 15; attempt++) {
     assertChatExecutionActive()
     if (!verifyIdentity()) return 'thread_not_confirmed'
-    if (confirmed()) return 'ok'
+    confirmations = confirmed() ? confirmations + 1 : 0
+    if (confirmations >= (activateBeforeConfirm ? 2 : 1)) return 'ok'
     if (attempt < 15) await delay(200, 200)
   }
   return 'thread_not_confirmed'

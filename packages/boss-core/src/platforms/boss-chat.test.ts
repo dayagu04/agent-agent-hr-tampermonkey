@@ -929,9 +929,23 @@ describe('thread matching', () => {
       await vi.advanceTimersByTimeAsync(200)
       expect(stableFinished).toBe(false)
       await vi.advanceTimersByTimeAsync(200)
+      expect(stableFinished).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
       expect(await stable).toBe('ok')
-      expect(await openThreadConfirmed('新会话公司', '客服', 'stable-job')).toBe('ok')
-      expect(freshSelect).toHaveBeenCalledTimes(beforeStable + 1)
+      let reopenedFinished = false
+      const reopened = openThreadConfirmed('新会话公司', '客服', 'stable-job').then(value => { reopenedFinished = true; return value })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(freshSelect).toHaveBeenCalledTimes(beforeStable + 2)
+      expect(reopenedFinished).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(await reopened).toBe('ok')
+      // A matching old header must not authorize a target whose activated header differs.
+      freshSelect.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .position-name')!.textContent = '其他岗位'
+      }, 100) })
+      const staleMatchingHeader = openThreadConfirmed('新会话公司', '客服', 'stable-job')
+      await vi.runAllTimersAsync()
+      expect(await staleMatchingHeader).toBe('thread_not_confirmed')
       // Identical header text for another ID is not evidence that this ID is active.
       allSources.push({ ...freshBoss, securityId: 'unrendered', encryptJobId: 'different-job', positionName: '客服' })
       expect(await openThreadConfirmed('新会话公司', '客服', 'stable-job')).toBe('thread_not_confirmed')
