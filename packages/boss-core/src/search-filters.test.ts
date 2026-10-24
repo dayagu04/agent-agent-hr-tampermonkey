@@ -120,17 +120,18 @@ describe('selecting a filter (click → panel → option)', () => {
     window.history.replaceState({}, '', '/web/geek/jobs?query=test&experience=105')
     const group = document.querySelector('#experience') as HTMLElement
     const panel = group.querySelector('.filter-select-dropdown') as HTMLElement
-    // command 76: computed panel visibility/opacity stay hidden/0 after inline writes.
-    // jsdom has no transition engine, so retain that computed state until this panel's transition is disabled.
-    panel.style.setProperty('transition-duration', '4s', 'important')
+    // commands 76/81: panel opacity and inherited UL/LI visibility can remain at their old computed values.
+    // jsdom has no transition engine; retain each node's old visibility until its own transition is disabled.
+    const transitionNodes = [panel, ...Array.from(panel.querySelectorAll('ul, li'))] as HTMLElement[]
+    for (const element of transitionNodes) element.style.setProperty('transition-duration', '4s', 'important')
     const originalComputedStyle = window.getComputedStyle.bind(window)
     vi.spyOn(window, 'getComputedStyle').mockImplementation((el, pseudo) => {
       const actual = originalComputedStyle(el, pseudo)
-      if (el !== panel || panel.style.getPropertyValue('transition') === 'none') return actual
+      if (!transitionNodes.includes(el as HTMLElement) || (el as HTMLElement).style.getPropertyValue('transition') === 'none') return actual
       return new Proxy(actual, {
         get(style, property) {
           if (property === 'visibility') return 'hidden'
-          if (property === 'opacity') return '0'
+          if (property === 'opacity' && el === panel) return '0'
           const value = Reflect.get(style, property, style)
           return typeof value === 'function' ? value.bind(style) : value
         },
@@ -161,9 +162,12 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(salaryClick).not.toHaveBeenCalled()
     expect(panel.style.getPropertyValue('visibility')).toBe('')
     expect(panel.style.getPropertyValue('opacity')).toBe('')
-    expect(panel.style.getPropertyValue('transition')).toBe('')
-    expect(panel.style.getPropertyValue('transition-duration')).toBe('4s')
-    expect(panel.style.getPropertyPriority('transition-duration')).toBe('important')
+    for (const element of transitionNodes) {
+      expect(element.style.getPropertyValue('transition')).toBe('')
+      expect(element.style.getPropertyValue('transition-duration')).toBe('4s')
+      expect(element.style.getPropertyPriority('transition-duration')).toBe('important')
+      expect(element.style.getPropertyValue('visibility')).toBe('')
+    }
     expect(getComputedStyle(panel).visibility).toBe('hidden')
     expect(readSearchFilters().find((g) => g.name === '工作经验')?.options.some((o) => o.selected)).toBe(false)
 
@@ -200,9 +204,12 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(selectedOptions).toEqual(['不限', '3-5年'])
     expect(panel.style.getPropertyValue('visibility')).toBe('')
     expect(panel.style.getPropertyValue('opacity')).toBe('')
-    expect(panel.style.getPropertyValue('transition')).toBe('')
-    expect(panel.style.getPropertyValue('transition-duration')).toBe('4s')
-    expect(panel.style.getPropertyPriority('transition-duration')).toBe('important')
+    for (const element of transitionNodes) {
+      expect(element.style.getPropertyValue('transition')).toBe('')
+      expect(element.style.getPropertyValue('transition-duration')).toBe('4s')
+      expect(element.style.getPropertyPriority('transition-duration')).toBe('important')
+      expect(element.style.getPropertyValue('visibility')).toBe('')
+    }
   })
 
   it('stops and says why when the group label is missing', async () => {

@@ -282,10 +282,14 @@ async function clickOptionInPanel(
   }
   const panelBefore = nodeDiagnostic(panel, 'panel')
   // transition 的部分长属性也可能单独内联设置；保存完整值/优先级，避免恢复 shorthand 时丢失。
-  const previous = ['visibility', 'opacity', 'transition', 'transition-property', 'transition-duration',
-    'transition-timing-function', 'transition-delay', 'transition-behavior'].map((name) => ({
-    name, value: panel.style.getPropertyValue(name), priority: panel.style.getPropertyPriority(name),
-  }))
+  const transitionProperties = ['transition', 'transition-property', 'transition-duration',
+    'transition-timing-function', 'transition-delay', 'transition-behavior']
+  const transitionChain = [panel, target.parentElement, target]
+  const previous = transitionChain.flatMap((element) =>
+    (element === panel ? ['visibility', 'opacity', ...transitionProperties] : transitionProperties).map((name) => ({
+      element, name, value: element.style.getPropertyValue(name), priority: element.style.getPropertyPriority(name),
+    })),
+  )
   const inlineOverride = (name: string, expected: string) => ({
     present: panel.style.getPropertyValue(name) !== '',
     matchesExpected: panel.style.getPropertyValue(name) === expected,
@@ -300,8 +304,8 @@ async function clickOptionInPanel(
     },
   })
   try {
-    // command 76: 同组面板展开后的计算值仍 hidden/0；过渡可覆盖内联 important，先停本面板过渡。
-    panel.style.setProperty('transition', 'none', 'important')
+    // commands 76/81: 面板及继承可见性的直属 UL/目标 LI 过渡可能滞留；仅暂停这条已验证链。
+    for (const element of transitionChain) element.style.setProperty('transition', 'none', 'important')
     panel.style.setProperty('visibility', 'visible', 'important')
     panel.style.setProperty('opacity', '1', 'important')
     // 计算样式可能仍在 opacity transition 的起点；只等待状态，不重新触发点击。
@@ -317,9 +321,9 @@ async function clickOptionInPanel(
     }
     return expandedRejection('expand_timeout', 12, actionBlocker(target))
   } finally {
-    for (const { name, value, priority } of previous) {
-      if (value) panel.style.setProperty(name, value, priority)
-      else panel.style.removeProperty(name)
+    for (const { element, name, value, priority } of previous) {
+      if (value) element.style.setProperty(name, value, priority)
+      else element.style.removeProperty(name)
     }
   }
 }
