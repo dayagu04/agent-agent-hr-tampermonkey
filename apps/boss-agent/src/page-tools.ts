@@ -4,6 +4,8 @@ import { createToolDefinitions, findJobCard, toolString } from '../../../package
 import { assertToolExecutionActive, installToolExecutionGuard } from '../../../packages/boss-core/src/tool-execution-guard'
 import { setPageResumeName } from './page/config'
 import { toolCatalog, validateToolArgs } from './tools-contract'
+import { dispatchCoreOperation } from './core-page'
+import { validateCoreOperation } from './core-operation-contract'
 import type { BossPageTools, PageEffect, PageExecution, PageInvocation, ToolResult } from './contracts'
 
 const detectPlatform = () => location.hostname === 'www.zhipin.com' ? new BossPlatform() : null
@@ -79,7 +81,9 @@ export function createPageTools(): BossPageTools & { cancel(commandKey?: string)
     async prepare(invocation) {
       if (!supportedPage()) return { ok: false, error: 'platform_not_supported' }
       if (!validInvocation(invocation)) return { ok: false, error: 'invalid_invocation' }
-      const validation = validateToolArgs(invocation.name, invocation.args)
+      const validation = invocation.name.startsWith('core:')
+        ? validateCoreOperation(invocation.name, invocation.args)
+        : validateToolArgs(invocation.name, invocation.args)
       if (!validation.ok) return validation
       if (invocation.name !== 'apply_job') return { ok: true }
       if (active) return { ok: false, error: 'page_busy' }
@@ -102,7 +106,9 @@ export function createPageTools(): BossPageTools & { cancel(commandKey?: string)
     async run(input) {
       if (!supportedPage()) return failure('platform_not_supported')
       if (!validInvocation(input)) return failure('invalid_invocation')
-      const validation = validateToolArgs(input.name, input.args)
+      const validation = input.name.startsWith('core:')
+        ? validateCoreOperation(input.name, input.args)
+        : validateToolArgs(input.name, input.args)
       if (!validation.ok) return { result: validation }
       // Copy before awaiting: a page caller cannot mutate arguments under an active command.
       const invocation = structuredClone(input)
@@ -121,8 +127,12 @@ export function createPageTools(): BossPageTools & { cancel(commandKey?: string)
       setPageResumeName(invocation.context?.defaultResumeName)
       let result: ToolResult
       try {
-        const tool = definitions(effects, invocation.context).find((entry) => entry.name === invocation.name)!
-        result = await tool.run(invocation.args)
+        if (invocation.name.startsWith('core:')) {
+          result = { ok: true, data: await dispatchCoreOperation(invocation.name, invocation.args) }
+        } else {
+          const tool = definitions(effects, invocation.context).find((entry) => entry.name === invocation.name)!
+          result = await tool.run(invocation.args)
+        }
         // A cancelled click may already have reached BOSS. Never turn that uncertainty into a retryable failure.
         if (lease.cancelled) result = { ok: false, error: 'reconciliation_required' }
       } catch {
