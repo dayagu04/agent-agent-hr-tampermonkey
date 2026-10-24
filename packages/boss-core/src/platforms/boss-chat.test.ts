@@ -856,6 +856,8 @@ describe('card handling confirmation', () => {
     const contact = '<div id="contact" class="item-friend"><div class="card"><p>想和您交换微信，您是否同意</p><button>拒绝</button><button>同意</button></div></div>'
     const location = (id: string, city: string) => `<div id="${id}" class="item-friend"><div class="card"><p>您是否接受此工作地点：${city}</p><button>暂不考虑</button><button>可以接受</button></div></div>`
     try {
+      document.body.innerHTML = ''
+      await expect(listPendingCardsStable()).rejects.toThrow('no_open_thread')
       mount(resume)
       const clicks = vi.fn()
       document.querySelector('#resume button:last-child')!.addEventListener('click', clicks)

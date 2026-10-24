@@ -1521,6 +1521,7 @@ async function revealLatestMessages(): Promise<void> {
 /** 待处理卡片（会先滚动到消息底部；key 绑定当前会话及卡片问题）。 */
 export async function listPendingCardsStable(): Promise<Array<{ kind: ChatCardKind; questionLength: number; question: string; cardKey: string; canAccept: boolean; canReject: boolean }>> {
   const expected = documentCurrent().threadId
+  if (!expected) throw new Error('no_open_thread')
   return withinThread(expected, async () => {
     await revealLatestMessages()
     const cards = await Promise.all(findPendingCards().map(async (card) => ({
