@@ -5,7 +5,8 @@ import { detectNavUnread } from '../../../packages/boss-core/src/nav-unread'
 import { probeSearchFiltersOnce } from '../../../packages/boss-core/src/search-filters'
 import { assertToolExecutionActive } from '../../../packages/boss-core/src/tool-execution-guard'
 import type { JobCard } from '../../../packages/boss-core/src/types'
-import { validateCoreOperation } from './core-operation-contract'
+import type { DeletedThreadTarget } from '../../../packages/boss-core/src/platforms/boss-chat'
+import { readUIDeleteResult, validateCoreOperation } from './core-operation-contract'
 
 const MAX_ROWS = 300
 const MAX_RESULT_CHARS = 2_000_000
@@ -70,10 +71,13 @@ const operations: Record<string, (args: Record<string, unknown>) => unknown | Pr
   },
   'ui.current_thread_info': () => { requireChat(); return currentThreadInfo() },
   'ui.open_thread': args => { requireChat(); return openThreadConfirmed(String(args.company), string(args.jobTitle)) },
-  'ui.delete_thread': args => {
+  'ui.delete_thread': async args => {
     requireChat()
     // Backend ledger and local mirror updates belong to the trusted panel, never MAIN.
-    return deleteThread(String(args.company), string(args.jobTitle), args.identity as { bossId?: string; encryptJobId?: string } | undefined, async () => {})
+    let target: DeletedThreadTarget | undefined
+    const status = await deleteThread(String(args.company), string(args.jobTitle), args.identity as { bossId?: string; encryptJobId?: string } | undefined,
+      async actual => { target = { ...actual } })
+    return readUIDeleteResult({ status, target })
   },
   'ui.probe_search_filters': args => { probeSearchFiltersOnce(string(args.reason, 128) || 'panel'); return null },
   ...chatPageOperations,

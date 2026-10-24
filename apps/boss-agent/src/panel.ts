@@ -1,5 +1,6 @@
 import './panel.css'
 import { initializeNativeHost, nativePageCall, nativePageContext, nativePageNavigate, nativeSend } from './host-bridge'
+import { readUIDeleteResult } from './core-operation-contract'
 import type { PanelLayout, UIHost, UIThread, UIThreadInfo, UIThreadRow } from '../../../packages/boss-core/src/ui-host'
 import type { ToolResult } from '../../../packages/boss-core/src/tool-definitions'
 
@@ -53,9 +54,9 @@ async function bootstrap(): Promise<void> {
   ])
   installNativeExecutionHost()
   installNativeChatDriver()
-  const [{ installUIHost }, ledger, { loadConfig }] = await Promise.all([
+  const [{ installUIHost }, { recordConversationDeleted }, { loadConfig }] = await Promise.all([
     import('../../../packages/boss-core/src/ui-host'),
-    import('../../../packages/boss-core/src/ledger'),
+    import('../../../packages/boss-core/src/platforms/chat-runner'),
     import('../../../packages/boss-core/src/config'),
   ])
   const host: UIHost = {
@@ -69,14 +70,13 @@ async function bootstrap(): Promise<void> {
     currentThreadInfo: () => nativePageCall<UIThreadInfo>('ui.current_thread_info'),
     openThread: (company, jobTitle) => nativePageCall('ui.open_thread', { company, jobTitle }),
     async deleteThread(company, jobTitle, identity) {
-      const result = await nativePageCall<'ok' | 'not-found' | 'failed'>('ui.delete_thread', { company, jobTitle, identity }, `panel-delete:${crypto.randomUUID()}`)
-      if (result === 'ok') {
+      const result = readUIDeleteResult(await nativePageCall('ui.delete_thread', { company, jobTitle, identity }, `panel-delete:${crypto.randomUUID()}`))
+      if (result.status === 'ok') {
         // MAIN reports only the observed deletion; the trusted host owns the durable backend mark.
-        await ledger.queueConversationDeletedMark({ company, job_title: jobTitle, encrypt_job_id: identity.encryptJobId, reason: 'manual' })
-        await ledger.removeMirrorByKey(company, jobTitle, identity)
-        await ledger.flushConversationDeletedMarks(loadConfig())
+        const target = result.target
+        await recordConversationDeleted(loadConfig(), target.company, target.jobTitle, 'manual', target)
       }
-      return result
+      return result.status
     },
     navigate: nativePageNavigate,
     async probeSearchFilters(reason) { await nativePageCall('ui.probe_search_filters', { reason }) },

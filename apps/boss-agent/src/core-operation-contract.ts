@@ -1,5 +1,7 @@
 // Pure contract shared by the trusted background and the MAIN dispatcher.
 // No page imports, credentials, backend requests, or caller-provided executable code.
+import type { DeletedThreadTarget } from '../../../packages/boss-core/src/platforms/boss-chat'
+
 type Rule = (value: unknown) => boolean
 const text = (max = 512, required = false): Rule => value => typeof value === 'string' && value.length <= max && (!required || !!value.trim())
 const flag: Rule = value => typeof value === 'boolean'
@@ -17,6 +19,18 @@ function fields(properties: Record<string, Rule> = {}, required: string[] = []):
   }
 }
 const thread = { company: text(512, true), jobTitle: text() }
+const deletedTarget = fields({ ...thread, bossId: text(), encryptJobId: text() }, ['company', 'jobTitle'])
+export type UIDeleteResult = { status: 'ok'; target: DeletedThreadTarget } | { status: 'not-found' | 'failed' }
+
+/** A successful page deletion must carry its observed identity, never the request's cached identity. */
+export function readUIDeleteResult(value: unknown): UIDeleteResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('deleted_target_unconfirmed')
+  const result = value as Record<string, unknown>
+  if (result.status === 'not-found' || result.status === 'failed') return { status: result.status }
+  if (result.status !== 'ok' || !deletedTarget(result.target)) throw new Error('deleted_target_unconfirmed')
+  return { status: 'ok', target: { ...result.target as DeletedThreadTarget } }
+}
+
 const target = fields({
   key: text(512, true), name: text(), company: text(), jobTitle: text(), unread: flag,
   bossId: text(), jobId: text(), lastTS: nullable(timestamp), sourceId: text(),

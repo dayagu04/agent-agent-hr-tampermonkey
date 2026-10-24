@@ -40,6 +40,7 @@ import { clickDirect } from './dom-events'
 import { installToolExecutionGuard } from './tool-execution-guard'
 import { PAGE_RUNTIME_KEY } from '../../../apps/boss-agent/src/contracts'
 import type { InstalledPageTools } from '../../../apps/boss-agent/src/page'
+import { readUIDeleteResult } from '../../../apps/boss-agent/src/core-operation-contract'
 
 describe('agent tools', () => {
   it('publishes a catalog that marks irreversible actions', () => {
@@ -394,6 +395,28 @@ describe('MV3 page boundary', () => {
         effects: [{ kind: 'conversation_deleted', payload: { company: 'A', job_title: '开发', encrypt_job_id: 'actual-job-id' } }],
       })
       expect(deleteThread).toHaveBeenLastCalledWith('A', '', { encryptJobId: 'actual-job-id' }, expect.any(Function))
+      // The full panel must account for the page-confirmed identity even when its mirror has only a row ID.
+      const actualTarget = { company: 'A', jobTitle: '开发', encryptJobId: 'actual-job-id', bossId: 'actual-boss-id' }
+      vi.mocked(deleteThread).mockImplementationOnce(async (_company, _jobTitle, _identity, afterDeleted) => {
+        await afterDeleted?.(actualTarget)
+        return 'ok'
+      })
+      const panelDelete = { commandKey: 'panel-delete', name: 'core:ui.delete_thread', args: { company: 'A人事经理', jobTitle: '', identity: { bossId: 'actual-boss-id' } } }
+      const panelResult = await page.run(panelDelete)
+      expect(panelResult).toEqual({ result: { ok: true, data: { status: 'ok', target: actualTarget } } })
+      expect(readUIDeleteResult(panelResult.result.data)).toEqual({ status: 'ok', target: actualTarget })
+      const deletionCalls = vi.mocked(deleteThread).mock.calls.length
+      expect(await page.run(panelDelete)).toEqual(panelResult)
+      expect(deleteThread).toHaveBeenCalledTimes(deletionCalls)
+      // Old/incomplete receipts cannot invent an identity, and failed actions never carry a deletion target.
+      expect(() => readUIDeleteResult('ok')).toThrow('deleted_target_unconfirmed')
+      expect(() => readUIDeleteResult({ status: 'ok' })).toThrow('deleted_target_unconfirmed')
+      expect(await page.run({ ...panelDelete, commandKey: 'panel-missing-target' })).toMatchObject({ result: { ok: false } })
+      vi.mocked(deleteThread).mockImplementationOnce(async (_company, _jobTitle, _identity, afterDeleted) => {
+        await afterDeleted?.(actualTarget)
+        return 'failed'
+      })
+      expect(await page.run({ ...panelDelete, commandKey: 'panel-failed' })).toEqual({ result: { ok: true, data: { status: 'failed' } } })
       const epoch = page.lifecycleEpoch()
       vi.mocked(sendMessageText).mockImplementationOnce(async () => { document.dispatchEvent(new Event('freeze')); return true })
       expect(await page.run({ commandKey: 'cancelled', name: 'send_message', args: { text: '你好' } })).toEqual({ result: { ok: false, error: 'reconciliation_required' } })
