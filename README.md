@@ -75,6 +75,8 @@ CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试�
 
 `open_thread` 指定岗位未匹配时返回 `not-found`，同公司多条匹配返回 `ambiguous`，不会退回首条；只有页面头部的公司、HR和岗位与目标一致才返回 `ok`。跨页调用首先回报 `navigating`，扩展最多尝试5次定位；完成后在同一个 command_id 上回报实际结果。CLI 的 `wait` 会等待过渡结束，`result` 对过渡状态返回 pending/退出码2。歧义立即终止。定位失败后仍可读状态/会话，发送等动作返回 `navigation_recovery_required`；用明确目标再次 `open_thread` 成功后恢复。旧油猴没有最终定位回报时，等待会超时，需通过 `read_thread_header` 另行确认。
 
+原生 `open_thread`、`read_thread_header`、`delete_thread` 可附带 `list_threads` 返回的 `jobId`。ID 未命中不会退回公司首条；即使列表岗位名称与聊天头部不同，也须固定唯一 ID、核对公司与 HR，并确认真实头部符合请求岗位。头部没有稳定 ID 时，同公司同 HR 的多候选会保守拒绝。跨页恢复保留此 ID；旧无 ID 调用保持原语义，当前保留的旧油猴入口对新 ID 明确拒绝，避免静默丢失目标。
+
 搜索/岗位工具返回岗位 ID、公司、名称、地点、薪资、JD 和来源 URL；详情和会话工具使用页面实际值。`send_message` 保留 `delivered/read/sending/failed/none` 回执；`sending` 已上屏，不能因尚无送达回执而重发。
 
 原生 `apply_job` 参数为 `{jobId, greeting?, resumeId?}`。`greeting` 缺省为空，由 Agent 决定内容；平台自动发送默认招呼时不会追加第二条，查看 `greetingSource` / `customGreetingSent` 区分事实。`resumeId` 只用于后端记账，必须属于当前账号；缺省使用面板已选简历，不会发送附件或改变默认配置。后端记账仍沿用简历关联 Agent 的现有约束。校验或页面准备阶段失败返回 `mayHaveExecuted=false`；执行开始后的不确定结果仍需核查。旧油猴缺省话术与原界面编排保持原行为。

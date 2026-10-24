@@ -123,15 +123,15 @@ tool name=delete_thread status=error ms=120 error=not-found
 | `apply_job` | `jobId`, `greeting?`, `resumeId?`（原生） | ✓ | 点击沟通并回报真实招呼来源；原生不生成话术，简历仅用于记账 |
 | `read_filters` | — | | 读筛选分组/选项/当前选中 |
 | `select_filters` | `filters: [{group, option}]` | ✓ | 点选筛选项 |
-| `list_threads` | — | | 列出会话（HR 名/公司/未读；岗位与薪资列表行没有） |
-| `read_thread_header` | `company`, `jobTitle?` | | 打开会话并读头部：HR 名/公司/岗位名/薪资/城市 |
+| `list_threads` | — | | 列出会话（HR、公司、jobId、岗位候选、未读；真实岗位以头部确认） |
+| `read_thread_header` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开会话并读头部：HR 名/公司/岗位名/薪资/城市 |
 | `read_messages` | — | | 读当前会话消息（含卡片类型） |
 | `list_pending_cards` | — | | 列出待处理卡片 |
-| `open_thread` | `company`, `jobTitle?` | | 打开指定会话 |
+| `open_thread` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开指定会话 |
 | `click_card` | `kind`, `accept`, `resumeName?`, `resumeIndex?` | ✓ | 点卡片同意/拒绝；同意索要简历时走完发送 |
 | `send_message` | `text` | ✓ | 给当前会话发文本；返回 `data.delivery` = delivered/read/sending/failed/none；未打开会话返回 `no_open_thread` |
 | `send_resume` | `resumeName?`, `resumeIndex?` | ✓ | 发附件简历；失败返回具体原因码 |
-| `delete_thread` | `company`, `jobTitle?` | ✓ | 删除会话 |
+| `delete_thread` | `company`, `jobTitle?`, `jobId?`（原生） | ✓ | 删除会话 |
 | `reload_page` | `force?` | | 刷新页面以加载最新插件构建；自动投递运行中拒绝（`orchestrator_running`），除非 `force=true` |
 | `probe_overlays` | — | | 读可见浮层结构（排障用） |
 | `probe_dom` | `selector`, `depth?` | | 读指定选择器的 DOM 结构（排障用） |
@@ -163,14 +163,14 @@ tool name=delete_thread status=error ms=120 error=not-found
 
 | 原子能力 | Chrome 原生现场证据（2026-10-25） |
 |---|---|
-| `get_page_state`、`open_search`、`scan_jobs`、`read_job_detail` | 命令读取成功；列表 15 条，offset 分批；隐藏页详情超时后，前台单条 JD 返回 710 字。切换目标的身份核对另行验证，不能只看字数 |
-| `read_filters`、`select_filters` | 读取 8 组，3–5 年选中成功；恢复不限暴露旧全页同名匹配问题，修复后需核对本组选中状态 |
-| `list_threads`、`open_thread`、`read_thread_header`、`read_messages` | 40 条会话；新测试会话头部、岗位、消息读回成功 |
+| `get_page_state`、`open_search`、`scan_jobs`、`read_job_detail` | 命令读取成功；列表 15 条、offset 分批；0.7.2 两个不同岗位 JD 为 710/26 字，指定读取与公开详情链接 ID 一致；隐藏页仍可能超时 |
+| `read_filters`、`select_filters` | 读取 8 组；修复同名误选及隐藏页过渡后，命令 83–86 选择 3–5 年、读回选中、恢复不限并读回清空，其他分组未误选 |
+| `list_threads`、`open_thread`、`read_thread_header`、`read_messages` | 40 条会话、消息读回成功；稳定 jobId 定位后，88 跨页打开、89 再读真实头部成功，兼容列表岗位别名差异 |
 | `apply_job`、`send_message` | 仅一次授权投递并记账、一次明确测试消息送达且读回恰好一次；投递为 BOSS 默认招呼，没有发送附件 |
 | `list_pending_cards`、`send_resume`、`click_card` | 当前测试会话待卡片 0，发简历按钮被 BOSS 禁用；只读结果成立，附件和卡片执行尚无成功条件 |
-| `delete_thread` | 唯一身份与缺岗位头部确认已修复；真实删除仍需明确测试目标与授权 |
+| `delete_thread` | 90 仅删除用户授权的测试会话一次；91 读回目标 ID 消失且其他原列表行保留，92 同 ID 打开返回 not-found |
 | `reload_page`、`probe_dom`、工具发现 | 刷新及诊断命令成功；`probe_dom` 只对同源岗位详情链接增加公开 `jobId`，不回传完整 href/query |
-| `probe_overlays`、`probe_row`、`list_tools` | 保留共享实现；工具发现不替代各诊断入口的本轮现场执行 |
+| `probe_overlays`、`probe_row`、`list_tools` | 保留共享实现；命令 79 的 overlays 读取成功；工具发现不替代 probe_row/list_tools 入口的本轮现场执行 |
 
 原悬浮窗收起、展开、拖动已由用户确认。Edge、批量进度、托管自动回复和冻结恢复的完整回归尚未完成；不要用旧油猴成功记录覆盖这些缺口。
 
