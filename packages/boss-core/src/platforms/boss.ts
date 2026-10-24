@@ -242,7 +242,10 @@ export class BossPlatform extends BasePlatform {
 
   /** Hidden retained panes and multiple visible panes cannot identify the current job. */
   private visibleDetailPanel(): HTMLElement | null {
-    const panels = Array.from(document.querySelectorAll<HTMLElement>('.job-detail-box, .job-detail, .job-detail-container'))
+    const candidates = Array.from(document.querySelectorAll<HTMLElement>('.job-detail-box, .job-detail, .job-detail-container'))
+    const panels = candidates
+      // A matching wrapper and its actual pane describe one detail, not two competing jobs.
+      .filter(panel => !candidates.some(other => other !== panel && panel.contains(other)))
       .filter(panel => {
         const rect = panel.getBoundingClientRect()
         if (rect.width < 1 || rect.height < 1) return false

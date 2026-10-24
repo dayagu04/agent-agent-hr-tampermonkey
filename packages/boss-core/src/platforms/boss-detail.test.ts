@@ -14,12 +14,12 @@ describe('reading a job JD from the detail pane', () => {
     const expected = '岗位职责：负责日常行政事务与文件整理。'.repeat(6)
     document.body.innerHTML = `
       <div class="job-card-wrap"><a href="/job_detail/job-b.html">行政班 早九晚六</a></div>
-      <div class="job-detail-box">
+      <div class="job-detail-container"><div class="job-detail-box">
         <div class="job-detail-info"><span class="job-name">上一岗位</span></div>
         <p class="desc">${oldJd}</p>
         <button>立即沟通</button>
         <a class="more-job-btn" href="/job_detail/job-a.html">查看详情</a>
-      </div>`
+      </div></div>`
     const visible = () => {
       for (const el of Array.from(document.querySelectorAll('*'))) vi.spyOn(el, 'getBoundingClientRect').mockReturnValue(rect(100))
     }
