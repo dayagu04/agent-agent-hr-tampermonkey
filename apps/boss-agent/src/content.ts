@@ -1,3 +1,4 @@
+import { detectNavUnread } from '../../../packages/boss-core/src/nav-unread'
 import { BossContentHeartbeat } from './runtime-content'
 
 // This isolated script owns only the frame geometry and the existing lifecycle heartbeat.
@@ -44,7 +45,7 @@ window.addEventListener('resize', () => { placePanel(); sendViewport() })
 function mountPanel(): void { if (!panel.isConnected) (document.body || document.documentElement).appendChild(panel) }
 mountPanel()
 
-const heartbeat = new BossContentHeartbeat({ runtime: chrome.runtime, visibility: () => document.visibilityState })
+const heartbeat = new BossContentHeartbeat({ runtime: chrome.runtime, visibility: () => document.visibilityState, navUnread: () => detectNavUnread().count })
 chrome.runtime.onMessage.addListener((message: unknown, sender, reply) => {
   if (!message || typeof message !== 'object' || (message as { type?: unknown }).type !== 'boss.wake') return false
   void heartbeat.wake(message, sender).then(reply, () => reply({ runnable: false }))

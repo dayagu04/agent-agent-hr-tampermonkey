@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('./logger', () => ({ diag: vi.fn() }))
 vi.mock('./platforms/boss-chat', () => ({
+  chatPageOperations: {},
   listThreads: vi.fn(() => [{ company: 'A人事经理', jobTitle: '', name: 'HR', unread: true, bossId: 'x', el: {} }]),
   readRowJobInfo: vi.fn(() => ({ title: 'B', salary: '11-18K', jobId: 'j1', brandName: 'A', hrName: '朱先生' })),
   readMessages: vi.fn(async () => [{ sender: 'hr', content: 'hi' }]),

@@ -37,7 +37,7 @@ export function checkFiles(name, files) {
   assert.equal(manifest.background?.type, 'module')
   assert.equal(manifest.action?.default_popup, 'popup.html')
   const allowedPermissions = name === 'boss-agent'
-    ? ['storage', 'alarms', 'scripting', 'activeTab']
+    ? ['storage', 'alarms', 'scripting', 'activeTab', 'webNavigation', 'notifications']
     : ['activeTab', 'scripting', 'storage']
   for (const permission of manifest.permissions || []) {
     assert.ok(allowedPermissions.includes(permission), `${name}: unexpected permission ${permission}`)

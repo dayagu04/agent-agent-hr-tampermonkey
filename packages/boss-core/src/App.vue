@@ -188,6 +188,9 @@ function gotoSettings(): void {
 
 const resumes = ref<Array<{ id: number; name: string; skills_count: number }>>([])
 const configError = ref('')
+const onNativeError = (event: Event) => { configError.value = String((event as CustomEvent).detail || '扩展连接失败') }
+onMounted(() => window.addEventListener('aah:native-error', onNativeError))
+onUnmounted(() => window.removeEventListener('aah:native-error', onNativeError))
 const loadingConfig = ref(false)
 
 // 投递用关键词：优先网页端求职偏好的 keyword，其次简历提取的 suggested_keywords。

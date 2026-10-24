@@ -13,7 +13,9 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, reply) => {
       : undefined
     await scheduler.refresh(proof)
   }, (error: unknown) => {
-    reply({ ok: false, error: error instanceof Error ? error.message : 'runtime_error' })
+    reply({ ok: false, transportError: true, error: error instanceof Error ? error.message : 'runtime_error' })
   }).catch(() => undefined)
   return true
 })
+
+chrome.runtime.onConnect.addListener(port => { void runtime.attachPanel(port) })

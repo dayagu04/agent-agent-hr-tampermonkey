@@ -50,8 +50,25 @@ type RequestOptions = Parameters<NetworkAPI['request']>[0] & { signal?: AbortSig
 const API_ROUTES = new Set([
   'POST /api/auth/login', 'GET /api/auth/token', 'GET /api/plugin/config',
   'POST /api/plugin/heartbeat', 'POST /api/plugin/greeting', 'POST /api/plugin/record',
-  'POST /api/plugin/chat/mark-deleted', 'POST /api/plugin/tools/result',
+  'POST /api/plugin/tools/call', 'POST /api/plugin/chat/mark-deleted', 'POST /api/plugin/tools/result',
+  'POST /api/plugin/match', 'POST /api/plugin/judge-jobs', 'POST /api/plugin/decision',
+  'GET /api/plugin/rules', 'POST /api/plugin/chat/sync', 'POST /api/plugin/chat/sent',
+  'POST /api/plugin/chat/outcome', 'POST /api/plugin/chat/snapshot', 'POST /api/plugin/chat/reconcile',
+  'POST /api/plugin/orchestrator/event', 'POST /api/plugin/logs',
+  'GET /api/plugin/chat/plan', 'GET /api/conversations/list',
 ])
+
+export function isAllowedApiRequest(method: string, url: URL): boolean {
+  if (method === 'GET' && /^\/api\/plugin\/tools\/result\/[1-9]\d*$/.test(url.pathname)) return !url.search
+  if (!API_ROUTES.has(`${method} ${url.pathname}`)) return false
+  const entries = [...url.searchParams.entries()]
+  if (new Set(entries.map(([key]) => key)).size !== entries.length) return false
+  if (url.pathname === '/api/plugin/chat/plan') return entries.every(([key, value]) => key === 'reply_scope' && ['this_round', 'all'].includes(value))
+  if (url.pathname === '/api/conversations/list') return entries.every(([key, value]) =>
+    key === 'limit' ? /^\d+$/.test(value) && Number(value) > 0 && Number(value) <= 1000 :
+    key === 'since' && value.length <= 64 && Number.isFinite(Number(value)) && Number(value) >= 0)
+  return entries.length === 0
+}
 
 /** Native fetch adapter; never exposed as a generic content/MAIN-world message proxy. */
 export class NativeNetwork implements NetworkAPI {
@@ -64,8 +81,8 @@ export class NativeNetwork implements NetworkAPI {
     const config = { ...this.credentials() }
     const origin = normalizeApiBase(config.apiBase)
     const url = new URL(options.url)
-    if (url.origin !== origin || url.username || url.password || url.hash || url.search ||
-        !API_ROUTES.has(`${options.method} ${url.pathname}`)) throw new Error('api_path_forbidden')
+    if (url.origin !== origin || url.username || url.password || url.hash ||
+        !isAllowedApiRequest(options.method, url)) throw new Error('api_path_forbidden')
     // Core may supply its existing authHeaders, but it cannot override the runtime's identity.
     for (const [key, value] of Object.entries(options.headers || {})) {
       const header = key.toLowerCase()

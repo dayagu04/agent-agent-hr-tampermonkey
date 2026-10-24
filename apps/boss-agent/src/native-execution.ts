@@ -3,7 +3,7 @@ import { installPageDriver, type ExecutionApplyContext, type ExecutionPlatform }
 import type { JobCard } from '../../../packages/boss-core/src/types'
 import { diag } from '../../../packages/boss-core/src/logger'
 import { storage } from '../../../packages/boss-core/src/platform-bridge'
-import { nativePageCall, nativePageContext, nativePageNavigate } from './host-bridge'
+import { nativePageCall, nativePageContext, nativePageNavigate, nativeSend } from './host-bridge'
 
 /** 面板中的平台代理。只调用页面原子动作，匹配、招呼语和记账仍由原 ApplyEngine 负责。 */
 export class NativeBossPlatform extends BasePlatform implements ExecutionPlatform {
@@ -63,6 +63,7 @@ export function installNativeExecutionHost(): void {
   installPageDriver({
     context: nativePageContext,
     navigate: nativePageNavigate,
+    cancel: () => { void nativeSend('boss.panel.cancel').catch(() => undefined) },
     detectRiskControl: () => nativePageCall<boolean>('page.detect_risk'),
     platform(url) {
       const page = new URL(url)

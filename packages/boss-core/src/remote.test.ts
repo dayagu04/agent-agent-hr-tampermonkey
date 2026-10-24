@@ -26,7 +26,7 @@ vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => ({})) }))
 
 import { network, storage } from './platform-bridge'
 import { diag, flushLogs } from './logger'
-import { reportHeartbeatAndPoll, startRemoteLoop } from './remote'
+import { executeRemoteCommand, reportHeartbeatAndPoll, startRemoteLoop } from './remote'
 import { detectPlatform } from './platforms/factory'
 import { getOrchestrator } from './orchestrator'
 
@@ -265,6 +265,17 @@ describe('远程心跳命令协议', () => {
       action: 'apply_batch', command_id: 'cmd-9',
     })
     expect(storage.set).not.toHaveBeenCalled()
+
+    // The same dispatcher must accept terminal controls while an ordinary batch is unaccepted/busy.
+    const stop = vi.fn(async () => undefined)
+    const pause = vi.fn(async () => undefined)
+    vi.mocked(getOrchestrator).mockReturnValue({ applyBackendAction, stop, pause } as never)
+    for (const action of ['stop', 'pause']) {
+      expect(await executeRemoteCommand({} as never, { id: 10, action: 'orchestrator.action', payload: { action, reason: 'control' } })).toBe(true)
+    }
+    expect(stop).toHaveBeenCalledWith('control')
+    expect(pause).toHaveBeenCalledWith('control')
+    expect(applyBackendAction).toHaveBeenCalledTimes(1)
   })
 
   it('远程命令失败时强制日志冲刷不阻塞命令终态', async () => {

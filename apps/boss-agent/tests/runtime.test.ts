@@ -10,6 +10,7 @@ const ACCOUNT = `${API}|1`
 const TOKEN = 'old-account-auth-token-long-value'
 const popup = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' } as chrome.runtime.MessageSender
 const page = { id: 'extension-id', frameId: 0, documentLifecycle: 'active', documentId: 'doc-1', url: 'https://www.zhipin.com/web/geek/chat', tab: { id: 12, url: 'https://www.zhipin.com/web/geek/chat' } } as chrome.runtime.MessageSender
+const panel = { ...page, frameId: 3, documentId: 'panel-doc-1', url: 'chrome-extension://extension-id/panel.html' } as chrome.runtime.MessageSender
 const command = (id = 8, name = 'send_message', args: Record<string, unknown> = { text: 'message' }) => ({ id, action: 'tool.call', payload: { name, args } })
 const heartbeat = (commands: unknown[]) => ({ command_epoch: 'db-outbox-v2', plugin_compatibility: { can_receive_commands: true }, commands })
 function deferred<T>() {
@@ -38,8 +39,12 @@ function harness(accounts: Record<string, unknown> = {}) {
       setAccessLevel: async (value: unknown) => { accesses.push(value) },
       get: async () => structuredClone(disk),
       set: async (value: Record<string, unknown>) => { disk = { ...disk, ...structuredClone(value) } },
+      remove: async (names: string | string[]) => { for (const name of Array.isArray(names) ? names : [names]) delete disk[name] },
     } },
     permissions: { contains: async () => permission },
+    webNavigation: { getFrame: async ({ frameId }: { frameId: number }) => frameId === 0
+      ? { documentId: page.documentId, url: page.url, parentFrameId: -1 }
+      : { documentId: panel.documentId, url: panel.url, parentFrameId: 0 } },
     tabs: { get: async (id: number) => ({ id, url: 'https://www.zhipin.com/web/geek/chat' }), update: async (...args: unknown[]) => { navigations.push(args) }, reload: async (...args: unknown[]) => { navigations.push(args) } },
     scripting: { executeScript: async (details: { files?: string[]; args?: unknown[]; func?: (...args: unknown[]) => unknown; target: { tabId: number; documentIds: string[] } }) => {
       expect(details.target).toEqual({ tabId: 12, documentIds: ['doc-1'] })
@@ -71,6 +76,15 @@ function harness(accounts: Record<string, unknown> = {}) {
     create: () => new BossRuntime({ chrome: chromeMock, fetch: fetchMock, now: () => time }),
     disk: () => disk[STORAGE_KEY] as { config: unknown; accounts: Record<string, { ack: number; receipts: Record<string, { state: string; result?: { error?: string }; uploaded: boolean }> }> },
     accesses, calls, pageCalls, navigations, cancellations,
+    port: () => {
+      const messages: Record<string, unknown>[] = []
+      let receive: (value: unknown) => void = () => {}
+      let disconnect: () => void = () => {}
+      const port = { name: 'boss.panel', sender: panel, postMessage: (value: Record<string, unknown>) => messages.push(value), disconnect: () => disconnect(),
+        onMessage: { addListener: (listener: typeof receive) => { receive = listener } },
+        onDisconnect: { addListener: (listener: typeof disconnect) => { disconnect = listener } } } as unknown as chrome.runtime.Port
+      return { port, messages, send: (value: unknown) => receive(value), disconnect: () => disconnect() }
+    },
     advance: (milliseconds = 1000) => { time += milliseconds }, denyPermission: () => { permission = false },
     changeEpoch: () => { epoch += 1 }, beforeInvocation: (handler: typeof beforeInvocation) => { beforeInvocation = handler },
     request: (handler: typeof onRequest) => { onRequest = handler }, page: (handler: typeof onPage) => { onPage = handler },
@@ -91,6 +105,21 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     await h.create().handle({ type: 'boss.tick', visibility: 'visible' }, page)
     expect(h.disk().accounts[ACCOUNT].ack).toBe(8)
     expect(h.disk().accounts[ACCOUNT].receipts['db-outbox-v2:8'].uploaded).toBe(false)
+
+    const native = harness()
+    const started = deferred<void>()
+    const pending = deferred<unknown>()
+    native.page(async () => { started.resolve(); return pending.promise })
+    const nativeRuntime = native.create()
+    await nativeRuntime.handle({ type: 'boss.panel.bootstrap' }, panel)
+    const action = nativeRuntime.handle({ type: 'boss.panel.page', account: ACCOUNT, operation: 'platform.apply_job', args: { jobId: 'job-1', greeting: 'hello' }, stableKey: 'apply-1' }, panel)
+    const rejected = expect(action).rejects.toThrow('reconciliation_required')
+    await started.promise
+    await nativeRuntime.handle({ type: 'boss.panel.config', account: ACCOUNT, config: { apiBase: API, token: '', resumeId: null } }, panel)
+    await rejected
+    expect(native.cancellations).not.toHaveLength(0)
+    await expect(nativeRuntime.handle({ type: 'boss.panel.storage', action: 'set', key: 'aah_orchestrator_state', value: {}, account: ACCOUNT }, panel)).rejects.toThrow('session_changed')
+    pending.resolve({ result: { ok: true, data: { outcome: 'applied' } } })
     h.advance()
     await h.create().handle({ type: 'boss.tick', visibility: 'visible' }, page)
     expect(h.pageCalls.filter(call => call.context?.greeting)).toHaveLength(1)
@@ -100,13 +129,59 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     expect(h.disk().accounts[ACCOUNT].receipts['db-outbox-v2:8'].uploaded).toBe(true)
     expect(h.accesses).toContainEqual({ accessLevel: 'TRUSTED_CONTEXTS' })
     expect(JSON.stringify(h.pageCalls)).not.toContain(TOKEN)
+
+    // The new full-panel page entry shares durable receipts, including across worker recovery.
+    const core = harness()
+    core.page(async () => ({ result: { ok: true, data: 'ok' } }))
+    let host = core.create()
+    await host.handle({ type: 'boss.panel.bootstrap' }, panel)
+    const deletion = { type: 'boss.panel.page', account: ACCOUNT, operation: 'ui.delete_thread', args: { company: 'company' }, stableKey: 'manual-delete-1' }
+    expect(await host.handle(deletion, panel)).toBe('ok')
+    host = core.create()
+    await host.handle({ type: 'boss.panel.bootstrap' }, panel)
+    expect(await host.handle(deletion, panel)).toBe('ok')
+    expect(core.pageCalls).toHaveLength(1)
+    await expect(host.handle({ ...deletion, args: { company: 'other' } }, panel)).rejects.toThrow('command_key_conflict')
+    expect(JSON.stringify(core.pageCalls)).not.toContain(TOKEN)
+
+    // A long core command must not keep a later stop/pause from reaching the controller.
+    const controls = harness()
+    const controller = controls.create()
+    await controller.handle({ type: 'boss.panel.bootstrap' }, panel)
+    const channel = controls.port()
+    await controller.attachPanel(channel.port)
+    let releasePage!: (result: unknown) => void
+    let startedPage!: () => void
+    const pageStarted = new Promise<void>(resolve => { startedPage = resolve })
+    controls.page(async () => { startedPage(); return new Promise(resolve => { releasePage = resolve }) })
+    const pendingAction = controller.handle({ type: 'boss.panel.page', account: ACCOUNT, operation: 'platform.apply_job', args: { jobId: 'job-1', greeting: 'test' }, stableKey: 'run:job-1' }, panel).then(() => '', error => error.message)
+    await pageStarted
+    const work = { id: 8, action: 'orchestrator.action', payload: { action: 'apply_batch' } }
+    controls.request(async path => path.endsWith('/heartbeat') ? heartbeat([work]) : { stored: true })
+    await controller.handle({ type: 'boss.tick' }, page)
+    expect(channel.messages.filter(message => message.type === 'command')).toHaveLength(1)
+    const stop = { id: 9, action: 'orchestrator.stop', payload: {} }
+    controls.request(async path => path.endsWith('/heartbeat') ? heartbeat([work, stop]) : { stored: true })
+    controls.advance()
+    await controller.handle({ type: 'boss.tick' }, page)
+    expect(channel.messages.filter(message => message.type === 'command').map(message => (message.command as { id: number }).id)).toEqual([8, 9])
+    expect(controls.disk().accounts[ACCOUNT].ack).toBe(0)
+    expect(await pendingAction).toBe('reconciliation_required')
+    releasePage({ result: { ok: true } })
+    channel.send({ type: 'command.result', key: 'db-outbox-v2:8', accepted: false })
+    channel.send({ type: 'command.result', key: 'db-outbox-v2:9', accepted: true })
+    // The cancelled batch may also finish late; it must not undo the confirmed stop.
+    channel.send({ type: 'command.result', key: 'db-outbox-v2:8', accepted: false })
+    controls.advance()
+    await controller.handle({ type: 'boss.tick' }, page)
+    expect(controls.disk().accounts[ACCOUNT].ack).toBe(9)
   })
 
-  it('turns a persisted started command into reconciliation evidence and leaves an unsupported legacy action unacknowledged', async () => {
+  it('turns a persisted started command into reconciliation evidence and leaves an unknown action unacknowledged', async () => {
     const h = harness({ [ACCOUNT]: { epoch: 'db-outbox-v2', ack: 0, receipts: {
       'db-outbox-v2:8': { commandId: 8, epoch: 'db-outbox-v2', tool: 'send_message', state: 'started', irreversible: true, uploaded: false, effects: [] },
     } } })
-    h.request(async path => path.endsWith('/heartbeat') ? heartbeat([command(), { id: 9, action: 'orchestrator.start', payload: {} }, command(10)]) : { stored: true })
+    h.request(async path => path.endsWith('/heartbeat') ? heartbeat([command(), { id: 9, action: 'unknown.action', payload: {} }, command(10)]) : { stored: true })
     const result = await h.create().handle({ type: 'boss.tick' }, page)
     expect(result).toMatchObject({ ok: true })
     expect(h.pageCalls).toHaveLength(0)
@@ -186,6 +261,18 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     h.denyPermission()
     await expect(runtime.handle({ type: 'boss.token', apiBase: 'http://127.0.0.1:8010', token: TOKEN }, popup)).rejects.toThrow('api_permission_required')
     expect(h.calls).toHaveLength(0)
+
+    const isolated = harness()
+    const host = isolated.create()
+    await expect(host.handle({ type: 'boss.panel.bootstrap' }, page)).rejects.toThrow('untrusted_sender')
+    await expect(host.handle({ type: 'boss.panel.bootstrap' }, { ...panel, documentId: 'stale-frame' })).rejects.toThrow('untrusted_panel_document')
+    await host.handle({ type: 'boss.panel.bootstrap' }, panel)
+    await expect(host.handle({ type: 'boss.panel.storage', action: 'set', key: 'aah_mirror_conversations', value: [], account: 'other-account' }, panel)).rejects.toThrow('session_changed')
+    await expect(host.handle({ type: 'boss.panel.storage', action: 'get', key: 'boss-agent.runtime.v1', account: ACCOUNT }, panel)).rejects.toThrow('storage_key_forbidden')
+    const request = { type: 'boss.panel.network', account: ACCOUNT, options: { method: 'GET', url: `${API}/api/conversations/list?limit=1000` } }
+    expect(await host.handle(request, panel)).toMatchObject({ status: 200 })
+    await expect(host.handle({ ...request, options: { method: 'GET', url: `${API}/api/conversations/list?limit=1000&token=bad` } }, panel)).rejects.toThrow('api_path_forbidden')
+    await expect(host.handle({ ...request, options: { method: 'POST', url: `${API}/api/plugin/heartbeat` } }, panel)).rejects.toThrow('api_path_forbidden')
 
     // MAIN-world page output cannot grant a read tool write access, smuggle API fields, or navigate arbitrary BOSS paths.
     const attacks = [

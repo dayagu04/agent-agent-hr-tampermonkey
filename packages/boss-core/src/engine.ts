@@ -3,7 +3,7 @@
 // 设计：决策复用后端主项目模块（规则/匹配/招呼语/决策日志），
 // 插件只做浏览器执行 + 如实上报，不在前端另造一套算法。
 import type { ApplyResult } from './platforms/base'
-import { executionPageUrl, type ExecutionPlatform } from './execution-host'
+import { cancelExecutionPage, executionPageUrl, type ExecutionPlatform } from './execution-host'
 import type { ApplyOutcome, ApplyRule, JobCard, PluginConfig, ApplyProgress } from './types'
 import {
   fetchGreeting,
@@ -40,6 +40,7 @@ export class ApplyEngine {
   /** 中断标记；长睡眠期间也会被 waitAbortable 感知，不必等睡完 */
   abort() {
     this.aborted = true
+    cancelExecutionPage()
   }
 
   /**

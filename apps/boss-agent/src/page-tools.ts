@@ -5,7 +5,7 @@ import { assertToolExecutionActive, installToolExecutionGuard } from '../../../p
 import { setPageResumeName } from './page/config'
 import { toolCatalog, validateToolArgs } from './tools-contract'
 import { dispatchCoreOperation } from './core-page'
-import { validateCoreOperation } from './core-operation-contract'
+import { isCoreSideEffect, validateCoreOperation } from './core-operation-contract'
 import type { BossPageTools, PageEffect, PageExecution, PageInvocation, ToolResult } from './contracts'
 
 const detectPlatform = () => location.hostname === 'www.zhipin.com' ? new BossPlatform() : null
@@ -120,7 +120,8 @@ export function createPageTools(): BossPageTools & { cancel(commandKey?: string)
         return receipt ? structuredClone(receipt) : failure('reconciliation_required')
       }
       if (active) return failure('page_busy')
-      if (seen.size >= MAX_COMMAND_KEYS) return failure('page_receipt_capacity')
+      const durable = !invocation.name.startsWith('core:') || isCoreSideEffect(invocation.name)
+      if (durable && seen.size >= MAX_COMMAND_KEYS) return failure('page_receipt_capacity')
       seen.set(invocation.commandKey, fingerprint)
       const lease = begin(invocation.commandKey)
       const effects: PageEffect[] = []
@@ -139,6 +140,7 @@ export function createPageTools(): BossPageTools & { cancel(commandKey?: string)
         result = { ok: false, error: lease.cancelled ? 'reconciliation_required' : 'page_execution_failed' }
       } finally { end() }
       const execution: PageExecution = { result, ...(effects.length ? { effects } : {}) }
+      if (!durable) { seen.delete(invocation.commandKey); return execution }
       receipts.set(invocation.commandKey, structuredClone(execution))
       if (receipts.size > MAX_RECEIPTS) receipts.delete(receipts.keys().next().value!)
       return execution

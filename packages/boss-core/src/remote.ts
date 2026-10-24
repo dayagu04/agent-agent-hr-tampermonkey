@@ -26,7 +26,7 @@ export function currentPlatformCode(): string {
   return ''
 }
 
-interface RemoteCommand {
+export interface RemoteCommand {
   id: number
   action: string
   payload: Record<string, unknown>
@@ -193,7 +193,7 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
             break
           }
           if (cmd.id <= ackCommandId) continue
-          if (!await executeCommand(cfg, cmd)) break
+          if (!await executeRemoteCommand(cfg, cmd)) break
           ackCommandId = cmd.id
           // 先持久化执行游标；即使命令触发跨页导航，新页面也能在下一次心跳 ACK。
           commandAck = { epoch: commandEpoch, id: ackCommandId }
@@ -226,7 +226,7 @@ export async function reportHeartbeatAndPoll(): Promise<void> {
 }
 
 /** 执行一条远程命令（网页端入队） */
-async function executeCommand(
+export async function executeRemoteCommand(
   cfg: ReturnType<typeof loadConfig>,
   cmd: RemoteCommand,
 ): Promise<boolean> {
@@ -299,9 +299,19 @@ async function executeCommand(
       case 'orchestrator.stop':
         await orch.stop(typeof cmd.payload?.reason === 'string' ? cmd.payload.reason : '网页端远程停止')
         break
-      case 'orchestrator.action':
-        // 后端 LangGraph 下发的执行指令（apply_batch / chat_snapshot / chat_reply / stop / pause）
-        return await orch.applyBackendAction((cmd.payload || {}) as Record<string, unknown>)
+      case 'orchestrator.action': {
+        // 控制指令可以打断忙碌批次，也必须能处理已暂停的执行器。
+        const payload = cmd.payload || {}
+        if (payload.action === 'stop') {
+          await orch.stop(typeof payload.reason === 'string' ? payload.reason : '后端指令停止')
+          return true
+        }
+        if (payload.action === 'pause') {
+          await orch.pause(typeof payload.reason === 'string' ? payload.reason : '后端指令暂停（请人工处理后继续）')
+          return true
+        }
+        return await orch.applyBackendAction(payload)
+      }
       case 'tool.call': {
         // agent 直接调用一个原子工具。参数：{ name, args }
         // 不论工具成败都 ACK（返回 true）：不可撤回的工具不能因为 ACK 丢失而重试一次。

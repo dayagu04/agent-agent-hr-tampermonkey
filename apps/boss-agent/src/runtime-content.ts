@@ -1,20 +1,22 @@
 interface ContentDependencies {
   runtime: Pick<typeof chrome.runtime, 'id' | 'sendMessage'>
   visibility: () => DocumentVisibilityState
+  navUnread?: () => number
 }
 
 /** Isolated-world heartbeat endpoint. It has no credentials, page actions, or generic API proxy. */
 export class BossContentHeartbeat {
   private readonly runtime: ContentDependencies['runtime']
   private readonly visibility: ContentDependencies['visibility']
+  private readonly navUnread: () => number
   private pending: Promise<unknown> | null = null
   private frozen = false
   private lifecycleVersion = 0
-  constructor(dependencies: ContentDependencies) { this.runtime = dependencies.runtime; this.visibility = dependencies.visibility }
+  constructor(dependencies: ContentDependencies) { this.runtime = dependencies.runtime; this.visibility = dependencies.visibility; this.navUnread = dependencies.navUnread || (() => -1) }
   tick(generation?: string): Promise<unknown> {
     if (this.frozen) return Promise.resolve({ ok: false, error: 'page_frozen' })
     if (this.pending) return this.pending
-    const message = { type: 'boss.tick', visibility: this.visibility(), lifecycleVersion: this.lifecycleVersion, ...(generation === undefined ? {} : { wakeGeneration: generation }) }
+    const message = { type: 'boss.tick', navUnread: this.navUnread(), visibility: this.visibility(), lifecycleVersion: this.lifecycleVersion, ...(generation === undefined ? {} : { wakeGeneration: generation }) }
     this.pending = Promise.resolve().then(() => this.runtime.sendMessage(message))
       .catch(() => ({ ok: false, error: 'background_unavailable' }))
       .finally(() => { this.pending = null })

@@ -73,7 +73,7 @@ const operations: Record<string, (args: Record<string, unknown>) => unknown | Pr
   'ui.delete_thread': args => {
     requireChat()
     // Backend ledger and local mirror updates belong to the trusted panel, never MAIN.
-    return deleteThread(String(args.company), string(args.jobTitle), undefined, async () => {})
+    return deleteThread(String(args.company), string(args.jobTitle), args.identity as { bossId?: string; encryptJobId?: string } | undefined, async () => {})
   },
   'ui.probe_search_filters': args => { probeSearchFiltersOnce(string(args.reason, 128) || 'panel'); return null },
   ...chatPageOperations,

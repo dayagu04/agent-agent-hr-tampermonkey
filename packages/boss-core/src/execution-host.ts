@@ -23,6 +23,7 @@ export interface PageDriver {
   context(): ExecutionPageContext
   navigate(url: string): Promise<void>
   detectRiskControl(): Promise<boolean>
+  cancel?(): void
   platform(url: string): ExecutionPlatform | null
 }
 
@@ -67,3 +68,6 @@ export async function detectExecutionRisk(): Promise<boolean> {
   }
   return /security-check|captcha|verify/.test(window.location.pathname + window.location.search)
 }
+
+/** 原页面宿主继续由引擎标记中断；原生宿主同时撤销当前页面动作。 */
+export function cancelExecutionPage(): void { pageDriver?.cancel?.() }
