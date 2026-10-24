@@ -111,7 +111,13 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
         if (needChatPage()) return needChatPage()!
         const info = currentThreadInfo()
         if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
-        return { ok: true, data: await listPendingCardsStable() }
+        try { return { ok: true, data: await listPendingCardsStable() } }
+        catch (error) {
+          if (error instanceof Error && ['no_open_thread', 'chat_thread_changed'].includes(error.message)) {
+            return { ok: false, error: error.message === 'no_open_thread' ? 'no_open_thread' : 'thread_changed' }
+          }
+          throw error
+        }
       },
     },
     {

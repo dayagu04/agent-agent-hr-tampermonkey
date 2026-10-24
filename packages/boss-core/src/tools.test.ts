@@ -334,6 +334,9 @@ describe('MV3 page boundary', () => {
     try {
       expect(await createPageTools().run({ commandKey: 'invalid', name: 'send_message', args: { text: false } })).toEqual({ result: { ok: false, error: 'invalid_arguments' } })
       expect(sendMessageText).not.toHaveBeenCalled()
+      const { listPendingCardsStable } = await import('./platforms/boss-chat')
+      vi.mocked(listPendingCardsStable).mockRejectedValueOnce(new Error('no_open_thread'))
+      expect(await createPageTools().run({ commandKey: 'ambiguous-cards', name: 'list_pending_cards', args: {} })).toEqual({ result: { ok: false, error: 'no_open_thread' } })
       const button = document.createElement('button')
       const click = vi.fn()
       button.addEventListener('click', click)
