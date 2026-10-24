@@ -93,20 +93,24 @@ describe('selecting a filter (click → panel → option)', () => {
 
   it('selects only the requested group and confirms its resulting state', async () => {
     vi.useFakeTimers()
-    // 2026-10-25 probe_dom commands 40/42: every group owns a dropdown;
-    // hidden dropdowns retain nonzero geometry and several groups contain 不限.
+    // 2026-10-25 probe_dom commands 40/42/53: each group owns a hover-only dropdown.
+    // Hidden dropdowns have block/hidden/0/auto CSS; li inherits hidden but has opacity 1.
     document.body.innerHTML = `
-      <style>.filter-select-dropdown li { cursor: pointer; }</style>
+      <style>
+        .filter-select-dropdown { visibility: hidden; opacity: 0; pointer-events: auto; }
+        .filter-select-dropdown ul, .filter-select-dropdown li { opacity: 1; }
+        .filter-select-dropdown li { cursor: pointer; }
+      </style>
       <div class="filter-condition-inner">
         <div class="condition-filter-select" id="salary">
           <div class="current-select"><span class="placeholder-text">薪资待遇</span></div>
-          <div class="filter-select-dropdown" style="visibility:hidden"><ul>
+          <div class="filter-select-dropdown"><ul>
             <li>不限<i class="ui-icon-check"></i></li><li>10-15K<i class="ui-icon-check"></i></li>
           </ul></div>
         </div>
         <div class="condition-filter-select is-select" id="experience">
           <div class="current-select"><span class="placeholder-text">工作经验</span><em class="select-num">(1)</em></div>
-          <div class="filter-select-dropdown" style="visibility:hidden"><ul>
+          <div class="filter-select-dropdown"><ul>
             <li>不限<i class="ui-icon-check"></i></li><li class="active">3-5年<i class="ui-icon-check"></i></li>
           </ul></div>
         </div>
@@ -115,8 +119,6 @@ describe('selecting a filter (click → panel → option)', () => {
     window.history.replaceState({}, '', '/web/geek/jobs?query=test&experience=105')
     const group = document.querySelector('#experience') as HTMLElement
     const panel = group.querySelector('.filter-select-dropdown') as HTMLElement
-    const label = group.querySelector('.placeholder-text') as HTMLElement
-    label.addEventListener('click', () => { panel.style.visibility = 'visible' })
     const salaryClick = vi.fn()
     document.querySelector('#salary li')!.addEventListener('click', salaryClick)
     const selectedOptions: string[] = []
@@ -128,7 +130,6 @@ describe('selecting a filter (click → panel → option)', () => {
         panel.querySelector('.active')?.classList.remove('active')
         group.classList.remove('is-select')
         group.querySelector('.select-num')?.remove()
-        panel.style.visibility = 'hidden'
         window.history.replaceState({}, '', '/web/geek/jobs?query=test')
       } else {
         // A click and an unrelated URL update are insufficient confirmation.
@@ -141,6 +142,9 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(await clearing).toMatchObject({ status: 'ok', urlChanged: true })
     expect(selectedOptions).toEqual(['不限'])
     expect(salaryClick).not.toHaveBeenCalled()
+    expect(panel.style.getPropertyValue('visibility')).toBe('')
+    expect(panel.style.getPropertyValue('opacity')).toBe('')
+    expect(getComputedStyle(panel).visibility).toBe('hidden')
     expect(readSearchFilters().find((g) => g.name === '工作经验')?.options.some((o) => o.selected)).toBe(false)
 
     expect(await selectSearchFilter('工作经验', '不限')).toMatchObject({ status: 'ok', urlChanged: false })
@@ -151,6 +155,21 @@ describe('selecting a filter (click → panel → option)', () => {
     expect(await ignored).toMatchObject({ status: 'selection_not_confirmed', urlChanged: true })
     expect(selectedOptions).toEqual(['不限', '3-5年'])
     expect(salaryClick).not.toHaveBeenCalled()
+
+    // A separately hidden or disabled li must remain unavailable after expanding its dropdown.
+    const experienceOption = panel.querySelectorAll('li')[1] as HTMLElement
+    experienceOption.style.visibility = 'hidden'
+    const independentlyHidden = selectSearchFilter('工作经验', '3-5年')
+    await vi.runAllTimersAsync()
+    expect(await independentlyHidden).toMatchObject({ status: 'no_panel', urlChanged: false })
+    experienceOption.style.removeProperty('visibility')
+    experienceOption.setAttribute('aria-disabled', 'true')
+    const disabled = selectSearchFilter('工作经验', '3-5年')
+    await vi.runAllTimersAsync()
+    expect(await disabled).toMatchObject({ status: 'no_panel', urlChanged: false })
+    expect(selectedOptions).toEqual(['不限', '3-5年'])
+    expect(panel.style.getPropertyValue('visibility')).toBe('')
+    expect(panel.style.getPropertyValue('opacity')).toBe('')
   })
 
   it('stops and says why when the group label is missing', async () => {

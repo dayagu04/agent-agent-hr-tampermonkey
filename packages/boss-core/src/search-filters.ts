@@ -178,6 +178,53 @@ function actionable(el: HTMLElement): boolean {
   return getComputedStyle(el).pointerEvents !== 'none'
 }
 
+function disabled(el: HTMLElement): boolean {
+  for (let current: HTMLElement | null = el; current; current = current.parentElement) {
+    if (current.hasAttribute('disabled') || current.getAttribute('aria-disabled') === 'true' ||
+      /(^|[-_\s])disabled([-_\s]|$)/.test(current.className)) return true
+  }
+  return false
+}
+
+/** 仅放行实测 hover 下拉：恢复 CSS 继承后重查目标，独立隐藏/禁用选项仍拒绝。 */
+async function clickOptionInPanel(label: HTMLElement, panel: HTMLElement, target: HTMLElement): Promise<boolean> {
+  if (!label.isConnected || !panel.isConnected || !target.isConnected || groupPanel(label) !== panel) return false
+  if (!actionable(label) || !panel.parentElement || !actionable(panel.parentElement)) return false
+  if (disabled(target)) return false
+  if (actionable(target)) {
+    realClick(target)
+    return true
+  }
+  // command 53: dropdown=block/hidden/0/auto，直属 ul/li 继承 hidden，但自身 opacity=1。
+  // 合成鼠标事件不建立 CSS :hover；只临时展开这个已绑定面板，不修改其他隐藏结构。
+  const style = getComputedStyle(panel)
+  if (!visible(panel) || style.display !== 'block' || style.visibility !== 'hidden' ||
+    style.opacity !== '0' || style.pointerEvents !== 'auto' ||
+    target.parentElement?.tagName !== 'UL' || target.parentElement.parentElement !== panel) return false
+  const previous = ['visibility', 'opacity'].map((name) => ({
+    name, value: panel.style.getPropertyValue(name), priority: panel.style.getPropertyPriority(name),
+  }))
+  try {
+    panel.style.setProperty('visibility', 'visible', 'important')
+    panel.style.setProperty('opacity', '1', 'important')
+    // 计算样式可能仍在 opacity transition 的起点；只等待状态，不重新触发点击。
+    for (let i = 0; i <= 12; i++) {
+      if (!target.isConnected || groupPanel(label) !== panel || disabled(target)) return false
+      if (actionable(target)) {
+        realClick(target)
+        return true
+      }
+      if (i < 12) await sleep(200)
+    }
+    return false
+  } finally {
+    for (const { name, value, priority } of previous) {
+      if (value) panel.style.setProperty(name, value, priority)
+      else panel.style.removeProperty(name)
+    }
+  }
+}
+
 function findOptionInPanel(panel: HTMLElement, optionText: string): HTMLElement | null {
   const want = optionText.replace(/\s/g, '')
   const matches = (Array.from(panel.querySelectorAll('li')) as HTMLElement[])
@@ -233,7 +280,10 @@ export async function selectSearchFilter(
     const label = findGroupLabel(group)
     panel = label ? groupPanel(label) : null
     const candidate = panel ? findOptionInPanel(panel, option) : null
-    if (candidate && actionable(candidate)) target = candidate
+    if (label && panel && candidate) {
+      if (await clickOptionInPanel(label, panel, candidate)) target = candidate
+      break
+    }
   }
   if (!target || !panel) {
     const panelOpen = panel && actionable(panel)
@@ -243,7 +293,6 @@ export async function selectSearchFilter(
     return { group, option, status, urlChanged: location.search !== urlBefore }
   }
 
-  realClick(target)
   await sleep(350)
 
   // 确认按钮也只能来自本组面板，不触碰其他分组或页面浮层。
