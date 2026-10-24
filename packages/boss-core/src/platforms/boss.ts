@@ -195,14 +195,11 @@ export class BossPlatform extends BasePlatform {
    *   .job-detail-box > .job-detail-body > h3.title「职位描述」+ p.desc
    * 同一面板里还有 .job-boss-info（HR 名片、「去App与BOSS随时沟通」）、
    * .job-address（地址/地图），页面底部还有 SEO 链接墙（「合肥保洁招聘…BOSS直聘招聘」）。
-   * 整块取 textContent 会把这些都混进 JD。找不到 p.desc 时才退回整块。
+   * 整块取 textContent 会把这些都混进 JD；描述尚未加载时返回空串。
    */
-  private readDetailJd(): string {
-    const panel =
-      document.querySelector('.job-detail-box, .job-detail, [class*="job-detail"]') ||
-      document.querySelector('.job-detail-container, [class*="detail-content"]')
+  private readDetailJd(panel: Element | null = this.visibleDetailPanel()): string {
     const box =
-      panel?.querySelector('.job-detail-body p.desc, .job-sec-text, p.desc') || panel
+      panel?.querySelector('.job-detail-body p.desc, .job-sec-text, p.desc')
     if (!box) return ''
     // 反爬水印（2026-10-21 probe_dom 实测）：JD 段落里夹着随机 class 的 <span>，
     // 文本是「kanzhun」「BOSS直聘」「直聘」，渲染尺寸为 0（width=0 或 0x0）——
@@ -243,6 +240,36 @@ export class BossPlatform extends BasePlatform {
       .slice(0, 4000)
   }
 
+  /** Hidden retained panes and multiple visible panes cannot identify the current job. */
+  private visibleDetailPanel(): HTMLElement | null {
+    const panels = Array.from(document.querySelectorAll<HTMLElement>('.job-detail-box, .job-detail, .job-detail-container'))
+      .filter(panel => {
+        const rect = panel.getBoundingClientRect()
+        if (rect.width < 1 || rect.height < 1) return false
+        for (let el: HTMLElement | null = panel; el; el = el.parentElement) {
+          const style = getComputedStyle(el)
+          if (el.hidden || el.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false
+        }
+        return true
+      })
+    return panels.length === 1 ? panels[0] : null
+  }
+
+  private detailMatchesJob(panel: HTMLElement, card: JobCard): boolean {
+    // The observed detail link is stronger evidence than a potentially duplicated title.
+    const links = panel.querySelectorAll<HTMLAnchorElement>('a.more-job-btn[href]')
+    if (links.length !== 1) return false
+    let id = ''
+    try {
+      const url = new URL(links[0].getAttribute('href')!, 'https://www.zhipin.com')
+      if (url.origin !== 'https://www.zhipin.com' || url.username || url.password) return false
+      id = url.pathname.match(/^\/job_detail\/([A-Za-z0-9_~-]+)\.html$/)?.[1] || ''
+    } catch { return false }
+    const title = this.text(panel.querySelector('.job-detail-info > .job-name'))
+    const normalize = (value: string) => value.replace(/[\uE000-\uF8FF\s]/g, '')
+    return !!id && id === card.platformJobId && !!normalize(title) && normalize(title) === normalize(card.title)
+  }
+
   /**
    * 读指定岗位的 JD 全文（只切换详情面板，不点「立即沟通」）。
    * 供 agent 的 read_job_detail 工具使用。
@@ -254,15 +281,26 @@ export class BossPlatform extends BasePlatform {
     if (!clickTarget) return ''
     clickTarget.scrollIntoView({ block: 'center' })
     await this.delay(250, 450)
+    const before = this.visibleDetailPanel()
+    const previousJd = before ? this.readDetailJd(before) : ''
+    const alreadySelected = !!before && this.detailMatchesJob(before, card)
     clickTarget.click()
-    let jd = ''
+    let candidate = ''
     for (let i = 0; i < 10; i++) {
       await this.delay(220, 300)
-      jd = this.readDetailJd()
-      if (jd.length > 80) break
+      const panel = this.visibleDetailPanel()
+      if (!panel || !this.detailMatchesJob(panel, card)) { candidate = ''; continue }
+      const jd = this.readDetailJd(panel)
+      // Header/link updates can precede the body. A newly selected job must replace the old JD.
+      if (!jd || (!alreadySelected && jd === previousJd)) { candidate = ''; continue }
+      if (candidate === jd) {
+        diag('BOSS', `read_job_detail id=confirmed jdLen=${jd.length}`)
+        return jd
+      }
+      candidate = jd
     }
-    diag('BOSS', `read_job_detail id=${card.platformJobId ? 'ok' : '-'} jdLen=${jd.length}`)
-    return jd
+    diag('BOSS', 'read_job_detail id=unconfirmed jdLen=0')
+    return ''
   }
 
   /** 逐个打开详情读 JD；失败不影响投递，按读取数量记日志。 */
@@ -270,20 +308,7 @@ export class BossPlatform extends BasePlatform {
     let ok = 0
     let totalLen = 0
     for (const job of jobs) {
-      const card = job.cardElement
-      const clickTarget =
-        (card?.querySelector('a, .job-name, .job-title') as HTMLElement | null) || card || null
-      if (!clickTarget) continue
-      clickTarget.scrollIntoView({ block: 'center' })
-      await this.delay(250, 450)
-      clickTarget.click()
-      // 等详情面板出现新内容：轮询 JD 文本长度，最多约 2.5s
-      let jd = ''
-      for (let i = 0; i < 10; i++) {
-        await this.delay(220, 300)
-        jd = this.readDetailJd()
-        if (jd.length > 80) break
-      }
+      const jd = await this.readJobDetail(job)
       if (jd) {
         job.jd = jd
         job.description = jd

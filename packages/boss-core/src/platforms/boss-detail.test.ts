@@ -9,23 +9,64 @@ function rect(width: number) {
 }
 
 describe('reading a job JD from the detail pane', () => {
-  it('drops the anti-scraping inline CSS and keeps the real description', async () => {
+  it('waits for the requested job identity and changed JD, then removes inline CSS', async () => {
+    const oldJd = '上一岗位的职责。'.repeat(20)
+    const expected = '岗位职责：负责日常行政事务与文件整理。'.repeat(6)
     document.body.innerHTML = `
+      <div class="job-card-wrap"><a href="/job_detail/job-b.html">行政班 早九晚六</a></div>
       <div class="job-detail-box">
-        <style>.anNMcHFn{display:inline-block;font-size:0!important}</style>
-        <h3>行政班 早九晚六</h3>
-        <div class="job-sec-text">岗位职责：负责日常行政事务与文件整理。</div>
+        <div class="job-detail-info"><span class="job-name">上一岗位</span></div>
+        <p class="desc">${oldJd}</p>
         <button>立即沟通</button>
+        <a class="more-job-btn" href="/job_detail/job-a.html">查看详情</a>
       </div>`
-    for (const el of Array.from(document.querySelectorAll('*'))) {
-      vi.spyOn(el, 'getBoundingClientRect').mockReturnValue(rect(100))
+    const visible = () => {
+      for (const el of Array.from(document.querySelectorAll('*'))) vi.spyOn(el, 'getBoundingClientRect').mockReturnValue(rect(100))
     }
+    visible()
+    const cardElement = document.querySelector<HTMLElement>('.job-card-wrap')!
+    const target = cardElement.querySelector<HTMLAnchorElement>('a')!
+    target.scrollIntoView = vi.fn()
+    target.addEventListener('click', event => event.preventDefault())
+    const card = { platformJobId: 'job-b', title: '行政班 早九晚六', company: '公司', cardElement }
     const platform = new BossPlatform()
-    const jd = await (platform as unknown as { readDetailJd(): string }).readDetailJd()
+    let polls = 0
+    const delay = vi.spyOn(platform as unknown as { delay(min: number, max: number): Promise<void> }, 'delay').mockImplementation(async min => {
+      if (min !== 220) return
+      polls++
+      if (polls === 1) {
+        document.querySelector('.job-name')!.textContent = card.title
+        document.querySelector('.more-job-btn')!.setAttribute('href', '/job_detail/job-b.html')
+      }
+      if (polls === 3) {
+        document.querySelector('p.desc')!.innerHTML = `<style>.anNMcHFn{display:inline-block;font-size:0!important}</style>${expected}`
+      }
+    })
+    const jd = await platform.readJobDetail(card)
 
-    expect(jd).toContain('岗位职责')
+    expect(polls).toBe(4) // Matching header/link alone must not accept the old body in polls 1 and 2.
+    expect(jd).toBe(expected)
     expect(jd).not.toContain('display:inline-block')
     expect(jd).not.toContain('立即沟通')
+
+    // A hidden retained pane must not win; the already confirmed target may retain the same JD.
+    const hidden = document.querySelector('.job-detail-box')!.cloneNode(true) as HTMLElement
+    hidden.hidden = true
+    document.body.prepend(hidden)
+    visible()
+    delay.mockResolvedValue(undefined)
+    expect(await platform.readJobDetail(card)).toBe(expected)
+
+    // A same-title target without a matching detail ID must not inherit this JD.
+    expect(await platform.readJobDetail({ ...card, platformJobId: 'job-c' })).toBe('')
+    hidden.hidden = false
+    expect(await platform.readJobDetail(card)).toBe('') // Two visible panes are ambiguous.
+    hidden.remove()
+    document.querySelector('.more-job-btn')!.removeAttribute('href')
+    expect(await platform.readJobDetail(card)).toBe('')
+    document.querySelector('.more-job-btn')!.setAttribute('href', '/job_detail/job-b.html')
+    document.querySelector('p.desc')!.remove()
+    expect(await platform.readJobDetail(card)).toBe('') // A loaded header is not a loaded JD.
   })
 
   it('removes zero-size watermark spans (kanzhun / BOSS直聘) mixed into the text', async () => {
