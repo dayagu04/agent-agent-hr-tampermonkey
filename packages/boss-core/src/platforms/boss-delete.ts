@@ -298,7 +298,7 @@ function findDeleteDialog(): HTMLElement | null {
  *                  BOSS 往往不弹确认窗 —— 每轮先查 gone，已消失立即返回，
  *                  不再固定空等 14 轮（约 5 秒）。
  */
-export async function confirmDeleteDialog(opts?: { gone?: () => boolean }): Promise<boolean> {
+export async function confirmDeleteDialog(opts?: { gone?: () => boolean; verifyIdentity?: () => boolean }): Promise<boolean> {
   let dumpedMissing = false
   for (let i = 0; i < 14; i++) {
     if (opts?.gone?.()) return true
@@ -335,6 +335,7 @@ export async function confirmDeleteDialog(opts?: { gone?: () => boolean }): Prom
       })
       continue
     }
+    if (opts?.verifyIdentity && !opts.verifyIdentity()) return false
     realClick(ok)
     await delay(500, 800)
     diag('CHAT', '已点击删除确认弹窗「确定」（已限定在确认弹窗内）')

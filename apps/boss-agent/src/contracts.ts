@@ -13,7 +13,7 @@ export interface PageInvocation {
   context?: { greeting?: string; defaultResumeName?: string }
 }
 export type PageEffect =
-  | { kind: 'navigate'; url: string; pendingThread?: { company: string; jobTitle: string } }
+  | { kind: 'navigate'; url: string; pendingThread?: { company: string; jobTitle: string; jobId?: string } }
   | { kind: 'reload' }
   | { kind: 'application'; payload: Record<string, unknown> }
   | { kind: 'conversation_deleted'; payload: Record<string, unknown> }

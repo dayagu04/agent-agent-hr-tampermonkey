@@ -870,7 +870,7 @@ describe('thread matching', () => {
         <span class="name-box"><span class="name-text">陈女士</span>新会话公司...</span>
       </li></ul><section id="header"><span class="name-text">其他女士</span><span class="company">其他公司</span><span class="position-name">其他岗位</span></section>`
       const freshRow = document.querySelector('li')!
-      const freshBoss = { securityId: 'fresh', name: '陈女士', brandName: '新会话公司...', positionName: '' }
+      const freshBoss = { securityId: 'fresh', encryptJobId: 'stable-job', name: '陈女士', brandName: '新会话公司...', positionName: '' }
       const allSources = [freshBoss]
       const freshSelect = vi.fn()
       Object.assign(freshRow, { __vue__: { handleClick: freshSelect, boss: freshBoss,
@@ -911,6 +911,44 @@ describe('thread matching', () => {
       const conflictingJob = openThreadConfirmed('新会话公司', '客服')
       await vi.runAllTimersAsync()
       expect(await conflictingJob).toBe('thread_not_confirmed')
+
+      // A stable ID may outlive a different label in the row. Only the actual
+      // requested header can authorize this target; a missing ID never falls back.
+      freshBoss.positionName = '网络客服'
+      expect(await openThreadConfirmed('新会话公司', '客服', 'missing')).toBe('not-found')
+      expect(await openThreadConfirmed('其他公司', '客服', 'stable-job')).toBe('thread_not_confirmed')
+      const wrongHeader = openThreadConfirmed('新会话公司', '客服', 'stable-job')
+      await vi.runAllTimersAsync()
+      expect(await wrongHeader).toBe('thread_not_confirmed')
+      const beforeStable = freshSelect.mock.calls.length
+      freshSelect.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .position-name')!.textContent = '客服'
+      }, 400) })
+      let stableFinished = false
+      const stable = openThreadConfirmed('新会话公司', '客服', 'stable-job').then(value => { stableFinished = true; return value })
+      await vi.advanceTimersByTimeAsync(200)
+      expect(stableFinished).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(await stable).toBe('ok')
+      expect(await openThreadConfirmed('新会话公司', '客服', 'stable-job')).toBe('ok')
+      expect(freshSelect).toHaveBeenCalledTimes(beforeStable + 1)
+      // Identical header text for another ID is not evidence that this ID is active.
+      allSources.push({ ...freshBoss, securityId: 'unrendered', encryptJobId: 'different-job', positionName: '客服' })
+      expect(await openThreadConfirmed('新会话公司', '客服', 'stable-job')).toBe('thread_not_confirmed')
+      allSources.pop()
+      allSources.push({ ...freshBoss, securityId: 'duplicate-id' })
+      expect(await openThreadConfirmed('新会话公司', '客服', 'stable-job')).toBe('ambiguous')
+      allSources.pop()
+      // The row can be recycled while its new header is still loading.
+      document.querySelector('#header .position-name')!.textContent = '其他岗位'
+      freshSelect.mockImplementationOnce(() => { setTimeout(() => {
+        freshBoss.encryptJobId = 'recycled-job'
+        document.querySelector('#header .position-name')!.textContent = '客服'
+      }, 400) })
+      const changedId = openThreadConfirmed('新会话公司', '客服', 'stable-job')
+      await vi.runAllTimersAsync()
+      expect(await changedId).toBe('thread_not_confirmed')
+
     } finally { vi.useRealTimers() }
   })
 

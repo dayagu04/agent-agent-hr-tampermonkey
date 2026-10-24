@@ -30,6 +30,7 @@ function harness(accounts: Record<string, unknown> = {}) {
   const navigations: unknown[] = []
   const cancellations: unknown[][] = []
   let epoch = 0
+  let documentId = page.documentId
   let beforeInvocation: () => Promise<void> = async () => undefined
   let onPage: (invocation: PageInvocation, method: string) => Promise<unknown> = async () => ({ result: { ok: true, data: { delivery: 'delivered' } } })
   let onRequest: (path: string, body: Record<string, unknown>) => Promise<unknown> = async path => path.endsWith('/heartbeat') ? heartbeat([]) : { stored: true }
@@ -44,11 +45,11 @@ function harness(accounts: Record<string, unknown> = {}) {
     } },
     permissions: { contains: async () => permission },
     webNavigation: { getFrame: async ({ frameId }: { frameId: number }) => frameId === 0
-      ? { documentId: page.documentId, url: page.url, parentFrameId: -1 }
+      ? { documentId, url: page.url, parentFrameId: -1 }
       : null },
     tabs: { get: async (id: number) => ({ id, url: 'https://www.zhipin.com/web/geek/chat' }), update: async (...args: unknown[]) => { navigations.push(args) }, reload: async (...args: unknown[]) => { navigations.push(args) } },
     scripting: { executeScript: async (details: { files?: string[]; args?: unknown[]; func?: (...args: unknown[]) => unknown; target: { tabId: number; documentIds: string[] } }) => {
-      expect(details.target).toEqual({ tabId: 12, documentIds: ['doc-1'] })
+      expect(details.target).toEqual({ tabId: 12, documentIds: [documentId] })
       if (details.files) return []
       if (details.args?.length === 2) { cancellations.push(details.args); return [] }
       if ((details.args?.length ?? 0) > 2) await beforeInvocation()
@@ -87,6 +88,7 @@ function harness(accounts: Record<string, unknown> = {}) {
       return { port, messages, send: (value: unknown) => receive(value), disconnect: () => disconnect() }
     },
     advance: (milliseconds = 1000) => { time += milliseconds }, denyPermission: () => { permission = false },
+    changeDocument: (id: string) => { documentId = id },
     changeEpoch: () => { epoch += 1 }, beforeInvocation: (handler: typeof beforeInvocation) => { beforeInvocation = handler },
     request: (handler: typeof onRequest) => { onRequest = handler }, page: (handler: typeof onPage) => { onPage = handler },
   }
@@ -279,7 +281,7 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     // An old persisted target may not exist after navigation. Bound retries across worker restarts,
     // replace its intermediate result and keep diagnostics usable without sending to the wrong thread.
     const missing = harness({ [ACCOUNT]: { epoch: 'db-outbox-v2', ack: 8,
-      pendingThread: { company: 'missing', jobTitle: '', fromDocumentId: 'previous-doc' },
+      pendingThread: { company: 'missing', jobTitle: '', jobId: 'stable-job', fromDocumentId: 'previous-doc' },
       receipts: { 'db-outbox-v2:8': { commandId: 8, epoch: 'db-outbox-v2', tool: 'open_thread', state: 'done', irreversible: false, uploaded: true, effects: [] } },
     } })
     missing.page(async invocation => invocation.name === 'open_thread' ? { result: { ok: false, error: 'not-found' } } : { result: { ok: true } })
@@ -290,12 +292,30 @@ describe('MV3 production message dispatcher persistence and trust', () => {
       missing.advance()
       if (attempt === 1) missingRuntime = missing.create()
     }
+    expect(missing.pageCalls.filter(call => call.name === 'open_thread').every(call => call.args?.jobId === 'stable-job')).toBe(true)
     expect(missing.pageCalls.map(call => call.name)).toEqual([...Array(5).fill('open_thread'), 'get_page_state'])
     expect(missing.calls.filter(call => call.path.endsWith('/tools/result')).map(call => ({ id: call.body.command_id, error: call.body.error }))).toEqual([
       { id: 8, error: 'not-found' }, { id: 9, error: 'navigation_recovery_required' }, { id: 10, error: '' },
     ])
     expect(missing.disk().accounts[ACCOUNT].ack).toBe(10)
     expect(await missingRuntime.handle({ type: 'boss.status' }, popup)).toMatchObject({ phase: 'diagnostic_only', lastError: 'pending_thread_not-found' })
+
+    // Navigate through the production effect validator, persist, restart the
+    // worker, then replay the exact ID on the new document before any next action.
+    const navigated = harness()
+    navigated.request(async path => path.endsWith('/heartbeat') ? heartbeat([command(8, 'open_thread', { company: 'company', jobTitle: 'job', jobId: 'stable-job' })]) : { stored: true })
+    navigated.page(async () => ({ result: { ok: true, data: 'navigating' }, effects: [{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/chat', pendingThread: { company: 'company', jobTitle: 'job', jobId: 'stable-job' } }] }))
+    await navigated.create().handle({ type: 'boss.tick' }, page)
+    expect(navigated.navigations).toHaveLength(1)
+    expect(navigated.disk().accounts[ACCOUNT]).toMatchObject({ pendingThread: { company: 'company', jobTitle: 'job', jobId: 'stable-job', fromDocumentId: 'doc-1' } })
+    navigated.changeDocument('doc-2')
+    navigated.advance()
+    navigated.request(async path => path.endsWith('/heartbeat') ? heartbeat([]) : { stored: true })
+    navigated.page(async () => ({ result: { ok: true, data: 'ok' } }))
+    await navigated.create().handle({ type: 'boss.tick' }, { ...page, documentId: 'doc-2' })
+    expect(navigated.pageCalls.at(-1)).toMatchObject({ name: 'open_thread', args: { company: 'company', jobTitle: 'job', jobId: 'stable-job' } })
+    expect(navigated.pageCalls).toHaveLength(2)
+    expect(navigated.disk().accounts[ACCOUNT]).toHaveProperty('pendingThread', undefined)
 
     const ambiguous = harness({ [ACCOUNT]: { epoch: 'db-outbox-v2', ack: 8, receipts: {}, pendingThread: { company: 'same-company', jobTitle: '', fromDocumentId: 'previous-doc' } } })
     ambiguous.page(async () => ({ result: { ok: false, error: 'ambiguous' } }))
@@ -369,6 +389,8 @@ describe('MV3 production message dispatcher persistence and trust', () => {
       { name: 'delete_thread', args: { company: 'company' }, effects: [{ kind: 'conversation_deleted', payload: { platform: 'zhipin', company: 'company', token: 'should-never-reach-api' } }] },
       { name: 'open_search', args: { keyword: 'keyword' }, effects: [{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/settings' }] },
       { name: 'open_thread', args: { company: 'company' }, effects: [{ kind: 'navigate', url: 'https://attacker.test/', pendingThread: { company: 'company', jobTitle: '' } }] },
+      { name: 'open_thread', args: { company: 'company', jobId: 'stable-job' }, effects: [{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/chat', pendingThread: { company: 'company', jobTitle: '', jobId: true } }] },
+      { name: 'open_thread', args: { company: 'company', jobId: 'stable-job' }, effects: [{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/chat', pendingThread: { company: 'company', jobTitle: '' } }] },
       { name: 'reload_page', args: {}, effects: [{ kind: 'reload' }, { kind: 'reload' }] },
       { name: 'get_page_state', args: {}, effects: { kind: 'application' } },
       { name: 'apply_job', args: { jobId: 'job-1' }, effects: [{ kind: 'application', payload: { platform: 'zhipin', platform_job_id: 'job-1', title: 'role', outcome: 'applied', resume_id: 99 } }] },

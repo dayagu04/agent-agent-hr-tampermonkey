@@ -46,7 +46,7 @@ interface AccountState {
   epoch: string
   ack: number
   receipts: Record<string, Receipt>
-  pendingThread?: { company: string; jobTitle: string; fromDocumentId: string; commandId?: number; epoch?: string; attempts?: number }
+  pendingThread?: { company: string; jobTitle: string; jobId?: string; fromDocumentId: string; commandId?: number; epoch?: string; attempts?: number }
   navigation?: { tabId: number; fromDocumentId: string; startedAt: number }
   diagnosticOnly?: boolean
 }
@@ -146,8 +146,8 @@ function pageEffects(tool: string, raw: unknown, resumeId: number | null, persis
       if (parsed.hash || parsed.pathname !== (tool === 'open_search' ? '/web/geek/jobs' : '/web/geek/chat') || (tool === 'open_thread' && parsed.search)) throw new Error('invalid_page_effect')
       if (tool === 'open_thread') {
         const thread = strictObject(effect.pendingThread)
-        keysOnly(thread, ['company', 'jobTitle'])
-        return { kind: 'navigate', url, pendingThread: { company: field(thread.company, 255, true), jobTitle: field(thread.jobTitle, 255) } }
+        keysOnly(thread, ['company', 'jobTitle', 'jobId'])
+        return { kind: 'navigate', url, pendingThread: { company: field(thread.company, 255, true), jobTitle: field(thread.jobTitle, 255), ...(thread.jobId !== undefined ? { jobId: field(thread.jobId, 512) } : {}) } }
       }
       return { kind: 'navigate', url }
     }
@@ -1019,7 +1019,14 @@ export class BossRuntime {
       if (new TextEncoder().encode(JSON.stringify(receipt.result)).length > MAX_RESULT_BYTES) {
         receipt.result = { ok: receipt.result.ok, error: receipt.result.error, data: { truncated: true, reason: 'result_exceeds_extension_budget', retrySafe: !receipt.irreversible } }
       }
-      receipt.effects = pageEffects(receipt.tool, execution.effects, resumeId).map(effect => ({ effect, done: false }))
+      const effects = pageEffects(receipt.tool, execution.effects, resumeId)
+      if (receipt.tool === 'open_thread' && typeof args.jobId === 'string' && args.jobId.trim()) {
+        const navigation = effects.find(effect => effect.kind === 'navigate')
+        if (navigation?.kind === 'navigate' && (navigation.pendingThread?.jobId?.trim() !== args.jobId.trim() ||
+            navigation.pendingThread.company.trim() !== String(args.company || '').trim() ||
+            navigation.pendingThread.jobTitle.trim() !== String(args.jobTitle || args.job_title || '').trim())) throw new Error('invalid_page_effect')
+      }
+      receipt.effects = effects.map(effect => ({ effect, done: false }))
       receipt.state = 'done'
       await this.save()
     } catch (error) {
@@ -1131,7 +1138,7 @@ export class BossRuntime {
     await this.save()
     const result = await this.page(session, connection, 'run', {
       commandKey: await pageCommandKey(`${session.accountKey}|pending-thread|${pending.epoch ?? account.epoch}|${pending.commandId ?? account.ack}|${pending.attempts}`), name: 'open_thread',
-      args: { company: pending.company, jobTitle: pending.jobTitle }, context: { defaultResumeName: session.config.defaultResumeName },
+      args: { company: pending.company, jobTitle: pending.jobTitle, ...(pending.jobId ? { jobId: pending.jobId } : {}) }, context: { defaultResumeName: session.config.defaultResumeName },
     }) as PageExecution
     this.assertActive(session)
     // A navigation response is not evidence that the target conversation opened.

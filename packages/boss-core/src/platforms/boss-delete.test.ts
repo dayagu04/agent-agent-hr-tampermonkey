@@ -121,6 +121,48 @@ describe('deleteViaRowVue', () => {
       })
       expect(document.querySelectorAll('.user-list li')).toHaveLength(1)
 
+      // Explicit ID selects the stable row even when its label is stale, but it
+      // must still confirm the requested header and report that actual identity.
+      document.querySelector('.user-list')!.prepend(rows[0])
+      sources.unshift(targetBoss)
+      targetBoss.positionName = '网络客服'
+      expect(await deleteThread('其他公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)).toBe('failed')
+      sources.push({ ...targetBoss, uniqueId: 'same-person', encryptJobId: 'another-job' })
+      expect(await deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)).toBe('failed')
+      sources.pop()
+      document.querySelector('#header .position-name')!.textContent = '网络客服'
+      const wrongHeader = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await wrongHeader).toBe('failed')
+      expect(remove).toHaveBeenCalledTimes(1)
+      document.querySelector('#header .position-name')!.textContent = '客服'
+      const confirmation = document.createElement('section')
+      confirmation.innerHTML = '确认删除吗？<button>确定</button>'
+      const finalConfirm = vi.fn()
+      confirmation.querySelector('button')!.addEventListener('click', finalConfirm)
+      for (const element of [confirmation, confirmation.querySelector('button')!]) {
+        vi.spyOn(element, 'getBoundingClientRect').mockReturnValue({ x: 100, y: 60, top: 60, left: 100, right: 220, bottom: 100, width: 120, height: 40, toJSON: () => ({}) })
+      }
+      const promptDelete = vi.fn(() => {
+        document.body.appendChild(confirmation)
+        setTimeout(() => { document.querySelector('#header .position-name')!.textContent = '其他岗位' }, 100)
+      })
+      Object.assign(rows[0], { __vue__: { boss: targetBoss, handleClick: select, deleteBoss: promptDelete, $parent: listVm } })
+      const switchedBeforeConfirm = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await switchedBeforeConfirm).toBe('failed')
+      expect(promptDelete).toHaveBeenCalledTimes(1)
+      expect(finalConfirm).not.toHaveBeenCalled()
+      expect(remove).toHaveBeenCalledTimes(1)
+      confirmation.remove()
+      document.querySelector('#header .position-name')!.textContent = '客服'
+      Object.assign(rows[0], { __vue__: { boss: targetBoss, handleClick: select, deleteBoss: remove, $parent: listVm } })
+      const identified = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await identified).toBe('ok')
+      expect(remove).toHaveBeenCalledTimes(2)
+      expect(afterDeleted).toHaveBeenLastCalledWith({ company: '新会话公司', jobTitle: '客服', bossId: 'target', encryptJobId: 'actual-job' })
+
       // The header fallback also uses all three identity fields. HR text is
       // deliberately separate from the company, as on the measured BOSS page.
       document.querySelector('.user-list')!.prepend(rows[0])
@@ -138,8 +180,8 @@ describe('deleteViaRowVue', () => {
       const fallback = deleteThread('新会话公司', '客服', undefined, afterDeleted)
       await vi.runAllTimersAsync()
       expect(await fallback).toBe('ok')
-      expect(remove).toHaveBeenCalledTimes(2)
-      expect(afterDeleted).toHaveBeenCalledTimes(2)
+      expect(remove).toHaveBeenCalledTimes(3)
+      expect(afterDeleted).toHaveBeenCalledTimes(3)
       expect(wrongRemove).not.toHaveBeenCalled()
 
       document.querySelector('.user-list')!.prepend(rows[0])
@@ -154,11 +196,11 @@ describe('deleteViaRowVue', () => {
         document.querySelector('#header .position-name')!.textContent = '其他岗位'
         ;(headerDelete as HTMLElement).style.visibility = 'visible'
       }, 100) })
-      const changedWhileOpening = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      const changedWhileOpening = deleteThread('新会话公司', '客服', { encryptJobId: 'actual-job' }, afterDeleted)
       await vi.runAllTimersAsync()
       expect(await changedWhileOpening).toBe('failed')
-      expect(remove).toHaveBeenCalledTimes(2)
-      expect(afterDeleted).toHaveBeenCalledTimes(2)
+      expect(remove).toHaveBeenCalledTimes(3)
+      expect(afterDeleted).toHaveBeenCalledTimes(3)
     } finally {
       vi.useRealTimers()
       vi.restoreAllMocks()

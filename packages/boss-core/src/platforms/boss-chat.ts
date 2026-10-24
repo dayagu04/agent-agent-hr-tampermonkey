@@ -409,21 +409,27 @@ async function deleteThreadImpl(
   }
   const { row: hit, pinned } = candidate
   const info = readRowJobInfo(hit.el)
+  const explicitJobId = (identity?.encryptJobId || '').trim()
+  const expectedHeader = threadHeaderIdentity(hit, company, jobTitle)
+  let headerRequired = false
   const sameRow = (): boolean => {
     assertChatExecutionActive()
     const live = listThreadsQuiet().find(row => row.el === hit.el)
     if (!live) return false
     const actual = rowTarget(live)
-    return actual.key === pinned.key && identityText(actual.name) === identityText(pinned.name) &&
+    return (!explicitJobId || (actual.jobId === explicitJobId && explicitThreadIdentityValid(candidate, company))) &&
+      (!headerRequired || threadHeaderMatches(expectedHeader)) &&
+      actual.key === pinned.key && identityText(actual.name) === identityText(pinned.name) &&
       (!actual.jobTitle || identityText(actual.jobTitle) === identityText(pinned.jobTitle || jobTitle)) &&
       confirmationCompany(actual.company) === confirmationCompany(pinned.company)
   }
   // Pin before awaiting selection: a recycled element must not become a new target.
   if (!sameRow()) return 'failed'
   let confirmedHeader: ReturnType<typeof currentThreadInfo> | undefined
-  if (!info.title && !hit.jobTitle) {
-    if (!jobTitle || await confirmThreadRow(hit, company, jobTitle) !== 'ok') return 'failed'
+  if (explicitJobId || (!info.title && !hit.jobTitle)) {
+    if ((!jobTitle && !info.title && !hit.jobTitle) || await confirmThreadRow(hit, company, jobTitle, sameRow) !== 'ok') return 'failed'
     confirmedHeader = currentThreadInfo()
+    headerRequired = !!explicitJobId
   }
   if (!sameRow()) return 'failed'
   const actualInfo = readRowJobInfo(hit.el)
@@ -473,7 +479,7 @@ async function deleteThreadImpl(
    */
   const confirmAndVerify = async (label: string): Promise<boolean> => {
     await delay(300, 450)
-    const confirmed = await confirmDeleteDialog({ gone: isGone })
+    const confirmed = await confirmDeleteDialog({ gone: isGone, verifyIdentity: explicitJobId ? sameRow : undefined })
     if (!confirmed) diag('CHAT', `${label}：未点到确认按钮，继续校验实际结果`)
     for (let i = 0; i < 6; i++) {
       if (isGone()) {
@@ -557,7 +563,7 @@ async function deleteThreadImpl(
     if (!sameRow()) return 'failed'
     realClick(del)
     await delay(300, 450)
-    const confirmed = await confirmDeleteDialog({ gone: isGone })
+    const confirmed = await confirmDeleteDialog({ gone: isGone, verifyIdentity: explicitJobId ? sameRow : undefined })
     if (!confirmed) {
       // 可能 BOSS 已改为无需确认，交给后续校验判定
       diag('CHAT', 'deleteThread 未点到确认按钮，继续校验实际结果')
@@ -610,7 +616,7 @@ export function threadRowMatchesText(
   return norm(`${t.company || ''}${t.jobTitle || ''}${t.name || ''}`).includes(wantJob)
 }
 
-interface DeleteCandidate { row: ChatThread; pinned: ChatThreadTarget }
+interface DeleteCandidate { row: ChatThread; pinned: ChatThreadTarget; sourceKey?: string }
 function pinDeleteCandidate(row: ChatThread): DeleteCandidate { return { row, pinned: rowTarget(row) } }
 
 async function findThreadForDelete(
@@ -657,7 +663,7 @@ async function findThreadForDelete(
     const visible = listThreadsQuiet().filter(matchesSource)
     if (visible.length > 1) return 'ambiguous'
     const row = visible[0] || await locateRowByIndex(source.index)
-    return row && sourceStillMatches() && matchesSource(row) ? pinDeleteCandidate(row) : null
+    return row && sourceStillMatches() && matchesSource(row) ? { ...pinDeleteCandidate(row), sourceKey: pinnedSourceKey } : null
   }
   // An explicit identity is always mandatory; absence never falls back to text.
   return findThreadByScrolling(matchRow)
@@ -700,10 +706,10 @@ export async function deleteThread(
   afterDeleted?: (target: DeletedThreadTarget) => Promise<void>,
 ): Promise<'ok' | 'not-found' | 'failed'> {
   let target: DeletedThreadTarget = { company, jobTitle, ...identity }
-  const r = await deleteThreadImpl(company, jobTitle, identity, afterDeleted ? (actual) => { target = actual } : undefined)
+  const r = await deleteThreadImpl(company, jobTitle, identity, (actual) => { target = actual })
   if (r === 'ok') {
     if (afterDeleted) await afterDeleted(target)
-    else await afterConversationDeleted(company, jobTitle, 'manual', identity)
+    else await afterConversationDeleted(target.company, target.jobTitle, 'manual', target)
   }
   return r
 }
@@ -746,7 +752,7 @@ async function deleteViaHeaderMenu(
   if (!clicked) return false
 
   await delay(300, 450)
-  const confirmed = await confirmDeleteDialog({ gone: isGone })
+  const confirmed = await confirmDeleteDialog({ gone: isGone, verifyIdentity: verify })
   if (!confirmed) diag('CHAT', '头部菜单删除：未点到确认按钮，继续校验实际结果')
 
   for (let i = 0; i < 10; i++) {
@@ -875,15 +881,55 @@ export function openThread(company: string, jobTitle = ''): 'ok' | 'not-found' |
 }
 
 /** Tool calls must observe the intended header before a subsequent send is allowed. */
-export async function openThreadConfirmed(company: string, jobTitle = ''): Promise<'ok' | 'not-found' | 'ambiguous' | 'failed' | 'thread_not_confirmed'> {
-  if (installedChatDriver()) return openChatThread(company, jobTitle)
+export async function openThreadConfirmed(company: string, jobTitle = '', jobId = ''): Promise<'ok' | 'not-found' | 'ambiguous' | 'failed' | 'thread_not_confirmed'> {
+  if (installedChatDriver()) return jobId.trim() ? 'thread_not_confirmed' : openChatThread(company, jobTitle)
   assertChatExecutionActive()
+  if (jobId.trim()) {
+    const candidate = await findThreadForDelete(company, jobTitle, { encryptJobId: jobId.trim() })
+    if (candidate === 'ambiguous') return candidate
+    if (!candidate) return 'not-found'
+    return confirmThreadRow(candidate.row, company, jobTitle, () => explicitThreadIdentityValid(candidate, company))
+  }
   // Resolve uniqueness even when a matching header is already open: company alone cannot identify an HR.
   let target: ReturnType<typeof findUnknownJobThread> = findThreadToOpen(company, jobTitle)
   const unknownJob = target === 'not-found' && !!jobTitle.trim()
   if (unknownJob) target = findUnknownJobThread(company)
   if (typeof target === 'string') return target
   return confirmThreadRow(target, company, jobTitle)
+}
+
+/** A text-only header cannot distinguish two IDs belonging to the same company/HR. */
+function explicitThreadIdentityValid(candidate: DeleteCandidate, company: string): boolean {
+  assertChatExecutionActive()
+  const { row, pinned } = candidate
+  const wantedCompany = confirmationCompany(company)
+  if (!wantedCompany || !pinned.jobId || !pinned.name || !confirmationCompany(pinned.company).includes(wantedCompany)) return false
+  const live = listThreadsQuiet()
+  const sameId = live.filter(thread => readRowJobInfo(thread.el).jobId === pinned.jobId)
+  if (sameId.length !== 1 || sameId[0].el !== row.el) return false
+  const actual = rowTarget(sameId[0])
+  if (actual.key !== pinned.key || actual.jobId !== pinned.jobId ||
+      confirmationCompany(actual.company) !== confirmationCompany(pinned.company) ||
+      identityText(actual.name) !== identityText(pinned.name) || identityText(actual.jobTitle) !== identityText(pinned.jobTitle)) return false
+  const samePerson = (brand: string, name: string) => confirmationCompany(brand) === confirmationCompany(pinned.company) &&
+    (!name || identityText(name) === identityText(pinned.name))
+  if (live.some(thread => thread.el !== row.el && (() => {
+    const info = readRowJobInfo(thread.el)
+    return samePerson(info.brandName || thread.company, info.hrName || thread.name)
+  })())) return false
+  const sources = readChatSources()
+  if (!sources && candidate.sourceKey) return false
+  if (sources) {
+    const identified = sources.filter(({ boss }) => String(boss.encryptJobId || boss.jobId || '') === pinned.jobId)
+    if (identified.length !== 1) return false
+    const boss = identified[0].boss
+    if (candidate.sourceKey && sourceKey(boss) !== candidate.sourceKey) return false
+    if (confirmationCompany(String(boss.brandName || boss.company || '')) !== confirmationCompany(pinned.company) ||
+        identityText(String(boss.name || boss.bossName || '')) !== identityText(pinned.name)) return false
+    if (sources.some(item => item !== identified[0] && samePerson(String(item.boss.brandName || item.boss.company || ''),
+      String(item.boss.name || item.boss.bossName || '')))) return false
+  }
+  return true
 }
 
 function threadHeaderIdentity(target: ChatThread, company: string, jobTitle: string) {
@@ -901,10 +947,10 @@ function threadHeaderMatches(expected: ReturnType<typeof threadHeaderIdentity>):
     confirmationCompany(header.company) === expected.company && identityText(header.hrName) === expected.hrName && identityText(header.jobTitle) === expected.jobTitle
 }
 
-async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
+async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle, verifyIdentity: () => boolean = () => true): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
   const expected = threadHeaderIdentity(target, company, jobTitle)
   // Missing identity is not evidence that the current conversation is the requested one.
-  if (!expected.company || !expected.hrName || !expected.jobTitle) return 'thread_not_confirmed'
+  if (!expected.company || !expected.hrName || !expected.jobTitle || !verifyIdentity()) return 'thread_not_confirmed'
   const confirmed = () => threadHeaderMatches(expected)
   if (confirmed()) return 'ok'
   const activated = activateThread(target)
@@ -912,6 +958,7 @@ async function confirmThreadRow(target: ChatThread, company = target.company, jo
   if (activated !== 'ok') return activated
   for (let attempt = 0; attempt <= 15; attempt++) {
     assertChatExecutionActive()
+    if (!verifyIdentity()) return 'thread_not_confirmed'
     if (confirmed()) return 'ok'
     if (attempt < 15) await delay(200, 200)
   }

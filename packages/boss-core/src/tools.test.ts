@@ -103,6 +103,10 @@ describe('chain tools', () => {
       release()
       expect((await result).ok).toBe(true)
     }
+    for (const name of ['open_thread', 'read_thread_header', 'delete_thread']) {
+      expect(await callTool(name, { company: 'A', jobTitle: 'B', jobId: 'stable-job' })).toEqual({ ok: false, error: 'thread_identity_not_supported' })
+      expect(await callTool(name, { company: 'A', jobId: true })).toEqual({ ok: false, error: 'invalid_arguments' })
+    }
     vi.mocked(openThreadConfirmed).mockResolvedValueOnce('ambiguous')
     expect(await callTool('read_thread_header', { company: 'A', jobTitle: 'B' })).toEqual({ ok: false, error: 'ambiguous' })
     vi.mocked(openThreadConfirmed).mockResolvedValueOnce('thread_not_confirmed')
@@ -274,11 +278,18 @@ describe('MV3 page boundary', () => {
       ['apply_job', { jobId: 'j1', resumeId: 0 }, 'invalid_arguments'],
       ['apply_job', { jobId: 'j1', resumeId: 1.5 }, 'invalid_arguments'],
       ['open_search', { keyword: '开发', page: 1.1 }, 'invalid_arguments'],
+      ['open_thread', { company: 'A', jobId: true }, 'invalid_arguments'],
+      ['read_thread_header', { company: 'A', jobId: 'a'.repeat(513) }, 'invalid_arguments'],
+      ['delete_thread', { company: 'A', jobId: null }, 'invalid_arguments'],
       ['scan_jobs', { offset: -1 }, 'invalid_arguments'],
       ['scan_jobs', { limit: 0 }, 'invalid_arguments'],
       ['reload_page', { force: 'false' }, 'invalid_arguments'],
     ] as const) {
       expect(validateToolArgs(name, args)).toEqual({ ok: false, error })
+    }
+    for (const name of ['open_thread', 'read_thread_header', 'delete_thread']) {
+      expect(validateToolArgs(name, { company: 'A', jobTitle: 'B', jobId: 'stable-job' })).toEqual({ ok: true })
+      expect(validateToolArgs(name, { company: 'A' })).toEqual({ ok: true })
     }
     expect(validateToolArgs('scan_jobs', { withDetail: true, offset: 10, limit: 5 })).toEqual({ ok: true })
     expect(validateToolArgs('apply_job', { jobId: 'j1' })).toEqual({ ok: true })
@@ -340,14 +351,23 @@ describe('MV3 page boundary', () => {
       expect(navigation.effects).toEqual([{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/jobs?query=%E5%AE%A2%E6%9C%8D&page=2' }])
       expect(location.assign).not.toHaveBeenCalled()
       expect(location.reload).not.toHaveBeenCalled()
-      const { deleteThread } = await import('./platforms/boss-chat')
+      const { deleteThread, onChatPage } = await import('./platforms/boss-chat')
+      vi.mocked(onChatPage).mockReturnValueOnce(false)
+      expect(await page.run({ commandKey: 'thread-navigation', name: 'open_thread', args: { company: 'A', jobTitle: 'B', jobId: 'stable-job' } })).toMatchObject({
+        result: { ok: true, data: 'navigating' }, effects: [{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/chat', pendingThread: { company: 'A', jobTitle: 'B', jobId: 'stable-job' } }],
+      })
+      for (const name of ['open_thread', 'read_thread_header']) {
+        expect((await page.run({ commandKey: `stable:${name}`, name, args: { company: 'A', jobTitle: 'B', jobId: 'stable-job' } })).result.ok).toBe(true)
+        expect(openThreadConfirmed).toHaveBeenLastCalledWith('A', 'B', 'stable-job')
+      }
       vi.mocked(deleteThread).mockImplementationOnce(async (_company, _jobTitle, _identity, afterDeleted) => {
         await afterDeleted?.({ company: 'A', jobTitle: '开发', encryptJobId: 'actual-job-id', bossId: 'actual-boss-id' })
         return 'ok'
       })
-      expect(await page.run({ commandKey: 'delete', name: 'delete_thread', args: { company: 'A' } })).toMatchObject({
+      expect(await page.run({ commandKey: 'delete', name: 'delete_thread', args: { company: 'A', jobId: 'actual-job-id' } })).toMatchObject({
         effects: [{ kind: 'conversation_deleted', payload: { company: 'A', job_title: '开发', encrypt_job_id: 'actual-job-id' } }],
       })
+      expect(deleteThread).toHaveBeenLastCalledWith('A', '', { encryptJobId: 'actual-job-id' }, expect.any(Function))
       const epoch = page.lifecycleEpoch()
       vi.mocked(sendMessageText).mockImplementationOnce(async () => { document.dispatchEvent(new Event('freeze')); return true })
       expect(await page.run({ commandKey: 'cancelled', name: 'send_message', args: { text: '你好' } })).toEqual({ result: { ok: false, error: 'reconciliation_required' } })

@@ -62,6 +62,11 @@ export async function callTool(name: string, args: Record<string, unknown> = {})
     diag('TOOL', `tool name=${name} status=error error=unknown_tool`)
     return { ok: false, error: 'unknown_tool' }
   }
+  // Legacy pending-open/UI storage has no stable job identity; never silently drop it.
+  if (['open_thread', 'read_thread_header', 'delete_thread'].includes(name) && args.jobId !== undefined) {
+    if (typeof args.jobId !== 'string' || args.jobId.length > 512) return { ok: false, error: 'invalid_arguments' }
+    if (args.jobId.trim()) return { ok: false, error: 'thread_identity_not_supported' }
+  }
   const started = Date.now()
   try {
     // An awaited page action may outlive an account/resume change in the panel.

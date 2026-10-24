@@ -5,7 +5,7 @@ type Schema = { type?: string | string[]; properties?: Record<string, Schema>; r
 const string = (maxLength = 512): Schema => ({ type: 'string', maxLength })
 const boolean: Schema = { type: 'boolean' }
 const resume = { resumeName: string(), resumeIndex: { type: ['integer', 'null'], minimum: 0, maximum: 99 } as Schema }
-const thread = { company: string(), jobTitle: string(), job_title: string() }
+const thread = { company: string(), jobTitle: string(), job_title: string(), jobId: string() }
 const object = (properties: Record<string, Schema> = {}, required: string[] = []): Schema => ({ type: 'object', properties, required, additionalProperties: false })
 const parameterSchemas: Record<string, Schema> = {
   open_search: object({ keyword: string(), cityCode: string(32), page: { type: 'integer', minimum: 1, maximum: 10000 } }, ['keyword']),
@@ -28,11 +28,11 @@ export const TOOL_CATALOG: ToolDeclaration[] = [
   { name: 'list_threads', description: '列出左侧会话（HR 名/公司/未读；岗位名与薪资列表行没有，需 read_thread_header）', irreversible: false, parameters: parameterSchemas.list_threads || object() },
   { name: 'read_messages', description: '读当前打开会话的消息（区分 hr/me/system，卡片带类型）', irreversible: false, parameters: parameterSchemas.read_messages || object() },
   { name: 'list_pending_cards', description: '列出当前会话里待处理的交互卡片类型（不点击）', irreversible: false, parameters: parameterSchemas.list_pending_cards || object() },
-  { name: 'open_thread', description: '打开指定会话（公司名必填，岗位名可选）；不在聊天页时先跳转聊天页', irreversible: false, parameters: parameterSchemas.open_thread || object() },
+  { name: 'open_thread', description: '打开指定会话（company 必填；jobId 可选，取 list_threads 同字段；仍核对头部岗位）；不在聊天页时先跳转', irreversible: false, parameters: parameterSchemas.open_thread || object() },
   { name: 'click_card', description: '点一张待处理卡片的同意/拒绝（kind=resume_request|location_confirm|contact_exchange，accept=bool；同意索要简历时会走完发简历流程）', irreversible: true, parameters: parameterSchemas.click_card || object() },
   { name: 'send_message', description: '给当前会话发一条文本（不可撤回）', irreversible: true, parameters: parameterSchemas.send_message || object() },
   { name: 'send_resume', description: '给当前会话发附件简历（resumeName 可选；不可撤回）', irreversible: true, parameters: parameterSchemas.send_resume || object() },
-  { name: 'delete_thread', description: '删除指定会话（company 必填；不可撤回）', irreversible: true, parameters: parameterSchemas.delete_thread || object() },
+  { name: 'delete_thread', description: '删除指定会话（company 必填；jobId 可选，取 list_threads 同字段并核对头部岗位；不可撤回）', irreversible: true, parameters: parameterSchemas.delete_thread || object() },
   { name: 'scan_jobs', description: '扫描当前职位列表页。offset 从 0 起，limit=1..100；withDetail=true 时默认且最多 10 条，返回有效 limit 和 total/hasMore/nextOffset，用 nextOffset 继续读取。无明细且未传 limit 时保留整页列表。', irreversible: false, parameters: parameterSchemas.scan_jobs || object() },
   { name: 'read_filters', description: '读取搜索页筛选条件（分组 + 可选值 + 当前选中）', irreversible: false, parameters: parameterSchemas.read_filters || object() },
   { name: 'select_filters', description: '按「分组 → 选项」点选筛选项（如 工作经验=3-5年），可传多个', irreversible: true, parameters: parameterSchemas.select_filters || object() },
@@ -43,7 +43,7 @@ export const TOOL_CATALOG: ToolDeclaration[] = [
   { name: 'probe_overlays', description: '读当前可见浮层/弹窗结构（标签链、尺寸、文本长度、是否有 iframe），用于适配选择器', irreversible: false, parameters: parameterSchemas.probe_overlays || object() },
   { name: 'probe_dom', description: '读指定选择器的 DOM 结构（标签/class/role/按钮文案与禁用态/文本长度），用于适配选择器', irreversible: false, parameters: parameterSchemas.probe_dom || object() },
   { name: 'probe_row', description: '读某一会话行的组件数据结构（键名与短字符串值），用于适配岗位名/薪资字段', irreversible: false, parameters: parameterSchemas.probe_row || object() },
-  { name: 'read_thread_header', description: '读某一会话的头部信息（HR 名/公司/岗位名/薪资/城市）；不在该会话时会先打开', irreversible: false, parameters: parameterSchemas.read_thread_header || object() },
+  { name: 'read_thread_header', description: '读指定会话头部（company 必填；jobId 可选，取 list_threads 同字段；仍核对请求岗位）；未打开时先切换', irreversible: false, parameters: parameterSchemas.read_thread_header || object() },
   { name: 'reload_page', description: '刷新当前页面；执行结果持久化后才刷新', irreversible: false, parameters: parameterSchemas.reload_page || object() },
   { name: 'list_tools', description: '列出当前可用工具及其参数', irreversible: false, parameters: parameterSchemas.list_tools || object() },
  ]

@@ -22,7 +22,7 @@ export interface ToolRuntime {
   detectPlatform(): BasePlatform | null
   getGreeting(platform: PlatformCode, job: JobCard): Promise<string>
   recordApplication(platform: PlatformCode, job: JobCard, matchScore: number, outcome: ApplyOutcome, error: string, greetingSent: boolean, runId: string, keyword: string): Promise<unknown>
-  navigate(url: string, pendingThread?: { company: string; jobTitle: string }): void | Promise<void>
+  navigate(url: string, pendingThread?: { company: string; jobTitle: string; jobId?: string }): void | Promise<void>
   reload(): void
   isRunning(): boolean
   afterDeleted?(target: DeletedThreadTarget): Promise<void>
@@ -106,18 +106,20 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'open_thread',
-      description: '打开指定会话（公司名必填，岗位名可选）；不在聊天页时先跳转聊天页',
-      exampleArgs: { company: '', jobTitle: '' },
+      description: '打开指定会话（company 必填；jobId 可选，取 list_threads 同字段；仍核对头部岗位）；不在聊天页时先跳转',
+      exampleArgs: { company: '', jobTitle: '', jobId: '' },
       async run(args) {
+        if (args.jobId !== undefined && (typeof args.jobId !== 'string' || args.jobId.length > 512)) return { ok: false, error: 'invalid_arguments' }
+        const jobId = toolString(args, 'jobId')
         const company = toolString(args, 'company')
         if (!company) return { ok: false, error: 'company_required' }
         const jobTitle = toolString(args, 'jobTitle') || toolString(args, 'job_title')
         if (!onChatPage()) {
           // Runtime persists the target before navigating; each packaging format resumes it after loading.
-          await runtime.navigate('https://www.zhipin.com/web/geek/chat', { company, jobTitle })
+          await runtime.navigate('https://www.zhipin.com/web/geek/chat', { company, jobTitle, ...(jobId ? { jobId } : {}) })
           return { ok: true, data: 'navigating' }
         }
-        const r = await openThreadConfirmed(company, jobTitle)
+        const r = await openThreadConfirmed(company, jobTitle, ...(jobId ? [jobId] as const : []))
         return { ok: r === 'ok', data: r, error: r === 'ok' ? undefined : r }
       },
     },
@@ -175,14 +177,16 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'delete_thread',
-      description: '删除指定会话（company 必填；不可撤回）',
+      description: '删除指定会话（company 必填；jobId 可选，取 list_threads 同字段并核对头部岗位；不可撤回）',
       irreversible: true,
-      exampleArgs: { company: '', jobTitle: '' },
+      exampleArgs: { company: '', jobTitle: '', jobId: '' },
       async run(args) {
+        if (args.jobId !== undefined && (typeof args.jobId !== 'string' || args.jobId.length > 512)) return { ok: false, error: 'invalid_arguments' }
+        const jobId = toolString(args, 'jobId')
         if (needChatPage()) return needChatPage()!
         const company = toolString(args, 'company')
         if (!company) return { ok: false, error: 'company_required' }
-        const r = await deleteThread(company, toolString(args, 'jobTitle') || toolString(args, 'job_title'), undefined, runtime.afterDeleted)
+        const r = await deleteThread(company, toolString(args, 'jobTitle') || toolString(args, 'job_title'), jobId ? { encryptJobId: jobId } : undefined, runtime.afterDeleted)
         return { ok: r === 'ok', data: r, error: r === 'ok' ? undefined : r }
       },
     },
@@ -469,14 +473,16 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'read_thread_header',
-      description: '读某一会话的头部信息（HR 名/公司/岗位名/薪资/城市）；不在该会话时会先打开',
-      exampleArgs: { company: '', jobTitle: '' },
+      description: '读指定会话头部（company 必填；jobId 可选，取 list_threads 同字段；仍核对请求岗位）；未打开时先切换',
+      exampleArgs: { company: '', jobTitle: '', jobId: '' },
       async run(args) {
+        if (args.jobId !== undefined && (typeof args.jobId !== 'string' || args.jobId.length > 512)) return { ok: false, error: 'invalid_arguments' }
+        const jobId = toolString(args, 'jobId')
         if (needChatPage()) return needChatPage()!
         const company = toolString(args, 'company')
         if (!company) return { ok: false, error: 'company_required' }
         const jobTitle = toolString(args, 'jobTitle') || toolString(args, 'job_title')
-        const r = await openThreadConfirmed(company, jobTitle)
+        const r = await openThreadConfirmed(company, jobTitle, ...(jobId ? [jobId] as const : []))
         if (r !== 'ok') return { ok: false, error: r }
         const info = currentThreadInfo()
         return { ok: !!info.company || !!info.jobTitle, data: info, error: info.jobTitle ? undefined : 'header_incomplete' }
