@@ -30,7 +30,7 @@ import { openThreadConfirmed, sendMessageText } from './platforms/boss-chat'
 import { detectPlatform } from './platforms/factory'
 import { fetchGreeting, recordApplication } from './api'
 import { loadConfig } from './config'
-import type { ApplyContext } from './platforms/base'
+import type { ApplyContext, ApplyResult } from './platforms/base'
 import { BossPlatform } from './platforms/boss'
 import { createPageTools } from '../../../apps/boss-agent/src/page-tools'
 import { TOOL_CATALOG, validateToolArgs } from '../../../apps/boss-agent/src/tools-contract'
@@ -127,7 +127,7 @@ describe('apply_job', () => {
       // Account changes while the browser is awaiting BOSS must not reattribute this call.
       vi.mocked(loadConfig).mockReturnValue(newConfig as never)
       await context?.getGreeting?.()
-      return { outcome: 'applied', message: '', greetingSent: true, alreadyApplied: false }
+      return { outcome: 'applied', message: '已建立会话，BOSS 已发送默认招呼语', greetingSent: true, greetingSource: 'platform_default', customGreetingSent: false, alreadyApplied: false }
     })
     vi.mocked(detectPlatform).mockReturnValue({
       code: 'zhipin',
@@ -138,6 +138,7 @@ describe('apply_job', () => {
     try {
       const r = await callTool('apply_job', { jobId: 'j1' })
       expect(r.ok).toBe(true)
+      expect(r.data).toMatchObject({ message: '已建立会话，BOSS 已发送默认招呼语', greetingSent: true, greetingSource: 'platform_default', customGreetingSent: false })
       expect(applyJob).toHaveBeenCalledTimes(1)
       expect(vi.mocked(fetchGreeting)).toHaveBeenCalledWith(originalConfig, 'zhipin', card)
       expect(vi.mocked(recordApplication)).toHaveBeenCalledTimes(1)
@@ -274,7 +275,7 @@ describe('MV3 page boundary', () => {
   it('returns durable effects, deduplicates document commands and preserves cancellation uncertainty', async () => {
     const location = { protocol: 'https:', hostname: 'www.zhipin.com', href: 'https://www.zhipin.com/web/geek/jobs', pathname: '/web/geek/jobs', search: '?query=开发', assign: vi.fn(), reload: vi.fn() }
     vi.stubGlobal('location', location)
-    const applyJob = vi.fn(async () => ({ outcome: 'applied', greetingSent: true }))
+    const applyJob = vi.fn(async (): Promise<boolean | ApplyResult> => ({ outcome: 'applied', greetingSent: true }))
     const scanJobs = vi.fn(async () => [{ platformJobId: 'j1', title: '开发', company: 'A', salary: '10-20K', city: '上海', description: '职责' }])
     vi.mocked(BossPlatform).mockImplementation(function () { return { code: 'zhipin', applyJob, scanJobs } as never })
     try {
@@ -283,10 +284,23 @@ describe('MV3 page boundary', () => {
       const invocation = { commandKey: 'boss:123', name: 'apply_job', args: { jobId: 'j1' }, context: { greeting: '你好' } }
       expect(await page.prepare(invocation)).toMatchObject({ ok: true, data: { job: { platformJobId: 'j1', salary: '10-20K', city: '上海' } } })
       const result = await page.run(invocation)
-      expect(result).toMatchObject({ result: { ok: true }, effects: [{ kind: 'application', payload: { platform: 'zhipin', platform_job_id: 'j1', outcome: 'applied', greeting_sent: true } }] })
+      expect(result).toMatchObject({ result: { ok: true, data: { message: '', greetingSent: true, greetingSource: 'unknown', customGreetingSent: false } }, effects: [{ kind: 'application', payload: { platform: 'zhipin', platform_job_id: 'j1', outcome: 'applied', greeting_sent: true } }] })
       expect(await page.run(invocation)).toEqual(result)
       expect(applyJob).toHaveBeenCalledTimes(1)
       expect(await page.run({ ...invocation, args: { jobId: 'other' } })).toEqual({ result: { ok: false, error: 'command_key_conflict' } })
+      for (const [key, raw, expected] of [
+        ['agent', { outcome: 'applied', message: '已发起沟通并发送招呼语', greetingSent: true, greetingSource: 'agent', customGreetingSent: true }, { message: '已发起沟通并发送招呼语', greetingSent: true, greetingSource: 'agent', customGreetingSent: true }],
+        ['legacy-boolean', true, { message: '', greetingSent: false, greetingSource: 'unknown', customGreetingSent: false }],
+      ] as const) {
+        applyJob.mockResolvedValueOnce(raw)
+        const request = { ...invocation, commandKey: `greeting:${key}` }
+        const response = await page.run(request)
+        expect(response.result).toMatchObject({ ok: true, data: expected })
+        expect(await page.run(request)).toEqual(response)
+        expect(response.effects?.[0]).not.toHaveProperty('payload.greetingSource')
+        expect(response.effects?.[0]).not.toHaveProperty('payload.customGreetingSent')
+      }
+      expect(applyJob).toHaveBeenCalledTimes(3)
       const navigation = await page.run({ commandKey: 'navigate', name: 'open_search', args: { keyword: '客服', page: 2 } })
       expect(navigation.effects).toEqual([{ kind: 'navigate', url: 'https://www.zhipin.com/web/geek/jobs?query=%E5%AE%A2%E6%9C%8D&page=2' }])
       expect(location.assign).not.toHaveBeenCalled()

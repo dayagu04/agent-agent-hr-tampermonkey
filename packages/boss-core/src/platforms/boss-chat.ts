@@ -2518,7 +2518,7 @@ function myBubbles(): HTMLElement[] {
 }
 
 /** 当前会话里我方气泡数量（发送前后对比，判断是否出现了这次的新气泡） */
-function countMyBubbles(): number {
+export function countMyBubbles(): number {
   return myBubbles().length
 }
 
@@ -2545,14 +2545,20 @@ export function readDeliveryState(bubble: Element): DeliveryState {
  *   failed         — BOSS 标了发送失败
  *   none           — 没出现新气泡（确定没发出去）
  */
-async function waitForDelivery(baseline: number, content: string, timeoutMs = 8000): Promise<DeliveryState> {
-  const needle = content.replace(/\s+/g, '').slice(0, 12)
+export async function waitForDelivery(baseline: number, content: string, timeoutMs = 8000, options: { exactContent?: boolean } = {}): Promise<DeliveryState> {
+  const normalized = content.replace(/\s+/g, '')
+  const needle = normalized.slice(0, 12)
   // 这次的新气泡：排在 baseline 之后、且文本吻合的那一条（防止 HR 同时发消息干扰）
   const pick = (): HTMLElement | null => {
     const fresh = myBubbles().slice(baseline)
     for (let i = fresh.length - 1; i >= 0; i--) {
-      const t = (fresh[i].textContent || '').replace(/\s+/g, '')
-      if (!needle || t.includes(needle)) return fresh[i]
+      if (options.exactContent) {
+        const body = text(firstMatch(SEL.msgText, fresh[i])).replace(/\s+/g, '')
+        if (body && body === normalized) return fresh[i]
+      } else {
+        const t = (fresh[i].textContent || '').replace(/\s+/g, '')
+        if (!needle || t.includes(needle)) return fresh[i]
+      }
     }
     return null
   }

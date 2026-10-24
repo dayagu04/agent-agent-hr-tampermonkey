@@ -9,6 +9,7 @@
 import { BasePlatform, type ApplyContext, type ApplyResult } from './base'
 import type { JobCard, PlatformCode } from '../types'
 import { diag } from '../logger'
+import { countMyBubbles, waitForDelivery } from './boss-chat'
 
 /** 薪资格式（数据层明文，如 8-12K / 1.5-2万 / 14-28K·14薪） */
 const SALARY_RE = /^\d+(?:\.\d+)?\s*[-~]\s*\d+(?:\.\d+)?\s*[Kk万](?:·\d+\s*薪)?/
@@ -318,7 +319,7 @@ export class BossPlatform extends BasePlatform {
         path: location.pathname,
         detailCandidateCount: this.sampleDetailTexts().length,
       })
-      return { outcome: 'failed', message: '未找到「立即沟通」按钮（详情未加载或已下线）' }
+      return { outcome: 'failed', message: '未找到「立即沟通」按钮（详情未加载或已下线）', greetingSource: 'unknown', customGreetingSent: false }
     }
 
     // 已沟通过的岗位按钮文本是「继续沟通」，跳过避免重复骚扰 HR
@@ -328,6 +329,8 @@ export class BossPlatform extends BasePlatform {
         outcome: 'unknown',
         message: '该岗位已沟通过（继续沟通态）',
         alreadyApplied: true,
+        greetingSource: 'unknown',
+        customGreetingSent: false,
       }
     }
 
@@ -345,6 +348,8 @@ export class BossPlatform extends BasePlatform {
         outcome: 'applied',
         message: '已建立会话，BOSS 已发送默认招呼语',
         greetingSent: true,
+        greetingSource: 'platform_default',
+        customGreetingSent: false,
       }
     }
 
@@ -359,7 +364,7 @@ export class BossPlatform extends BasePlatform {
     // 可能被风控页拦截，或按钮点击未生效
       if (/_security_check|security-check/.test(location.href)) {
         diag('BOSS', '触发风控验证页', { path: location.pathname })
-        return { outcome: 'failed', message: '触发风控验证页，请手动完成验证后重试' }
+        return { outcome: 'failed', message: '触发风控验证页，请手动完成验证后重试', greetingSource: 'unknown', customGreetingSent: false }
       }
 
     // 联动页点「立即沟通」通常不弹聊天框：会话已建立（消息角标 +1），
@@ -372,6 +377,8 @@ export class BossPlatform extends BasePlatform {
         outcome: 'unknown',
         message: '已点「立即沟通」但未见聊天框；请到消息页核对并手动发送招呼语',
         greetingSent: false,
+        greetingSource: 'unknown',
+        customGreetingSent: false,
       }
     }
 
@@ -393,6 +400,7 @@ export class BossPlatform extends BasePlatform {
         await this.delay(600, 1200)
 
         // 回车发送；部分版本需点「发送」按钮
+        const baseline = countMyBubbles()
         input.dispatchEvent(
           new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }),
         )
@@ -406,9 +414,9 @@ export class BossPlatform extends BasePlatform {
           await this.delay(600, 1200)
         }
 
-        // 校验：招呼语是否出现在聊天记录里
-        const body = document.body.textContent || ''
-        greetingSent = body.includes(greeting.slice(0, 10))
+        // 只认本次新增、正文完整匹配的我方消息；草稿和历史同文消息不是发送证据。
+        const delivery = await waitForDelivery(baseline, greeting, 8000, { exactContent: true })
+        greetingSent = delivery === 'delivered' || delivery === 'read' || delivery === 'sending'
         diag('BOSS', `招呼语${greetingSent ? '已上屏' : '未确认'}`, {
           greetingLength: greeting.length,
         })
@@ -422,6 +430,8 @@ export class BossPlatform extends BasePlatform {
       outcome: 'applied',
       message: greetingSent ? '已发起沟通并发送招呼语' : '已发起沟通（招呼语未确认）',
       greetingSent,
+      greetingSource: greetingSent ? 'agent' : 'unknown',
+      customGreetingSent: greetingSent,
     }
   }
 

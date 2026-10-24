@@ -8,6 +8,10 @@ export interface ApplyResult {
   message?: string
   /** 是否已发送打招呼语（BOSS 沟通场景） */
   greetingSent?: boolean
+  /** 已确认招呼语的来源；旧适配器未提供时按 unknown 处理。 */
+  greetingSource?: 'unknown' | 'platform_default' | 'agent'
+  /** 是否确认本次指定文案已发出；缺省 false，不从 greetingSent 推断。 */
+  customGreetingSent?: boolean
   /**
    * 该岗位此前已沟通过（如 BOSS「继续沟通」态）——不是本次投递失败，
    * 应计为跳过而非 failed；同时后端应补记真实投递记录便于跨轮去重。

@@ -335,7 +335,7 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
           getGreeting: () => runtime.getGreeting(platform.code, card),
         })
         const res = typeof raw === 'boolean'
-          ? { outcome: (raw ? 'applied' : 'failed') as ApplyOutcome, message: '', greetingSent: false, alreadyApplied: false }
+          ? { outcome: (raw ? 'applied' : 'failed') as ApplyOutcome, message: '', greetingSent: false, greetingSource: 'unknown' as const, customGreetingSent: false, alreadyApplied: false }
           : raw
         const outcome = (res.alreadyApplied ? 'applied' : res.outcome) as ApplyOutcome
         try {
@@ -348,7 +348,11 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
         }
         return {
           ok: outcome !== 'failed',
-          data: { jobId, outcome, messageLength: (res.message || '').length, greetingSent: !!res.greetingSent },
+          data: {
+            jobId, outcome, message: res.message || '', messageLength: (res.message || '').length,
+            greetingSent: !!res.greetingSent, greetingSource: res.greetingSource || 'unknown',
+            customGreetingSent: res.greetingSource === 'agent' && !!res.greetingSent && res.customGreetingSent === true,
+          },
           error: outcome === 'failed' ? 'apply_failed' : undefined,
         }
       },
