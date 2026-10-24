@@ -10,10 +10,12 @@ let writes: Promise<void> = Promise.resolve()
 let port: chrome.runtime.Port | null = null
 let initialized = false
 let retired = false
+let pageGeneration = 0
 
 export function nativePageContext(): NativePageContext { return context }
 export async function nativeSend<T>(type: string, payload: Record<string, unknown> = {}): Promise<T> {
   if (retired) throw new Error('session_changed')
+  if (type === 'boss.panel.cancel') pageGeneration += 1
   const captured = account
   const result = await rawSend<T>(type, payload, captured)
   if (retired || captured !== account) throw new Error('session_changed')
@@ -25,11 +27,15 @@ async function rawSend<T>(type: string, payload: Record<string, unknown>, scope:
   return result as T
 }
 export async function nativePageCall<T>(operation: string, args: Record<string, unknown> = {}, stableKey?: string): Promise<T> {
+  const generation = pageGeneration
   await writes
+  if (generation !== pageGeneration) throw new Error('execution_cancelled')
   return nativeSend<T>('boss.panel.page', { operation, args, stableKey: stableKey || `manual:${crypto.randomUUID()}` })
 }
 export async function nativePageNavigate(url: string): Promise<void> {
+  const generation = pageGeneration
   await writes
+  if (generation !== pageGeneration) throw new Error('execution_cancelled')
   await nativeSend('boss.panel.navigate', { url })
 }
 async function requestPermission(apiBase: string): Promise<void> {
@@ -104,12 +110,16 @@ export async function initializeNativeHost(): Promise<void> {
       }).catch(surfaceError)
     }
     if (message.type === 'suspend') {
+      pageGeneration += 1
       void import('../../../packages/boss-core/src/orchestrator').then(async module => {
         const { loadConfig } = await import('../../../packages/boss-core/src/config')
         await module.getOrchestrator(loadConfig()).pause(String(message.reason || '执行端已暂停'))
       }).catch(surfaceError)
     }
     if (message.type === 'command') {
+      const command = message.command as { action?: string; payload?: { action?: string } }
+      if (['orchestrator.stop', 'orchestrator.pause'].includes(command?.action || '') ||
+          (command?.action === 'orchestrator.action' && ['stop', 'pause'].includes(command.payload?.action || ''))) pageGeneration += 1
       const scope = String(message.key)
       void (async () => {
         await writes

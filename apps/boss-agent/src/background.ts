@@ -1,5 +1,5 @@
 import { BossRuntime } from './runtime'
-import { BossHeartbeatScheduler } from './background-scheduler'
+import { attachExistingBossPages, BossHeartbeatScheduler } from './background-scheduler'
 
 const runtime = new BossRuntime({ chrome, fetch: globalThis.fetch.bind(globalThis) })
 const scheduler = new BossHeartbeatScheduler({ chrome, target: () => runtime.schedulerTarget() })
@@ -19,3 +19,6 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, reply) => {
 })
 
 chrome.runtime.onConnect.addListener(port => { void runtime.attachPanel(port) })
+
+// A live content owner only wakes its heartbeat; reload creates one replacement panel.
+void attachExistingBossPages(chrome).catch(() => undefined)

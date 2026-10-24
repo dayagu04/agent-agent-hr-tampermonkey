@@ -115,3 +115,11 @@ export class BossHeartbeatScheduler {
     ).catch(() => undefined)
   }
 }
+
+/** Static content scripts do not attach to already-open pages when the extension is reloaded. */
+export async function attachExistingBossPages(api: Pick<typeof chrome, 'tabs' | 'scripting'>): Promise<void> {
+  const tabs = await api.tabs.query({ url: 'https://www.zhipin.com/*' })
+  await Promise.allSettled(tabs.filter(tab => typeof tab.id === 'number' && !tab.discarded && !(tab as { frozen?: boolean }).frozen).map(tab =>
+    api.scripting.executeScript({ target: { tabId: tab.id!, frameIds: [0] }, world: 'ISOLATED', files: ['content.js'] }),
+  ))
+}
