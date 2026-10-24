@@ -1,6 +1,6 @@
 # AGENTS.md — 双扩展边界与 BOSS 工具规范
 
-本仓库管理两个独立扩展：`apps/boss-agent/` 把 BOSS 页面能力封装成标准工具供上游 Agent 调用，`apps/application-autofill/` 保留独立网申填写产品（详见 [README](./README.md)）。两个扩展分别维护 manifest、权限、登录、存储、版本、安装包和发布，不共享运行态。网申专属规则见其目录 AGENTS.md；原 `src/` userscript 保留兼容。
+本仓库管理两个独立扩展：`apps/boss-agent/` 把 BOSS 页面能力封装成标准工具供上游 Agent 调用，`apps/application-autofill/` 保留独立网申填写产品（详见 [README](./README.md)）。两个扩展分别维护 manifest、权限、登录、存储、版本、安装包和发布，不共享运行态。网申专属规则见其目录 AGENTS.md；`packages/boss-core/src/` 保留原完整功能，`legacy/userscript/src/` 隔离旧宿主兼容。
 本文件定义：工具是什么、怎么调、怎么新增、返回值怎么判、BOSS 页面的真实标记。
 新增任何面向 agent 的页面能力都按这里做，不另起一套。分支与发布见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
@@ -51,7 +51,7 @@ agent（服务端决策）
 
 ## 2. 工具定义（唯一模板）
 
-页面执行定义统一维护在 `src/tool-definitions.ts`，原 `src/tools.ts` 与 MV3 的 page-tools 通过不同运行环境适配。function-call 参数目录在 `apps/boss-agent/src/tools-contract.ts`。新增工具同步执行定义、参数 schema 与本文件，不维护两份分叉实现。字段示例：
+页面执行定义统一维护在 `packages/boss-core/src/tool-definitions.ts`，原 `packages/boss-core/src/tools.ts` 与 MV3 的 page-tools 通过不同运行环境适配。function-call 参数目录在 `apps/boss-agent/src/tools-contract.ts`。新增工具同步执行定义、参数 schema 与本文件，不维护两份分叉实现。字段示例：
 
 ```ts
 {
@@ -99,22 +99,22 @@ tool name=delete_thread status=error ms=120 error=not-found
 
 ## 5. 新增工具的做法（照抄即可）
 
-1. 页面动作写到 `src/platforms/<平台>.ts` 或专题模块（如 `search-filters.ts`），导出纯函数；
+1. 页面动作写到 `packages/boss-core/src/platforms/<平台>.ts` 或专题模块（如 `search-filters.ts`），导出纯函数；
 2. 在共享工具工厂及 MV3 参数目录加一项，按第 2 节模板填全字段；
 3. 先检索既有契约，默认测试净增0；将独立失败模式并入最低稳定层级，不按工具数量添加测试；
 4. 只跑修改模块的既有契约及命中类型检查；MV3 用 `npm run build:boss` 并重载扩展和页面，旧油猴的 `dev:serve` 不用于 MV3；
 5. `npm run tool -- <新工具> '<args>'` 在真实页面跑通，再在 §7/§8 补上验证记录，才算完成。
 
-## 6. 旧油猴面板内调试区（仅兼容历史安装）
+## 6. 原悬浮窗与面板内调试区
 
-MV3 只保留连接 popup，工具调试统一使用第0节 CLI。以下面板不进入新扩展，也不是本轮迁移的恢复目标。
+迁移必须保留原悬浮窗、投递控制、进度、会话和设置及使用方式。完整 UI 源码在共享 core，底层通过宿主适配器替换；popup 是扩展连接辅助入口，不能代替原面板。当前处于底层独立阶段，MV3 的完整面板和编排尚待接回，不得将构建成功写成功能迁移完成。
 
-- 入口：投递面板标题栏的 🧪 按钮（`src/TestTools.vue`，在面板内展开，不另开窗口）。
+- 入口：投递面板标题栏的 🧪 按钮（`packages/boss-core/src/TestTools.vue`，在面板内展开，不另开窗口）。
 - 打开后面板主体只显示测试工具，业务步骤暂时隐藏；点「关闭测试」回到正常投递流程。
 - 工具以两列卡片列出，选中后填 JSON 参数执行，结果就地显示。
 - 不可撤回工具需要点两次（第一次上膛，第二次执行）。
 - 结果同时写入 `logs/plugin/` 的 `[TOOL]` 行。
-- 只用于人工点按排查；验收以 §0 的命令行调用为准。不承载业务逻辑。
+- 保留原人工点按排查入口；功能接通后再用 §0 的命令行调用验收。不在调试 UI 内重复业务逻辑。
 
 ## 7. 现有工具（以此为准）
 

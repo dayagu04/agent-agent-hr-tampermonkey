@@ -13,7 +13,7 @@
 
 先安装 `npm ci` 和 `npm --prefix apps/application-autofill ci`。`npm run build` 生成两个独立目录，`npm run package` 生成分别可安装的 ZIP；版本源、权限、账号和运行状态不得合并。路径改动只验证受影响产品，公共构建/依赖改动验证两者。
 
-BOSS MV3 通过已有 API 提供原子工具，function-call 参数和未知终态处理见 README/AGENTS。首次安装需要扩展管理页加载目录；更新 background/content/manifest 后重载扩展与页面。不能使用旧 userscript 的 new Function/CDN 开发加载方式。
+BOSS 的完整 UI/业务位于 `packages/boss-core`，MV3 宿主位于 `apps/boss-agent`，GM 与开发加载器仅在 `legacy/userscript`。迁移保留原功能与使用方式。BOSS MV3 通过已有 API 提供原子工具，function-call 参数和未知终态处理见 README/AGENTS。首次安装需要扩展管理页加载目录；更新 background/content/manifest 后重载扩展与页面。不能使用旧 userscript 的 new Function/CDN 开发加载方式。
 
 ## 油猴兼容开发闭环
 
@@ -25,7 +25,7 @@ npm run dev:serve      # 后台常驻：源码改动自动重建，并给已安�
 **首次一次性**：在 Tampermonkey 里安装 `http://127.0.0.1:8017/agent-agent-hr-tampermonkey.user.js`
 （或拖入 `npm run build:local` 的产物），打开 BOSS 页面登录面板。之后：
 
-1. 改代码 → `npm run typecheck && npm test`；dev-serve 自动重建。
+1. 改代码 → 只运行所改模块的类型检查与必要既有契约；dev-serve 自动重建。
 2. `npm run tool -- reload_page` 刷新页面：已安装的脚本每次加载都会先拉 dev-serve 上的最新构建并由它接管
    （同一个脚本条目，登录与配置不丢）。用 `get_page_state` 或心跳里的 `version` 确认新版本已生效。
 3. `npm run tool -- <工具> '<args>'` 在真实页面验证，以工具返回值和 `logs/plugin/` 日志为证据。

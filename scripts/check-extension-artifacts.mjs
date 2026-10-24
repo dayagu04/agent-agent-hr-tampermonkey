@@ -73,6 +73,9 @@ export function checkFiles(name, files) {
     assert.ok(!/(^|\/)(node_modules|\.git)(\/|$)/.test(path), `${name}: unexpected source/dependencies ${path}`)
     if (!/\.(?:js|html)$/.test(path)) continue
     const source = bytes.toString()
+    if (name === 'boss-agent') {
+      assert.ok(!/\bGM_(?:getValue|setValue|deleteValue|listValues|xmlhttpRequest|notification|addStyle)\b|VITE_DEV_UPDATE_URL/.test(source), `${name}: userscript runtime leaked into ${path}`)
+    }
     assert.ok(!/\b(?:import\s*(?:\(\s*)?|from\s*)["']https?:\/\//.test(source), `${name}: remote executable import in ${path}`)
     assert.ok(!/<script[^>]+src\s*=\s*["']https?:\/\//i.test(source), `${name}: remote script in ${path}`)
     assert.ok(!/\beval\s*\(|\bnew\s+Function\s*\(/.test(source), `${name}: dynamic executable code in ${path}`)

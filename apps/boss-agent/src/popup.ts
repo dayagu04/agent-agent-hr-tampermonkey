@@ -1,5 +1,5 @@
 import './app.css'
-import { apiPermissionPattern, DEFAULT_API_BASE, normalizeApiBase } from './runtime'
+import { apiPermissionPattern, DEFAULT_API_BASE, normalizeApiBase } from './native-platform'
 
 type Status = { authenticated: boolean; username: string; apiBase: string; userId: number; enabled: boolean; tabId: number | null; resumeId: number | null; defaultResumeName: string; phase: string; online: boolean; pendingResults: number; pendingEffects: number; lastError: string; tools?: Array<{ name: string; irreversible: boolean }>; resumes?: Array<{ id: number; name: string }> }
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T

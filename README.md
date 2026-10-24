@@ -4,10 +4,16 @@
 
 | 产品 | 源码 | 安装目录 | 责任 |
 |---|---|---|---|
-| 谷谷求职 Agent | `apps/boss-agent/` | `dist/boss-agent/` | 将真实 BOSS 页面能力提供给上游 Agent：搜索、岗位信息、投递、会话、消息、简历和卡片 |
+| 谷谷求职 Agent | `apps/boss-agent/` | `dist/boss-agent/` | 保留原悬浮窗、投递控制、进度、会话和设置，同时向 Agent 提供页面工具 |
 | 谷谷网申助手 | `apps/application-autofill/` | `dist/application-autofill/` | 用户主动扫描、填写和核对网申资料；最终提交由用户完成 |
 
 两个扩展各自拥有 manifest、后台、UI、权限、登录、存储、版本号和 ZIP，不要求同时安装，不同步 token 或运行状态。共享的是源码仓库。网申代码来源为原独立仓 main `1de4f48`，以 subtree 保留来源历史，没有导入旧功能分支或被放弃的未提交内容。
+
+## 迁移范围与当前阶段
+
+本次迁移只更换实现方式：由油猴宿主改为 Chrome/Edge Manifest V3，原功能和使用方式保留，CLI 是辅助验证入口。悬浮窗、拖拽与收起、登录与简历同步、投递开始/停止、进度、会话列表及设置都是迁移目标，不以 popup 替代。
+
+当前先完成源码与底层分离：`packages/boss-core/src/` 完整保存原 Vue 界面、投递与会话业务；`apps/boss-agent/` 使用原生扩展后台、存储、网络和调度；`legacy/userscript/` 仅承载旧宿主适配和开发加载器。MV3 尚未重新挂载完整悬浮窗及接通编排，当前构建不能视作功能等价版本。
 
 ## 构建与安装
 
@@ -73,7 +79,8 @@ CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试�
 
 ```bash
 npm run typecheck
-npm run test:userscript       # 共享页面能力及油猴兼容契约
+npm run test:core             # 共享业务与页面契约
+npm run test:userscript       # 仅旧宿主兼容契约
 npm run test:autofill         # 网申自己的既有契约
 npm run build:boss
 npm run build:autofill
@@ -90,8 +97,9 @@ BOSS MV3 的运行时测试由其专用配置执行，CI 与共享页面契约�
 
 ## 油猴兼容入口
 
-原 `src/`、Vue 面板、编排器与 userscript 仍用于兼容现有安装和回滚。用户已明确 BOSS 产品只保留 Agent 原子工具；旧批量投递和会话托管面板退役，不进入新扩展，业务编排由上游 Agent 完成。旧源码/产物仅作为迁移兼容与临时回滚保留，不是新扩展后续开发目标。新扩展遇到不支持的编排命令拒绝执行且不越过 ACK。
+`packages/boss-core/src/` 是与宿主无关的完整功能源码，不依赖 GM 全局。`legacy/userscript/src/` 保留原安装与回滚所需的入口、GM 适配器和开发加载器；只有旧构建显式安装这个适配器。MV3 不导入该目录，也不使用油猴 CDN 或动态开发加载器。
 
+共享代码通过 `PlatformRuntime` 的存储、网络、通知与同步配置快照接口调用宿主能力；MV3 的原生后台存储与网络已复用该接口。后续将完整面板接回同一认证与执行通道，并保留原编排/台账功能。当前未接通的编排命令仍明确拒绝，不提前宣称可执行，也不跳过 ACK。
 ```bash
 npm run build:userscript      # dist/agent-agent-hr-tampermonkey.user.js
 npm run build:local           # 旧油猴本地联调包

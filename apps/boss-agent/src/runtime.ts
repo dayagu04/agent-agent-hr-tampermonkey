@@ -1,8 +1,9 @@
 import { PAGE_RUNTIME_KEY, type PageEffect, type PageExecution, type PageInvocation, type ToolResult } from './contracts'
 import { TOOL_CATALOG, validateToolArgs } from './tools-contract'
+import { NativeNetwork, NativeStorage, DEFAULT_API_BASE, normalizeApiBase, apiPermissionPattern } from './native-platform'
+export { DEFAULT_API_BASE, normalizeApiBase, apiPermissionPattern } from './native-platform'
 
 export const STORAGE_KEY = 'boss-agent.runtime.v1'
-export const DEFAULT_API_BASE = 'https://gudaya.chat'
 const API_PATHS = new Set(['/api/auth/login', '/api/auth/token', '/api/plugin/config', '/api/plugin/heartbeat', '/api/plugin/greeting', '/api/plugin/record', '/api/plugin/chat/mark-deleted', '/api/plugin/tools/result'])
 const BOSS_ORIGIN = 'https://www.zhipin.com'
 const MAX_PENDING = 20
@@ -58,19 +59,6 @@ function object(value: unknown): Record<string, unknown> {
 function fail(error: string): ToolResult { return { ok: false, error } }
 function number(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
-}
-export function normalizeApiBase(value: unknown): string {
-  if (typeof value !== 'string') throw new Error('invalid_api_origin')
-  let url: URL
-  try { url = new URL(value.trim()) } catch { throw new Error('invalid_api_origin') }
-  const loopback = ['localhost', '127.0.0.1'].includes(url.hostname)
-  if (url.hostname === '[::1]' || url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '') ||
-      (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback))) throw new Error('invalid_api_origin')
-  return url.origin
-}
-export function apiPermissionPattern(apiBase: string): string {
-  const url = new URL(normalizeApiBase(apiBase))
-  return `${url.protocol}//${url.hostname}/*`
 }
 async function pageCommandKey(value: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
@@ -156,6 +144,7 @@ function pageEffects(tool: string, raw: unknown, resumeId: number | null, persis
 export class BossRuntime {
   private readonly api: typeof chrome
   private readonly fetcher: typeof fetch
+  private readonly storage: NativeStorage
   private readonly now: () => number
   private state: State = { config: null, accounts: {} }
   private loaded: Promise<void>
@@ -176,13 +165,13 @@ export class BossRuntime {
   constructor(dependencies: RuntimeDependencies) {
     this.api = dependencies.chrome
     this.fetcher = dependencies.fetch
+    this.storage = new NativeStorage(this.api.storage.local, 'boss-agent.runtime.')
     this.now = dependencies.now || Date.now
     this.loaded = this.load()
   }
   private async load(): Promise<void> {
     // Content scripts cannot read JWTs or any persisted tool output.
-    await this.api.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
-    const saved = (await this.api.storage.local.get(STORAGE_KEY))[STORAGE_KEY] as State | undefined
+    const saved = await this.storage.get<State | undefined>('v1', undefined)
     if (saved && typeof saved === 'object' && saved.accounts) this.state = saved
     // A restarted worker has no proof whether a started page action completed. Never replay it.
     for (const [namespace, account] of Object.entries(this.state.accounts)) {
@@ -198,7 +187,7 @@ export class BossRuntime {
     await this.save()
     this.phase = this.state.config?.enabled ? 'awaiting_boss_page' : 'disabled'
   }
-  private save(): Promise<void> { return this.api.storage.local.set({ [STORAGE_KEY]: this.state }) }
+  private save(): Promise<void> { return this.storage.set('v1', this.state) }
   private enqueue<T>(run: () => Promise<T>): Promise<T> {
     const next = this.queue.then(async () => { await this.loaded; return run() })
     this.queue = next.catch(() => undefined)
@@ -331,26 +320,23 @@ export class BossRuntime {
   private async request(config: Pick<Config, 'apiBase' | 'token'>, path: string, body?: unknown, session?: Session): Promise<Record<string, unknown>> {
     if (!API_PATHS.has(path)) throw new Error('api_path_forbidden')
     if (session) this.assertActive(session)
-    await this.permission(config.apiBase)
-    if (session) this.assertActive(session)
     const controller = new AbortController()
     this.requestController = controller
-    const timeout = setTimeout(() => controller.abort(), 20_000)
+    const network = new NativeNetwork(this.api.permissions, this.fetcher, () => config)
     try {
-      const response = await this.fetcher(`${config.apiBase}${path}`, {
-        method: body === undefined ? 'GET' : 'POST', headers: {
-          'Content-Type': 'application/json', ...(config.token ? { Authorization: `Bearer ${config.token}` } : {}),
-        }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal: controller.signal, credentials: 'omit', redirect: 'error', cache: 'no-store',
+      const response = await network.request({
+        method: body === undefined ? 'GET' : 'POST', url: `${config.apiBase}${path}`,
+        ...(body === undefined ? {} : { data: JSON.stringify(body) }),
+        signal: controller.signal, timeout: 20_000,
       })
       if (session) this.assertActive(session)
-      if (!response.ok) throw new Error(`api_http_${response.status}`)
-      return object(await response.json())
+      if (response.status < 200 || response.status >= 300) throw new Error(`api_http_${response.status}`)
+      return object(JSON.parse(response.responseText))
     } finally {
-      clearTimeout(timeout)
       if (this.requestController === controller) this.requestController = null
     }
   }
+
   private async authenticate(payload: Record<string, unknown>, useToken: boolean): Promise<unknown> {
     const apiBase = normalizeApiBase(payload.apiBase || DEFAULT_API_BASE)
     const revision = this.revision
