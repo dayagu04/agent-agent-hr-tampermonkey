@@ -39,11 +39,13 @@ function render(next: Status): void {
 async function refresh(): Promise<void> {
   const next = await send('boss.status')
   input('api-base').value = next.apiBase
-  render(next.authenticated ? await send('boss.refresh') : next)
+  render(next)
   const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/*' })
   const choices = select('boss-tab'); choices.replaceChildren(new Option('请选择 BOSS 标签页', ''))
   for (const tab of tabs) if (tab.id) choices.add(new Option(`${tab.title || 'BOSS 直聘'}（${tab.id}）`, String(tab.id)))
   choices.value = status?.tabId ? String(status.tabId) : ''
+  // Local tab selection must remain usable when the backend configuration request fails.
+  if (next.authenticated) render(await send('boss.refresh'))
 }
 async function action(run: () => Promise<void>): Promise<void> {
   if (busy) return

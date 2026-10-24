@@ -10,7 +10,7 @@ const ACCOUNT = `${API}|1`
 const TOKEN = 'old-account-auth-token-long-value'
 const popup = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' } as chrome.runtime.MessageSender
 const page = { id: 'extension-id', frameId: 0, documentLifecycle: 'active', documentId: 'doc-1', url: 'https://www.zhipin.com/web/geek/chat', tab: { id: 12, url: 'https://www.zhipin.com/web/geek/chat' } } as chrome.runtime.MessageSender
-const panel = { ...page, frameId: 3, documentId: 'panel-doc-1', url: 'chrome-extension://extension-id/panel.html' } as chrome.runtime.MessageSender
+const panel = { ...page, frameId: 3, documentId: 'panel-doc-1', origin: 'chrome-extension://extension-id', url: 'chrome-extension://extension-id/panel.html' } as chrome.runtime.MessageSender
 const command = (id = 8, name = 'send_message', args: Record<string, unknown> = { text: 'message' }) => ({ id, action: 'tool.call', payload: { name, args } })
 const heartbeat = (commands: unknown[]) => ({ command_epoch: 'db-outbox-v2', plugin_compatibility: { can_receive_commands: true }, commands })
 function deferred<T>() {
@@ -34,7 +34,8 @@ function harness(accounts: Record<string, unknown> = {}) {
   let onPage: (invocation: PageInvocation, method: string) => Promise<unknown> = async () => ({ result: { ok: true, data: { delivery: 'delivered' } } })
   let onRequest: (path: string, body: Record<string, unknown>) => Promise<unknown> = async path => path.endsWith('/heartbeat') ? heartbeat([]) : { stored: true }
   const chromeMock = {
-    runtime: { id: 'extension-id', getURL: (path: string) => `chrome-extension://extension-id/${path}`, getManifest: () => ({ version: '0.7.0' }) },
+    runtime: { id: 'extension-id', getURL: (path: string) => `chrome-extension://extension-id/${path}`, getManifest: () => ({ version: '0.7.1' }),
+      getContexts: async () => [{ documentId: panel.documentId, documentUrl: panel.url, documentOrigin: panel.origin, frameId: panel.frameId, tabId: panel.tab!.id }] },
     storage: { local: {
       setAccessLevel: async (value: unknown) => { accesses.push(value) },
       get: async () => structuredClone(disk),
@@ -44,7 +45,7 @@ function harness(accounts: Record<string, unknown> = {}) {
     permissions: { contains: async () => permission },
     webNavigation: { getFrame: async ({ frameId }: { frameId: number }) => frameId === 0
       ? { documentId: page.documentId, url: page.url, parentFrameId: -1 }
-      : { documentId: panel.documentId, url: panel.url, parentFrameId: 0 } },
+      : null },
     tabs: { get: async (id: number) => ({ id, url: 'https://www.zhipin.com/web/geek/chat' }), update: async (...args: unknown[]) => { navigations.push(args) }, reload: async (...args: unknown[]) => { navigations.push(args) } },
     scripting: { executeScript: async (details: { files?: string[]; args?: unknown[]; func?: (...args: unknown[]) => unknown; target: { tabId: number; documentIds: string[] } }) => {
       expect(details.target).toEqual({ tabId: 12, documentIds: ['doc-1'] })
@@ -310,6 +311,7 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     const isolated = harness()
     const host = isolated.create()
     await expect(host.handle({ type: 'boss.panel.bootstrap' }, page)).rejects.toThrow('untrusted_sender')
+    await expect(host.handle({ type: 'boss.panel.bootstrap' }, { ...panel, origin: 'null' })).rejects.toThrow('untrusted_sender')
     await expect(host.handle({ type: 'boss.panel.bootstrap' }, { ...panel, documentId: 'stale-frame' })).rejects.toThrow('untrusted_panel_document')
     await host.handle({ type: 'boss.panel.bootstrap' }, panel)
     await expect(host.handle({ type: 'boss.panel.storage', action: 'set', key: 'aah_mirror_conversations', value: [], account: 'other-account' }, panel)).rejects.toThrow('session_changed')

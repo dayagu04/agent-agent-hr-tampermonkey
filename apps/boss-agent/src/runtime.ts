@@ -333,13 +333,19 @@ export class BossRuntime {
     }
   }
   private async trustedPanel(sender: chrome.runtime.MessageSender): Promise<{ tabId: number; documentId: string; topDocumentId: string; state: Record<string, unknown>; port?: chrome.runtime.Port }> {
+    const panelUrl = this.api.runtime.getURL('panel.html')
+    const panelOrigin = this.api.runtime.getURL('').replace(/\/$/, '')
     if (sender.id !== this.api.runtime.id || sender.frameId === undefined || sender.frameId <= 0 || !sender.documentId ||
         (sender.documentLifecycle && sender.documentLifecycle !== 'active') || !number(sender.tab?.id) || !bossUrl(sender.tab?.url) ||
-        sender.url?.split('#')[0] !== this.api.runtime.getURL('panel.html')) throw new Error('untrusted_sender')
-    const frame = await this.api.webNavigation.getFrame({ tabId: sender.tab!.id!, frameId: sender.frameId })
+        sender.origin !== panelOrigin || sender.url?.split('#')[0] !== panelUrl) throw new Error('untrusted_sender')
+    // webNavigation intentionally omits chrome-extension: frames. Use Chrome's live extension contexts instead.
+    const contexts = await this.api.runtime.getContexts({ documentIds: [sender.documentId], tabIds: [sender.tab!.id!], frameIds: [sender.frameId] })
+    const frame = contexts.find(item => item.documentId === sender.documentId && item.tabId === sender.tab!.id && item.frameId === sender.frameId &&
+      item.documentOrigin === panelOrigin && item.documentUrl?.split('#')[0] === panelUrl)
     const top = await this.api.webNavigation.getFrame({ tabId: sender.tab!.id!, frameId: 0 })
-    if (!frame || !top || frame.documentId !== sender.documentId || frame.parentFrameId !== 0 ||
-        !bossUrl(top.url) || frame.url.split('#')[0] !== this.api.runtime.getURL('panel.html')) throw new Error('untrusted_panel_document')
+    if (!frame) throw new Error('untrusted_panel_document')
+    if (!top) throw new Error('panel_parent_unavailable')
+    if (!bossUrl(top.url)) throw new Error('panel_parent_not_boss')
     const previous = this.panels.get(sender.documentId)
     const panel = { ...previous, tabId: sender.tab!.id!, documentId: sender.documentId, topDocumentId: top.documentId, state: previous?.state || {} }
     this.panels.set(sender.documentId, panel)

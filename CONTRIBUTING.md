@@ -15,6 +15,8 @@
 
 BOSS 的完整 UI/业务位于 `packages/boss-core`，MV3 宿主位于 `apps/boss-agent`，GM 与开发加载器仅在 `legacy/userscript`。迁移保留原功能与使用方式。BOSS MV3 通过已有 API 提供原子工具，function-call 参数和未知终态处理见 README/AGENTS。首次安装需要扩展管理页加载目录；更新 background/content/manifest 后重载扩展与页面。不能使用旧 userscript 的 new Function/CDN 开发加载方式。
 
+BOSS 0.7.1 起最低 Chromium 116。重载扩展会给已打开的可用 BOSS 页重新挂载面板，之后可用 CLI `reload_page` 刷新页面适配器，再以 `status` 的实际版本和连接状态确认。不要用 `webNavigation.getFrame()` 查询扩展自己的 iframe：Chrome 会过滤扩展 scheme；应保留 `runtime.getContexts()` 对 document/tab/frame/origin/URL 的校验，以及顶层 BOSS 文档校验。错误码只输出白名单代码，不输出凭据或页面正文。
+
 ## 油猴兼容开发闭环
 
 ```bash

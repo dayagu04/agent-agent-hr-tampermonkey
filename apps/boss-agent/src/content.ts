@@ -14,9 +14,15 @@ function attachContent(): void {
 
   // This isolated script owns only the frame geometry and the existing lifecycle heartbeat.
   // Credentials and business messages use extension runtime messaging inside panel.html.
+  const host = document.createElement('div')
+  host.id = 'aah-native-host'
+  host.dataset.extension = chrome.runtime.id
+  host.style.setProperty('display', 'contents', 'important')
+  const shadow = host.attachShadow({ mode: 'closed' })
   const panel = document.createElement('iframe')
   const panelOrigin = chrome.runtime.getURL('').replace(/\/$/, '')
-  panel.src = chrome.runtime.getURL('panel.html')
+  const geometryKey = crypto.randomUUID()
+  panel.src = chrome.runtime.getURL('panel.html') + '#' + geometryKey
   panel.title = 'BOSS 智能投递助手'
   panel.id = 'aah-native-panel'
   panel.setAttribute('referrerpolicy', 'origin')
@@ -24,6 +30,7 @@ function attachContent(): void {
     position: 'fixed', top: '72px', right: '12px', width: '64px', height: '64px',
     border: '0', background: 'transparent', zIndex: '2147483647', colorScheme: 'light',
   })
+  shadow.appendChild(panel)
   let frameGeometry = { top: 80, right: 20, width: 64, height: 64 }
   function placePanel(): void {
     const width = Math.min(frameGeometry.width, window.innerWidth)
@@ -35,12 +42,13 @@ function attachContent(): void {
     })
   }
   function sendViewport(): void {
-    panel.contentWindow?.postMessage({ type: 'aah.panel.viewport', width: window.innerWidth, height: window.innerHeight }, panelOrigin)
+    panel.contentWindow?.postMessage({ type: 'aah.panel.viewport', key: geometryKey, width: window.innerWidth, height: window.innerHeight }, '*')
   }
   function receiveGeometry(event: MessageEvent): void {
-    if (event.source !== panel.contentWindow || event.origin !== panelOrigin) return
+    // Privileged extension frames may expose a null MessageEvent.source. Geometry carries no authority.
+    if ((event.source !== null && event.source !== panel.contentWindow) || event.origin !== panelOrigin) return
     const data = event.data as Record<string, unknown> | null
-    if (!data || typeof data !== 'object') return
+    if (!data || typeof data !== 'object' || data.key !== geometryKey) return
     if (data.type === 'aah.panel.ready') { sendViewport(); return }
     if (data.type !== 'aah.panel.geometry' || typeof data.collapsed !== 'boolean' ||
         !['top', 'right', 'width', 'height'].every(key => typeof data[key] === 'number' && Number.isFinite(data[key]))) return
@@ -55,10 +63,13 @@ function attachContent(): void {
   function resize(): void { placePanel(); sendViewport() }
   window.addEventListener('message', receiveGeometry)
   window.addEventListener('resize', resize)
-  function mountPanel(): void { if (!panel.isConnected) (document.body || document.documentElement).appendChild(panel) }
+  function mountPanel(): void { if (!host.isConnected) (document.body || document.documentElement).appendChild(host) }
   // Remove only this extension's obsolete iframe after an extension reload.
   for (const old of document.querySelectorAll<HTMLIFrameElement>('iframe#aah-native-panel')) {
-    if (old.src === panel.src) old.remove()
+    if (old.src.split('#')[0] === chrome.runtime.getURL('panel.html')) old.remove()
+  }
+  for (const old of document.querySelectorAll<HTMLElement>('#aah-native-host')) {
+    if (old.dataset.extension === chrome.runtime.id) old.remove()
   }
   mountPanel()
 
@@ -96,7 +107,7 @@ function attachContent(): void {
       window.removeEventListener('pageshow', resume)
       window.removeEventListener('focus', tick)
       try { chrome.runtime.onMessage.removeListener(receiveWake) } catch { /* previous extension context is invalid */ }
-      panel.remove()
+      host.remove()
       if (owners[OWNER_KEY] === owner) delete owners[OWNER_KEY]
     },
   }

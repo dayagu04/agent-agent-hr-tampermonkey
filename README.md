@@ -15,6 +15,8 @@
 
 原 Vue 悬浮窗及投递、进度、会话、设置已接入 MV3：`panel.html` 在扩展自己的 iframe 中运行 `packages/boss-core/src/` 的原界面和控制器，页面内收起、展开、拖动和操作入口保持原样。`apps/boss-agent/` 后台统一负责原生登录、存储、网络、心跳和页面执行权；`legacy/userscript/` 仅承载旧宿主适配和开发加载器。代码与构建验证不代替 Chrome/Edge 真实页面验收。
 
+BOSS 0.7.1 修复扩展面板启动被拒绝及错误提示裁切的问题，需要 Chromium 116 或以上。后台通过 Chrome 的活动扩展上下文验证面板，通过导航接口验证顶层 BOSS 文档；iframe 挂在封闭 shadow root 内隔离页面样式和通用 iframe 扫描。shadow root 只隔离界面，不承担认证。扩展重载后会重新挂载已打开、可用的 BOSS 页，保留登录和配置；冻结页等待恢复，未确认动作仍先核查。
+
 ## 构建与安装
 
 Node.js 22.15 或以上：
@@ -65,7 +67,7 @@ npm run tool -- wait <command_id>
 
 CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试账号环境变量指定连接。远端必须使用 HTTPS 并显式提供凭据，不会发送本地默认账号。CLI 自动为新调用生成 `request_id`，入队前输出该 ID，入队后立即输出 `command_id`；上游可用 `AAH_REQUEST_ID` 传入同一次 function call 的稳定 ID。POST 响应丢失时复用原 ID 和原参数，结果等待超时则用 `result` / `wait` 查询原 command_id，不创建新调用。`AAH_HTTP_TIMEOUT` 控制单次 HTTP 超时（默认15秒），`AAH_WAIT` 控制结果等待（默认90秒）。查询尚未完成的结果退出码为2，失败/超时为1，成功为0。
 
-`status` 和 `functions` 都只读后端状态，不入队；`connected=false` 或目录为空表示没有已确认的执行端，后端登录成功不等于扩展已登录/连接。旧后端没有发现接口时 `functions` 明确返回 HTTP 404。首次安装和扩展登录仍在 popup 完成，之后用 CLI 调用工具，不需要操作 BOSS 页面。
+`status` 和 `functions` 都只读后端状态，不入队；`connected=false` 或目录为空表示没有已确认的执行端，后端登录成功不等于扩展已登录/连接。旧后端没有发现接口时 `functions` 明确返回 HTTP 404。首次安装通过扩展管理页完成，扩展登录可在原悬浮窗或 popup 完成，之后用 CLI 调用工具，不需要操作 BOSS 页面。
 
 `scan_jobs` 返回 `count/total/offset/limit/hasMore/nextOffset`；`withDetail=true` 默认且最多每批10个岗位，继续使用返回的 `nextOffset`。不带明细且未指定 limit 时保留整页列表。offset 基于本次页面列表顺序，翻页、筛选或列表变化后应重新扫描，不能将它当作稳定快照游标。
 

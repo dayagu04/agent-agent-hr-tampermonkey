@@ -4,6 +4,7 @@ import type { PanelLayout, UIHost, UIThread, UIThreadInfo, UIThreadRow } from '.
 import type { ToolResult } from '../../../packages/boss-core/src/tool-definitions'
 
 const PAGE_ORIGIN = 'https://www.zhipin.com'
+const geometryKey = location.hash.slice(1)
 let viewport = { width: 1024, height: 768 }
 let layout: PanelLayout = { collapsed: true, position: { top: 80, right: 20 } }
 let observer: ResizeObserver | undefined
@@ -15,7 +16,7 @@ function sendGeometry(): void {
     const root = document.querySelector<HTMLElement>('.aah-root')
     const size = root?.getBoundingClientRect()
     window.parent.postMessage({
-      type: 'aah.panel.geometry',
+      type: 'aah.panel.geometry', key: geometryKey,
       collapsed: layout.collapsed,
       top: layout.position.top,
       right: layout.position.right,
@@ -26,9 +27,9 @@ function sendGeometry(): void {
 }
 
 function receiveViewport(event: MessageEvent): void {
-  if (event.source !== window.parent || event.origin !== PAGE_ORIGIN) return
-  const data = event.data as { type?: unknown; width?: unknown; height?: unknown } | null
-  if (data?.type !== 'aah.panel.viewport' || typeof data.width !== 'number' || typeof data.height !== 'number' ||
+  if ((event.source !== null && event.source !== window.parent) || event.origin !== PAGE_ORIGIN) return
+  const data = event.data as { type?: unknown; key?: unknown; width?: unknown; height?: unknown } | null
+  if (data?.key !== geometryKey || data.type !== 'aah.panel.viewport' || typeof data.width !== 'number' || typeof data.height !== 'number' ||
       !Number.isFinite(data.width) || !Number.isFinite(data.height) || data.width < 1 || data.height < 1) return
   const next = { width: Math.min(20000, data.width), height: Math.min(20000, data.height) }
   if (next.width === viewport.width && next.height === viewport.height) return
@@ -40,9 +41,10 @@ function receiveViewport(event: MessageEvent): void {
 }
 
 async function bootstrap(): Promise<void> {
-  if (window.parent === window || new URL(document.referrer).origin !== PAGE_ORIGIN) throw new Error('请在 BOSS 页面打开投递助手')
+  // Chrome can omit an extension iframe's referrer. The background validates the actual parent document.
+  if (window.parent === window || window.parent !== window.top) throw new Error('panel_requires_boss_parent')
   window.addEventListener('message', receiveViewport)
-  window.parent.postMessage({ type: 'aah.panel.ready' }, PAGE_ORIGIN)
+  window.parent.postMessage({ type: 'aah.panel.ready', key: geometryKey }, PAGE_ORIGIN)
   // Install credentials/configuration in this trusted extension context before evaluating core business modules.
   await initializeNativeHost()
   const [{ installNativeExecutionHost }, { installNativeChatDriver }] = await Promise.all([
@@ -95,9 +97,10 @@ async function bootstrap(): Promise<void> {
   window.addEventListener('pagehide', () => { observer?.disconnect(); app.unmount() }, { once: true })
 }
 
-void bootstrap().catch(() => {
+void bootstrap().catch(reason => {
   const error = document.getElementById('aah-panel-error')!
   error.hidden = false
-  error.textContent = '投递助手连接失败，请刷新 BOSS 页面后重试。'
-  window.parent.postMessage({ type: 'aah.panel.geometry', collapsed: false, top: 80, right: 20, width: 320, height: 90 }, PAGE_ORIGIN)
+  const code = reason instanceof Error && /^[a-z][a-z0-9_]{1,63}$/.test(reason.message) ? reason.message : 'panel_bootstrap_failed'
+  error.textContent = `投递助手连接失败（${code}），请重新加载扩展后重试。`
+  window.parent.postMessage({ type: 'aah.panel.geometry', key: geometryKey, collapsed: false, top: 80, right: 20, width: 320, height: 90 }, PAGE_ORIGIN)
 })
