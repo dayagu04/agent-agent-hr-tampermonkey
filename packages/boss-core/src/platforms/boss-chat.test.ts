@@ -22,12 +22,15 @@ import {
   isContactCardAllowed,
   listPendingCardKinds,
   listResumeOptions,
+  lastResumeSendState,
   openThread,
   openThreadConfirmed,
   readMessages,
+  readResumeState,
   selectResumeRowByIndex,
   resumeDialogKind,
   selectResumeInDialog,
+  sendResumeDetailed,
   threadRowMatchesText,
 } from './boss-chat'
 import { normalizeAgentPolicy } from '../contact-policy'
@@ -93,6 +96,25 @@ describe('BOSS resume picker DOM handling', () => {
       height,
       toJSON: () => ({}),
     })
+  }
+
+  function mountResumeThread(): HTMLElement {
+    document.body.insertAdjacentHTML('beforeend', '<section id="resume-thread"><span class="name-text">测试HR</span><span class="company">测试公司</span><span class="position-name">测试岗位</span></section>')
+    vi.spyOn(document.querySelector('#resume-thread .company')!, 'getBoundingClientRect').mockReturnValue({
+      x: 100, y: 0, top: 0, left: 100, right: 300, bottom: 40, width: 200, height: 40, toJSON: () => ({}),
+    })
+    let panel = document.querySelector<HTMLElement>('.chat-conversation')
+    if (!panel) {
+      panel = document.createElement('div')
+      panel.className = 'chat-conversation'
+      document.body.append(panel)
+    }
+    setRect(panel, 800, 800)
+    return panel
+  }
+
+  function addResumeMark(): void {
+    document.querySelector('.chat-conversation')!.insertAdjacentHTML('beforeend', '<div class="item-system"><span>您的附件简历已发送给Boss</span></div>')
   }
 
   afterEach(() => {
@@ -164,6 +186,7 @@ describe('BOSS resume picker DOM handling', () => {
     const clicks = vi.fn()
     submit.addEventListener('click', clicks)
 
+    mountResumeThread()
     const result = completeResumeSend(null)
     await vi.runAllTimersAsync()
 
@@ -186,6 +209,7 @@ describe('BOSS resume picker DOM handling', () => {
     const clicks = vi.fn()
     button.addEventListener('click', clicks)
 
+    mountResumeThread()
     const result = completeResumeSend(null)
     await vi.runAllTimersAsync()
 
@@ -283,6 +307,19 @@ describe('BOSS resume picker DOM handling', () => {
     for (const el of Array.from(dialog.querySelectorAll('*'))) setRect(el, 120, 40)
 
     expect(selectResumeInDialog(dialog, '后端工程师简历.pdf')).toBe(false)
+
+    document.body.innerHTML = `<div class="boss-popup__content"><h3>请选择要发送的简历</h3>
+      <div class="choose-resume-dialog"><ul><li class="list-item disabled selected"><div class="item-body">后端工程师简历.pdf</div></li></ul><button>发送</button></div>
+      </div><button class="unable">发简历</button>`
+    for (const el of Array.from(document.querySelectorAll('*'))) setRect(el, 300, 40)
+    const known = findResumeDialog()!
+    const clicked = vi.fn()
+    known.querySelector('li')!.addEventListener('click', clicked)
+    expect(listResumeOptions(known)).toEqual([{ name: '后端工程师简历.pdf', selected: true, disabled: true }])
+    expect(selectResumeRowByIndex(known, 0)).toBe(false)
+    expect(selectResumeInDialog(known, '后端工程师简历.pdf')).toBe(false)
+    expect(readResumeState()).toEqual({ toolbar: 'disabled', dialog: 'picker', options: [{ index: 0, name: '后端工程师简历.pdf', selected: true, disabled: true }], sentMarkCount: 0 })
+    expect(clicked).not.toHaveBeenCalled()
   })
 
   it('classifies an unknown resume form separately from safe picker/confirm flows', () => {
@@ -308,6 +345,11 @@ describe('BOSS resume picker DOM handling', () => {
     }
 
     expect(findResumeDialog()).toBeNull()
+    document.body.innerHTML = [true, false].map(selected => `<div class="boss-popup__content"><h3>请选择要发送的简历</h3>
+      <div class="choose-resume-dialog"><ul><li class="list-item${selected ? ' selected' : ''}"><div class="item-body">测试附件.pdf</div></li></ul><button>发送</button></div></div>`).join('')
+    for (const el of Array.from(document.querySelectorAll('*'))) setRect(el, 300, 40)
+    expect(findResumeDialog()).toBeNull()
+    expect(readResumeState()).toMatchObject({ dialog: 'unknown', options: [] })
   })
 
   it('fails closed when an unrelated visible dialog competes with the resume dialog', () => {
@@ -339,6 +381,7 @@ describe('BOSS resume picker DOM handling', () => {
     const clicks = vi.fn()
     button.addEventListener('click', clicks)
 
+    mountResumeThread()
     const result = completeResumeSend('后端工程师简历.pdf')
     await vi.runAllTimersAsync()
 
@@ -363,6 +406,7 @@ describe('BOSS resume picker DOM handling', () => {
     const clicks = vi.fn()
     button.addEventListener('click', clicks)
 
+    mountResumeThread()
     const result = completeResumeSend('后端工程师简历.pdf')
     await vi.runAllTimersAsync()
 
@@ -390,41 +434,53 @@ describe('BOSS resume picker DOM handling', () => {
       input.checked = true
       button.disabled = false
     })
-    const sends = vi.fn(() => dialog.remove())
+    const sends = vi.fn(() => { dialog.remove(); setTimeout(addResumeMark, 800) })
     row.addEventListener('click', selections)
     button.addEventListener('click', sends)
 
+    mountResumeThread()
     const result = completeResumeSend('后端工程师简历.pdf')
     await vi.runAllTimersAsync()
 
     await expect(result).resolves.toBe(true)
     expect(selections).toHaveBeenCalledTimes(1)
     expect(sends).toHaveBeenCalledTimes(1)
+    expect(lastResumeSendState()).toEqual({ attempted: true, confirmed: true })
   })
 
   it('does not retry an unconfirmed send click', async () => {
     vi.useFakeTimers()
-    document.body.innerHTML = `
-      <div role="dialog">
-        <div>请选择要发送的简历</div>
-        <label class="resume-item selected"><span>后端工程师简历.pdf</span></label>
-        <button type="button"><span>发送</span></button>
-      </div>
-    `
-    const dialog = document.querySelector('[role="dialog"]') as HTMLElement
-    const row = dialog.querySelector('label') as HTMLElement
-    const button = dialog.querySelector('button') as HTMLButtonElement
-    for (const el of [dialog, row, row.querySelector('span')!, button, button.querySelector('span')!]) {
-      setRect(el, 120, 40)
+    for (const outcome of ['open', 'closed', 'thread_before_send', 'thread_after_send', 'missing_header']) {
+      document.body.innerHTML = `
+        <div role="dialog">
+          <div>请选择要发送的简历</div>
+          <label class="resume-item selected"><span>后端工程师简历.pdf</span></label>
+          <button type="button"><span>发送</span></button>
+        </div>
+      `
+      const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+      const row = dialog.querySelector('label') as HTMLElement
+      const button = dialog.querySelector('button') as HTMLButtonElement
+      for (const el of [dialog, row, row.querySelector('span')!, button, button.querySelector('span')!]) {
+        setRect(el, 120, 40)
+      }
+      if (outcome !== 'missing_header') mountResumeThread()
+      const changeThread = () => { document.querySelector('#resume-thread .company')!.textContent = '另一公司' }
+      const sends = vi.fn(() => {
+        if (outcome === 'closed') dialog.remove()
+        if (outcome === 'thread_after_send') { changeThread(); addResumeMark() }
+      })
+      button.addEventListener('click', sends)
+
+      const result = completeResumeSend('后端工程师简历.pdf')
+      if (outcome === 'thread_before_send') setTimeout(changeThread, 100)
+      await vi.runAllTimersAsync()
+
+      await expect(result).resolves.toBe(false)
+      const attempted = outcome !== 'thread_before_send' && outcome !== 'missing_header'
+      expect(sends).toHaveBeenCalledTimes(attempted ? 1 : 0)
+      expect(lastResumeSendState()).toEqual({ attempted, confirmed: false })
     }
-    const sends = vi.fn()
-    button.addEventListener('click', sends)
-
-    const result = completeResumeSend('后端工程师简历.pdf')
-    await vi.runAllTimersAsync()
-
-    await expect(result).resolves.toBe(false)
-    expect(sends).toHaveBeenCalledTimes(1)
   })
 
   it('ignores hidden dialog remnants after the picker closes', () => {
@@ -475,6 +531,7 @@ describe('BOSS resume picker DOM handling', () => {
     const sends = vi.fn()
     dialog.querySelector('button')!.addEventListener('click', sends)
 
+    mountResumeThread()
     const result = completeResumeSend(null)
     await vi.runAllTimersAsync()
 
@@ -493,13 +550,14 @@ describe('BOSS resume picker DOM handling', () => {
     `
     const dialog = document.querySelector('[role="dialog"]') as HTMLElement
     for (const el of Array.from(dialog.querySelectorAll('*')).concat(dialog)) setRect(el, 120, 30)
-    const sends = vi.fn(() => dialog.remove())
+    const sends = vi.fn(() => { dialog.remove(); addResumeMark() })
     dialog.querySelector('button')!.addEventListener('click', sends)
 
-    const result = completeResumeSend(null)
+    mountResumeThread()
+    const result = sendResumeDetailed()
     await vi.runAllTimersAsync()
 
-    await expect(result).resolves.toBe(true)
+    await expect(result).resolves.toMatchObject({ ok: true })
     expect(sends).toHaveBeenCalledTimes(1)
   })
 
@@ -556,6 +614,10 @@ describe('BOSS resume picker DOM handling', () => {
     const baseline = countResumeSentMarks()
     expect(baseline).toBe(1)
 
+    mountResumeThread()
+    const unchanged = completeResumeSend(null)
+    await vi.runAllTimersAsync()
+    await expect(unchanged).resolves.toBe(false)
     const result = completeResumeSend(null, false, baseline)
     // BOSS 直接发出：没有任何弹窗，只是消息区多了一条系统提示
     const mark = document.createElement('div')

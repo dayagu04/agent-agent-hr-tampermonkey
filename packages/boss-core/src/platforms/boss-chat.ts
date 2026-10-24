@@ -1781,6 +1781,7 @@ export function findResumeDialog(): HTMLElement | null {
   //   .footer button.btn-sure-v2「发送」
   // 必须放在「多弹窗就保险退出」之前：聊天里的卡片层（.message-dialog-both /
   // .item-dialog）也会命中 [class*=dialog]，会被误当成竞争弹窗导致直接返回 null。
+  if (visibleChooseResumeDialogs().length > 1) return null
   const chooseDialog = findChooseResumeDialog()
   if (chooseDialog) {
     diag('CHAT', 'resume_dialog via=choose-resume')
@@ -2013,7 +2014,7 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
         const score = norm === targetNorm ? 2 : norm.includes(targetNorm) || targetNorm.includes(norm) ? 1 : 0
         return { row, score }
       })
-      .filter((x) => x.score > 0 && !isDialogButtonDisabled(x.row))
+      .filter((x) => x.score > 0 && !optionState(x.row).disabled)
     const best = Math.max(0, ...scored.map((x) => x.score))
     const top = scored.filter((x) => x.score === best)
     if (top.length !== 1) {
@@ -2027,6 +2028,8 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
       // 行里有 radio/checkbox 时直接点控件：点 label 会被浏览器再转发一次给 input，
       // 行上的 Vue handler 收到两次（与下方旧版行逻辑同一处理）
       const formControl = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
+      assertChatExecutionActive()
+      resumeSendState.attempted = true // A picker may send immediately on row selection.
       if (formControl) clickDirect(formControl)
       else realClick(row)
       diag('CHAT', `resume_select status=clicked rows=${fileRows.length} score=${best} control=${formControl ? 1 : 0}`)
@@ -2099,6 +2102,8 @@ export function selectResumeInDialog(dialog: HTMLElement, targetName: string): b
     // Resume rows are Vue-controlled radio/checkbox items; use the same
     // real pointer sequence as the surrounding dialog buttons.
     if (!alreadySelected) {
+      assertChatExecutionActive()
+      resumeSendState.attempted = true
       if (formControl) clickDirect(formControl)
       else realClick(clickTarget)
     }
@@ -2144,18 +2149,27 @@ export function selectResumeRowByIndex(dialog: HTMLElement, index: number): bool
   const listItems = Array.from(dialog.querySelectorAll('li.list-item')) as HTMLElement[]
   const pick = listItems[index]
   if (pick) {
-    if (!pick.classList.contains('selected')) realClick(pick)
+    if (!isVisibleDialog(pick) || optionState(pick).disabled) return false
+    if (!optionState(pick).selected) {
+      assertChatExecutionActive()
+      resumeSendState.attempted = true
+      realClick(pick)
+    }
     diag('CHAT', `resume_select status=clicked_list_item index=${index} rows=${listItems.length}`)
     return true
   }
+  if (listItems.length) return false
   const rows = genericRowEls(dialog)
   const row = rows[index]
   if (!row) {
     diag('CHAT', `resume_select status=index_out_of_range index=${index} rows=${rows.length}`)
     return false
   }
+  if (optionState(row).disabled) return false
   const input = row.querySelector('input[type="radio"], input[type="checkbox"]') as HTMLElement | null
   if (!optionState(row).selected) {
+    assertChatExecutionActive()
+    resumeSendState.attempted = true
     if (input) clickDirect(input)
     else realClick(row)
   }
@@ -2206,18 +2220,21 @@ const RESUME_META_RE = /^(\d{4}[./-]\d{1,2}[./-]\d{1,2}.*|\d+(\.\d+)?\s*(kb|mb|k
  * 新版选择框的行没有 li/label/radio，只能这样圈出整行（含更新时间和大小）。
  */
 /**
- * 可见的简历选择框：优先带已选行的那个（页面里可能出现两份实例）。
+ * 仅保留视口内的可见实例；不能以已选行猜测哪个独立弹窗可操作。
  */
-function findChooseResumeDialog(): HTMLElement | null {
-  const cands = (Array.from(document.querySelectorAll('.choose-resume-dialog')) as HTMLElement[])
+function visibleChooseResumeDialogs(): HTMLElement[] {
+  const cands = (Array.from(document.querySelectorAll('.choose-resume-dialog, [class*="choose-resume"], [class*="chooseResume"]')) as HTMLElement[])
     .filter((el) => !el.closest('.aah-root') && isVisibleDialog(el))
-    .filter((el) => el.querySelectorAll('li.list-item').length > 0)
     // BOSS 会保留一份离屏副本（宽高都正常，但 left/top 在视口外）。
     // 点到副本等于没点 —— 只留真正在视口里的那一份。
     .filter(inViewport)
-  if (!cands.length) return null
-  const withSelected = cands.filter((el) => el.querySelector('li.list-item.selected'))
-  const pick = withSelected[0] || cands[cands.length - 1]
+  return cands.filter(candidate => !cands.some(other => candidate !== other && candidate.contains(other)))
+}
+
+function findChooseResumeDialog(): HTMLElement | null {
+  const cands = visibleChooseResumeDialogs()
+  if (cands.length !== 1 || !cands[0].querySelector('li.list-item')) return null
+  const pick = cands[0]
   // 标题「请选择要发送的简历」在 .boss-dialog__header 里，不在 .choose-resume-dialog 内部；
   // 返回整个 popup content，才能同时拿到标题（判类型）和「发送」按钮。
   const wrapper = pick.closest('.boss-popup__content') as HTMLElement | null
@@ -2231,6 +2248,7 @@ function resumeFileRows(dialog: HTMLElement): Array<{ row: HTMLElement; name: st
     let cur = leaf.parentElement
     while (cur && cur !== dialog && resumeFileLeaves(cur).length === 1) {
       row = cur
+      if (cur.matches('li.list-item')) break
       cur = cur.parentElement
     }
     return { row, name: (leaf.textContent || '').trim() }
@@ -2244,7 +2262,7 @@ function optionState(row: HTMLElement): { selected: boolean; disabled: boolean }
     row.getAttribute('aria-selected') === 'true' ||
     !!input?.checked ||
     /(?:^|[-_\s])(selected|active|checked|current)(?:$|[-_\s])/.test(String(row.className || ''))
-  return { selected, disabled: isDialogButtonDisabled(row) }
+  return { selected, disabled: isDialogButtonDisabled(row) || !!input && isDialogButtonDisabled(input) }
 }
 
 /**
@@ -2264,8 +2282,7 @@ export function listResumeOptions(dialog: HTMLElement): ResumeOption[] {
       const name = raw.split(/更新于|\d+(?:\.\d+)?\s*(?:KB|MB|K|M)\b/i)[0].trim().slice(0, 120)
       return {
         name: name || 'row',
-        selected: li.classList.contains('selected'),
-        disabled: false,
+        ...optionState(li),
       }
     })
   }
@@ -2316,6 +2333,46 @@ function findResumeToolbarButton(): HTMLElement | null {
   return null
 }
 
+/** Read-only page facts. Attachment names are returned to the caller, never logged. */
+export function readResumeState(): {
+  toolbar: 'available' | 'disabled' | 'missing'
+  dialog: 'picker' | 'confirm' | 'unknown' | 'none'
+  options: Array<ResumeOption & { index: number }>
+  sentMarkCount: number
+} {
+  const toolbar = findResumeToolbarButton()
+  const dialog = findResumeDialog()
+  const kind = dialog ? resumeDialogKind(dialog) : visibleChooseResumeDialogs().length > 1 ? 'unknown' : 'none'
+  return {
+    toolbar: toolbar ? isDialogButtonDisabled(toolbar) ? 'disabled' : 'available' : 'missing',
+    dialog: kind,
+    options: dialog && kind === 'picker' ? listResumeOptions(dialog).map((option, index) => ({ index, ...option })) : [],
+    sentMarkCount: countResumeSentMarks(),
+  }
+}
+
+let resumeSendState = { attempted: false, confirmed: false }
+/** The latest send invocation only; false confirmation never implies a safe retry. */
+export function lastResumeSendState(): { attempted: boolean; confirmed: boolean } {
+  return { ...resumeSendState }
+}
+
+async function inResumeThread<T>(expected: string, action: () => Promise<T>, fallback: T): Promise<T> {
+  if (!expected || documentCurrent().threadId !== expected) return fallback
+  try {
+    // Core/card callers may already own this exact lease. Atomic resume calls create it here.
+    if (pageExpectedThread) {
+      if (pageExpectedThread !== expected) return fallback
+      assertChatExecutionActive()
+      return await action()
+    }
+    return await withinThread(expected, action, fallback)
+  } catch (error) {
+    if (error instanceof Error && error.message === 'chat_thread_changed') return fallback
+    throw error
+  }
+}
+
 /**
  * 简历发送弹窗流：确认（同意/确定）→ 选择默认简历 → 发送。
  *
@@ -2331,22 +2388,41 @@ export async function completeResumeSend(
   sentBaseline: number | null = null,
   /** 按序号选（附件名被字体混淆、无法按名字匹配时用） */
   targetIndex: number | null = null,
+  expectedThread = documentCurrent().threadId,
+): Promise<boolean> {
+  resumeSendState = { attempted: alreadyAgreed, confirmed: false }
+  const baseline = sentBaseline ?? countResumeSentMarks()
+  return inResumeThread(expectedThread, () => completeResumeSendInThread(targetName, alreadyAgreed, baseline, targetIndex), false)
+}
+
+async function completeResumeSendInThread(
+  targetName: string | null,
+  alreadyAgreed: boolean,
+  sentBaseline: number,
+  targetIndex: number | null,
 ): Promise<boolean> {
   let agreed = alreadyAgreed
   const selectedPickers = new WeakSet<HTMLElement>()
+  const clickedStages = new Set<'picker' | 'confirm'>()
   let waitingForEnabledLogged = false
   let sawDialog = false
-  const sentNow = (): boolean => sentBaseline !== null && countResumeSentMarks() > sentBaseline
+  const sentNow = (): boolean => {
+    assertChatExecutionActive()
+    if (countResumeSentMarks() <= sentBaseline) return false
+    resumeSendState.confirmed = true
+    return true
+  }
   for (let i = 0; i < 24; i++) {
     await delay(400, 600)
+    if (sentNow()) {
+      diag('CHAT', `resume_send status=sent via=chat_mark dialog=${sawDialog}`)
+      return true
+    }
+    if (visibleChooseResumeDialogs().length > 1) return false
     const dialog = findResumeDialog()
     if (!dialog) {
       // 只有一份附件时 BOSS 不弹选择框、直接发出；选中附件行后选择框也会直接关闭。
       // 这两种情况都靠消息区新出现的「附件简历…已发送给Boss」确认，不靠弹窗。
-      if (sentNow()) {
-        diag('CHAT', `resume_send status=sent via=chat_mark dialog=${sawDialog}`)
-        return true
-      }
       continue
     }
     sawDialog = true
@@ -2374,7 +2450,7 @@ export async function completeResumeSend(
       // 没指定发哪份：只有一份时可以直接发；多份时 BOSS 的「当前选中」
       // 只是它自己的默认值，不代表用户意图。简历不可撤回，宁可停下交给人工。
       const options = listResumeOptions(dialog)
-      if (options.length !== 1) {
+      if (options.length !== 1 || options[0].disabled) {
         diag('CHAT', `resume_send status=ambiguous options=${options.length} target=none`)
         return false
       }
@@ -2404,9 +2480,13 @@ export async function completeResumeSend(
         }
         continue
       }
+      if (clickedStages.has(kind)) return false
       // BOSS uses delegated Vue handlers for the portal button. A bare
       // HTMLElement.click() can update nothing even though the button is
       // visible; dispatch the same pointer/mouse sequence as a user click.
+      assertChatExecutionActive()
+      clickedStages.add(kind)
+      resumeSendState.attempted = true
       const sendHit = realClick(sendBtn)
       const sendRect = sendBtn.getBoundingClientRect()
       diag(
@@ -2417,21 +2497,17 @@ export async function completeResumeSend(
           `inChatPanel=${!!findChatPanel()?.contains(sendBtn)}`,
       )
       // 不重试点击同一个发送按钮：第一次可能已到服务端但页面关闭稍慢，
-      // 再点会重复发送。只轮询弹窗是否关闭/切到下一阶段。
+      // 再点会重复发送。关闭本身不代表发送成功，必须看到本次新增附件标记。
       for (let wait = 0; wait < 12; wait++) {
         await delay(250, 400)
         const current = findResumeDialog()
-        if (!current) {
-          diag('CHAT', `已发送简历（${targetName ? '使用配置的默认简历' : '使用平台当前选中简历'}）`)
-          return true
-        }
         // 弹窗还没关，但消息区已经出现「已发送给Boss」= 实际已发出，
         // 不能因为弹窗动画慢就判失败（否则会重复点发送）。
         if (sentNow()) {
           diag('CHAT', 'resume_send status=sent via=chat_mark dialog_still_open=1')
           return true
         }
-        if (resumeDialogKind(current) !== kind) break
+        if (current && resumeDialogKind(current) !== kind) break
       }
       const current = findResumeDialog()
       if (current && resumeDialogKind(current) === kind) {
@@ -2445,6 +2521,8 @@ export async function completeResumeSend(
     if (!agreed) {
       const agreeBtn = findDialogButton(dialog, /^(同意|确定|确认|继续发送)$/)
       if (agreeBtn && !isDialogButtonDisabled(agreeBtn)) {
+        assertChatExecutionActive()
+        resumeSendState.attempted = true
         realClick(agreeBtn)
         agreed = true
         await delay(900, 1300)
@@ -2500,12 +2578,22 @@ export async function sendResumeDetailed(
   targetName?: string | null,
   targetIndex?: number | null,
 ): Promise<ResumeSendOutcome> {
+  resumeSendState = { attempted: false, confirmed: false }
+  return inResumeThread(documentCurrent().threadId,
+    () => sendResumeDetailedInThread(targetName, targetIndex), { ok: false, reason: 'send_failed' })
+}
+
+async function sendResumeDetailedInThread(
+  targetName?: string | null,
+  targetIndex?: number | null,
+): Promise<ResumeSendOutcome> {
+  if (visibleChooseResumeDialogs().length > 1) return { ok: false, reason: 'send_failed' }
   // 选择框已经开着（例如刚点过卡片同意）：直接处理它，不要再点工具栏把框关掉
   const open = findResumeDialog()
   if (open && resumeDialogKind(open) === 'picker') {
     const baseline = countResumeSentMarks()
     diag('CHAT', 'resume_send step=reuse_open_picker')
-    const okReuse = await completeResumeSend(targetName || null, false, baseline, targetIndex ?? null)
+    const okReuse = await completeResumeSendInThread(targetName || null, false, baseline, targetIndex ?? null)
     return { ok: okReuse, reason: okReuse ? undefined : 'send_failed' }
   }
   const btn = findResumeToolbarButton()
@@ -2531,11 +2619,13 @@ export async function sendResumeDetailed(
   // The toolbar button is Vue-controlled as well; use the full pointer
   // sequence so the resume picker is opened in the same way as a user click.
   const baseline = countResumeSentMarks()
+  assertChatExecutionActive()
+  resumeSendState.attempted = true
   realClick(btn)
   await delay(1200, 1800)
 
   if (targetName || targetIndex != null) {
-    const ok = await completeResumeSend(targetName || null, false, baseline, targetIndex ?? null)
+    const ok = await completeResumeSendInThread(targetName || null, false, baseline, targetIndex ?? null)
     return { ok, reason: ok ? undefined : 'send_failed' }
   }
   const cfg = loadConfig()
@@ -2543,7 +2633,7 @@ export async function sendResumeDetailed(
     cfg.defaultSendResumeId && cfg.resumeNames
       ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
       : null
-  const ok = await completeResumeSend(configured, false, baseline)
+  const ok = await completeResumeSendInThread(configured, false, baseline, null)
   return { ok, reason: ok ? undefined : 'send_failed' }
 }
 
