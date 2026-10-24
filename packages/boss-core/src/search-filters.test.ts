@@ -14,6 +14,7 @@ function visibleAll(): void {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   document.body.innerHTML = ''
   diag.mockClear()
 })
@@ -90,27 +91,66 @@ describe('selecting a filter (click → panel → option)', () => {
     }
   }
 
-  it('opens the group panel and clicks the exact option', async () => {
+  it('selects only the requested group and confirms its resulting state', async () => {
+    vi.useFakeTimers()
+    // 2026-10-25 probe_dom commands 40/42: every group owns a dropdown;
+    // hidden dropdowns retain nonzero geometry and several groups contain 不限.
     document.body.innerHTML = `
-      <div class="filter-bar"><span class="label">工作经验</span></div>`
+      <style>.filter-select-dropdown li { cursor: pointer; }</style>
+      <div class="filter-condition-inner">
+        <div class="condition-filter-select" id="salary">
+          <div class="current-select"><span class="placeholder-text">薪资待遇</span></div>
+          <div class="filter-select-dropdown" style="visibility:hidden"><ul>
+            <li>不限<i class="ui-icon-check"></i></li><li>10-15K<i class="ui-icon-check"></i></li>
+          </ul></div>
+        </div>
+        <div class="condition-filter-select is-select" id="experience">
+          <div class="current-select"><span class="placeholder-text">工作经验</span><em class="select-num">(1)</em></div>
+          <div class="filter-select-dropdown" style="visibility:hidden"><ul>
+            <li>不限<i class="ui-icon-check"></i></li><li class="active">3-5年<i class="ui-icon-check"></i></li>
+          </ul></div>
+        </div>
+      </div>`
     rects()
-    const label = document.querySelector('.label') as HTMLElement
-    label.addEventListener('click', () => {
-      const panel = document.createElement('div')
-      panel.className = 'dropdown-panel'
-      panel.innerHTML = '<span>1-3年</span><span>3-5年</span>'
-      document.body.appendChild(panel)
-      rects()
-    })
-    const clicked: string[] = []
-    document.addEventListener('click', (e) => {
-      const t = (e.target as HTMLElement).textContent || ''
-      if (t === '3-5年') clicked.push(t)
+    window.history.replaceState({}, '', '/web/geek/jobs?query=test&experience=105')
+    const group = document.querySelector('#experience') as HTMLElement
+    const panel = group.querySelector('.filter-select-dropdown') as HTMLElement
+    const label = group.querySelector('.placeholder-text') as HTMLElement
+    label.addEventListener('click', () => { panel.style.visibility = 'visible' })
+    const salaryClick = vi.fn()
+    document.querySelector('#salary li')!.addEventListener('click', salaryClick)
+    const selectedOptions: string[] = []
+    panel.addEventListener('click', (event) => {
+      const li = (event.target as Element).closest('li')
+      if (!li) return
+      selectedOptions.push(li.textContent || '')
+      if (li.textContent === '不限') {
+        panel.querySelector('.active')?.classList.remove('active')
+        group.classList.remove('is-select')
+        group.querySelector('.select-num')?.remove()
+        panel.style.visibility = 'hidden'
+        window.history.replaceState({}, '', '/web/geek/jobs?query=test')
+      } else {
+        // A click and an unrelated URL update are insufficient confirmation.
+        window.history.replaceState({}, '', '/web/geek/jobs?query=test&city=1')
+      }
     })
 
-    const r = await selectSearchFilter('工作经验', '3-5年')
-    expect(r.status).toBe('ok')
-    expect(clicked).toEqual(['3-5年'])
+    const clearing = selectSearchFilter('工作经验', '不限')
+    await vi.runAllTimersAsync()
+    expect(await clearing).toMatchObject({ status: 'ok', urlChanged: true })
+    expect(selectedOptions).toEqual(['不限'])
+    expect(salaryClick).not.toHaveBeenCalled()
+    expect(readSearchFilters().find((g) => g.name === '工作经验')?.options.some((o) => o.selected)).toBe(false)
+
+    expect(await selectSearchFilter('工作经验', '不限')).toMatchObject({ status: 'ok', urlChanged: false })
+    expect(selectedOptions).toEqual(['不限'])
+
+    const ignored = selectSearchFilter('工作经验', '3-5年')
+    await vi.runAllTimersAsync()
+    expect(await ignored).toMatchObject({ status: 'selection_not_confirmed', urlChanged: true })
+    expect(selectedOptions).toEqual(['不限', '3-5年'])
+    expect(salaryClick).not.toHaveBeenCalled()
   })
 
   it('stops and says why when the group label is missing', async () => {
