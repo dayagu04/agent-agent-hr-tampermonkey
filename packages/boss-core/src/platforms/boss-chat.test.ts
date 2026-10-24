@@ -9,6 +9,7 @@ vi.mock('../platform-bridge', () => ({
 vi.mock('../logger', () => ({ diag: vi.fn() }))
 
 import {
+  chatPageOperations,
   classifyCard,
   clickCard,
   completeResumeSend,
@@ -827,6 +828,41 @@ describe('thread matching', () => {
       expect(currentThreadInfo().jobTitle).toBe('人事专员')
       expect(currentThreadId()).toBe('周女士|人事专员')
       expect(target).toHaveBeenCalledTimes(3)
+      expect(wrong).not.toHaveBeenCalled()
+
+      // The native public entry must confirm the actual header too, not the
+      // position-name in the target list row or an already displayed HR name.
+      rows[1].setAttribute('data-user-id', 'native-target')
+      const window = await chatPageOperations['chat.window']({}) as { threads: unknown[] }
+      const nativeTarget = window.threads[1]
+      document.querySelector('#header .position-name')!.textContent = '纯客服'
+      target.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .position-name')!.textContent = '人事专员'
+      }, 400) })
+      let nativeFinished = false
+      const nativeResult = chatPageOperations['chat.open']({ target: nativeTarget })
+        .then(value => { nativeFinished = true; return value })
+      await vi.advanceTimersByTimeAsync(200)
+      expect(nativeFinished).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(await nativeResult).toMatchObject({
+        threadId: 'chat:["江苏迈泉科技","周女士","人事专员"]',
+        info: { company: '江苏迈泉科技', hrName: '周女士', jobTitle: '人事专员' },
+      })
+      expect(target).toHaveBeenCalledTimes(4)
+
+      // Two native identities can share all text exposed by the header. That
+      // header cannot prove which row is active, even if the requested row ID is unique.
+      const duplicate = document.createElement('li')
+      duplicate.setAttribute('data-user-id', 'another-native-id')
+      duplicate.innerHTML = '<span class="name-box"><span class="name-text">周女士</span>江苏迈泉科技</span>'
+      Object.assign(duplicate, { __vue__: { handleClick: wrong, boss: {
+        securityId: 'other', name: '周女士', brandName: '江苏迈泉科技', positionName: '人事专员',
+      } } })
+      document.querySelector('.user-list')!.appendChild(duplicate)
+      expect(await chatPageOperations['chat.open']({ target: nativeTarget })).toBeNull()
+      expect(await chatPageOperations['chat.current']({})).toMatchObject({ threadId: '' })
+      expect(target).toHaveBeenCalledTimes(4)
       expect(wrong).not.toHaveBeenCalled()
     } finally { vi.useRealTimers() }
   })
