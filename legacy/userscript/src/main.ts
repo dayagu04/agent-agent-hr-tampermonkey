@@ -1,7 +1,9 @@
 // 油猴脚本入口 —— 注入 Vue 悬浮面板到招聘平台页面
+// 先安装同步宿主能力，再求值任何共享业务模块。
+import './platform-runtime'
 import { createApp } from 'vue'
-import App from './App.vue'
-import { startRemoteLoop } from './remote'
+import App from '../../../packages/boss-core/src/App.vue'
+import { startRemoteLoop } from '../../../packages/boss-core/src/remote'
 import { runLatestDevBuild } from './dev-loader'
 
 function mount() {

@@ -1,5 +1,5 @@
 // Only the selected resume label enters MAIN; backend URL, IDs and JWT stay in the service worker.
-import type { PluginConfig } from '../../../../src/types'
+import type { PluginConfig } from '../../../../packages/boss-core/src/types'
 let defaultResumeName = ''
 export function setPageResumeName(name = ''): void { defaultResumeName = name }
 export function loadConfig(): PluginConfig {

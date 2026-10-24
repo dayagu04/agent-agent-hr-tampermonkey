@@ -29,7 +29,7 @@ jobs:
       - id: paths
         run: node scripts/check-extension-paths.mjs
 
-  legacy-contracts:
+  shared-contracts:
     needs: select
     if: needs.select.outputs.boss == 'true' || needs.select.outputs.legacy == 'true'
     runs-on: ubuntu-latest
@@ -41,8 +41,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run typecheck:core
       - run: npm run typecheck:userscript
-      - run: npm run test:userscript
+      - run: npm test
 
   boss:
     needs: select
@@ -111,7 +112,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [select, legacy-contracts, boss, autofill, legacy]
+    needs: [select, shared-contracts, boss, autofill, legacy]
     if: >-
       always() && startsWith(github.ref, 'refs/tags/') &&
       needs.select.result == 'success' &&

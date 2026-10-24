@@ -1,29 +1,10 @@
-// 平台桥接层 —— 隔离 GM API
-//
-// 业务代码只调这一层、不直接用 GM_*；将来迁移到独立扩展时只换这个文件。
-
-export interface StorageAPI {
-  get<T>(key: string, defaultValue: T): Promise<T>
-  set<T>(key: string, value: T): Promise<void>
-  remove(key: string): Promise<void>
-  clear(): Promise<void>
-}
-
-export interface NetworkAPI {
-  /** 跨域 HTTP 请求（油猴用 GM_xmlhttpRequest，扩展用 fetch） */
-  request(opts: {
-    method: string
-    url: string
-    headers?: Record<string, string>
-    data?: string
-    timeout?: number
-  }): Promise<{ status: number; responseText: string }>
-}
-
-export interface NotificationAPI {
-  /** 桌面通知 */
-  notify(title: string, message: string): void
-}
+// 仅历史 userscript 入口加载此适配器；共享业务与 MV3 不引用 GM API。
+import {
+  installPlatformRuntime,
+  type StorageAPI,
+  type NetworkAPI,
+  type NotificationAPI,
+} from '../../../packages/boss-core/src/platform-bridge'
 
 class GMStorageAPI implements StorageAPI {
   async get<T>(key: string, defaultValue: T): Promise<T> {
@@ -85,6 +66,12 @@ class GMNotificationAPI implements NotificationAPI {
   }
 }
 
-export const storage: StorageAPI = new GMStorageAPI()
-export const network: NetworkAPI = new GMNetworkAPI()
-export const notification: NotificationAPI = new GMNotificationAPI()
+installPlatformRuntime({
+  storage: new GMStorageAPI(),
+  network: new GMNetworkAPI(),
+  notification: new GMNotificationAPI(),
+  configuration: {
+    get: (key, defaultValue) => GM_getValue<string>(key, defaultValue),
+    set: (key, value) => { GM_setValue(key, value) },
+  },
+})

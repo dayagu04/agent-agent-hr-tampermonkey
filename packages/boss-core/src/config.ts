@@ -1,4 +1,5 @@
-// 配置存储 — 基于油猴 GM_setValue/GM_getValue 持久化
+// 配置存储 — 宿主适配器负责快照与持久化
+import { configuration } from './platform-bridge'
 import type { PluginConfig } from './types'
 import { DEFAULT_AGENT_POLICY, normalizeAgentPolicy } from './contact-policy'
 
@@ -43,8 +44,8 @@ const DEFAULT_CONFIG: PluginConfig = {
 }
 
 export function loadConfig(): PluginConfig {
+  const raw = configuration.get(CONFIG_KEY, '')
   try {
-    const raw = GM_getValue(CONFIG_KEY, '')
     if (!raw) return { ...DEFAULT_CONFIG }
     const parsed = JSON.parse(raw as string)
     const cfg = { ...DEFAULT_CONFIG, ...parsed }
@@ -70,7 +71,7 @@ export function loadConfig(): PluginConfig {
 }
 
 export function saveConfig(cfg: PluginConfig): void {
-  GM_setValue(CONFIG_KEY, JSON.stringify(cfg))
+  configuration.set(CONFIG_KEY, JSON.stringify(cfg))
 }
 
 /** 网页端偏好（users.plugin_preferences）合并进本地配置，网页端设置优先。 */

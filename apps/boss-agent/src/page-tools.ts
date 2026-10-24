@@ -1,7 +1,7 @@
 // Credential-free adapter around the shared atomic tool definitions.
-import { BossPlatform } from '../../../src/platforms/boss'
-import { createToolDefinitions, findJobCard, toolString } from '../../../src/tool-definitions'
-import { assertToolExecutionActive, installToolExecutionGuard } from '../../../src/tool-execution-guard'
+import { BossPlatform } from '../../../packages/boss-core/src/platforms/boss'
+import { createToolDefinitions, findJobCard, toolString } from '../../../packages/boss-core/src/tool-definitions'
+import { assertToolExecutionActive, installToolExecutionGuard } from '../../../packages/boss-core/src/tool-execution-guard'
 import { setPageResumeName } from './page/config'
 import { toolCatalog, validateToolArgs } from './tools-contract'
 import type { BossPageTools, PageEffect, PageExecution, PageInvocation, ToolResult } from './contracts'

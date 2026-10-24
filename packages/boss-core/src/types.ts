@@ -58,7 +58,7 @@ export interface ApplyRule {
 /** 投递真实结果：applied=平台已确认 / unknown=无法确认 / failed=明确失败 */
 export type ApplyOutcome = 'applied' | 'unknown' | 'failed'
 
-/** 插件配置（存 GM_setValue） */
+/** 插件配置，由宿主运行时持久化。 */
 export interface PluginConfig {
   apiBase: string // 后端地址，如 https://gudaya.chat
   token: string // JWT Token

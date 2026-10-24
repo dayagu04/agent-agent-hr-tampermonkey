@@ -15,8 +15,8 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["vite/client", "vite-plugin-monkey/client"]
+    "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.vue"],
+  "include": ["packages/boss-core/src/**/*.ts", "packages/boss-core/src/**/*.vue"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

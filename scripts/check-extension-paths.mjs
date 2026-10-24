@@ -34,8 +34,9 @@ if (ref.startsWith('refs/tags/')) {
     for (const path of paths) {
       if (path.startsWith('apps/boss-agent/')) selected.boss = true
       else if (path.startsWith('apps/application-autofill/')) selected.autofill = true
-      else if (path.startsWith('src/') || path === 'vite.config.ts' || path.startsWith('vitest.config.') || path.startsWith('tsconfig.')) {
-        selected.boss = true // page bridge deliberately reuses the legacy DOM tools
+      else if (path.startsWith('legacy/userscript/') || path === 'vite.config.ts') selected.legacy = true
+      else if (path.startsWith('packages/boss-core/') || path.startsWith('src/') || path.startsWith('vitest.config.') || path.startsWith('tsconfig.')) {
+        selected.boss = true // shared business and DOM tools serve both runtimes
         selected.legacy = true
       } else if (path.endsWith('.md') || path.startsWith('docs/') || ['LICENSE', '.gitignore'].includes(path)) {
         // Documentation and ignored-file policy do not change executable inputs.

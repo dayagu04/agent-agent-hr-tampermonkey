@@ -1,5 +1,6 @@
 import { defineConfig, type Plugin } from 'vite'
 import { fileURLToPath } from 'node:url'
+import pkg from './package.json'
 import { dirname, resolve } from 'node:path'
 
 const app = fileURLToPath(new URL('.', import.meta.url))
@@ -9,7 +10,7 @@ const repository = resolve(app, '../..')
 // keeps the authenticated API client; the page gets data/DOM-only facades.
 function pageFacades(): Plugin {
   const facades = new Map(['logger', 'config', 'api', 'ledger'].map(name => [
-    resolve(repository, `src/${name}.ts`),
+    resolve(repository, `packages/boss-core/src/${name}.ts`),
     resolve(app, `src/page/${name === 'api' || name === 'ledger' ? 'forbidden-' : ''}${name}.ts`),
   ]))
   return {
@@ -24,6 +25,7 @@ function pageFacades(): Plugin {
 }
 
 export default defineConfig({
+  define: { __AAH_BOSS_VERSION__: JSON.stringify(pkg.version) },
   root: app,
   plugins: [pageFacades()],
   build: {
