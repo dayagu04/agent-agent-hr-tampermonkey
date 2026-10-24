@@ -80,14 +80,14 @@ CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试�
 ```bash
 npm run typecheck
 npm run test:core             # 共享业务与页面契约
-npm run test:userscript       # 仅旧宿主兼容契约
+npm run test:legacy           # 仅旧宿主兼容契约
 npm run test:autofill         # 网申自己的既有契约
 npm run build:boss
 npm run build:autofill
 npm run check:artifacts
 ```
 
-BOSS MV3 的运行时测试由其专用配置执行，CI 与共享页面契约分开选择；不要为小改动反复跑全部矩阵。页面真实回归不由 mock/jsdom 或构建检查代替。
+现有 CI 入口 `typecheck:userscript` / `test:userscript` 继续验证共享 core 与旧适配器；无需改 GitHub 工作流即可覆盖新目录。BOSS MV3 的运行时测试由其专用配置执行，CI 与共享页面契约分开选择；不要为小改动反复跑全部矩阵。页面真实回归不由 mock/jsdom 或构建检查代替。
 
 - BOSS：`apps/boss-agent/package.json` / manifest，发布标签 `boss-vX.Y.Z`。
 - 网申：`apps/application-autofill/package.json` / manifest，发布标签 `autofill-vX.Y.Z`。

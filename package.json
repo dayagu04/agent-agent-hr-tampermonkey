@@ -8,17 +8,17 @@
     "build": "node scripts/build-extensions.mjs",
     "build:local": "node scripts/build-local.mjs",
     "preview": "vite preview",
-    "typecheck": "npm run typecheck:core && npm run typecheck:userscript && npm run typecheck:boss && npm run typecheck:autofill",
+    "typecheck": "npm run typecheck:userscript && npm run typecheck:boss && npm run typecheck:autofill",
     "test": "vitest run",
     "tool": "node scripts/tool.mjs",
     "dev:serve": "node scripts/dev-serve.mjs",
     "build:boss": "node scripts/build-extensions.mjs boss-agent",
     "build:autofill": "node scripts/build-extensions.mjs application-autofill",
     "build:userscript": "vite build",
-    "typecheck:userscript": "vue-tsc --noEmit --project legacy/userscript/tsconfig.json",
+    "typecheck:userscript": "npm run typecheck:core && vue-tsc --noEmit --project legacy/userscript/tsconfig.json",
     "typecheck:boss": "tsc --noEmit --project apps/boss-agent/tsconfig.json",
     "typecheck:autofill": "npm --prefix apps/application-autofill run typecheck",
-    "test:userscript": "vitest run legacy/userscript/src",
+    "test:userscript": "vitest run",
     "test:autofill": "npm --prefix apps/application-autofill test",
     "check:artifacts": "node scripts/check-extension-artifacts.mjs",
     "package": "node scripts/package-extensions.mjs",
@@ -26,7 +26,8 @@
     "package:autofill": "node scripts/package-extensions.mjs application-autofill",
     "test:boss": "vitest run --config apps/boss-agent/vitest.config.ts",
     "typecheck:core": "vue-tsc --noEmit --project tsconfig.check.json",
-    "test:core": "vitest run packages/boss-core/src"
+    "test:core": "vitest run packages/boss-core/src",
+    "test:legacy": "vitest run legacy/userscript/src"
   },
   "dependencies": {
     "vue": "^3.4.21"
