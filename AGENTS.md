@@ -28,12 +28,8 @@ GET  /api/plugin/tools/result/{command_id}   → 200 结果 / 202 阶段（见 �
 - 结果保留 10 分钟、上限 200 条、超过 200KB 截断；`logs/plugin/YYYY-MM-DD.log` 只有摘要。
 - **读页面结构也用工具，不开 DevTools**（BOSS 检测到 F12 会关页）：
   `get_page_state` `read_filters` `scan_jobs` `list_threads` `read_messages` `probe_dom` `probe_overlays` `probe_row`。
-- **时延**：插件约 1 秒一次心跳。标签页在后台时，0.6.56 起由 Worker 驱动心跳避开 Chrome 的定时器节流。
-- **冻结（整页暂停）**：Chrome 的「节省内存」等机制可能把后台标签页整页冻结，Worker 一起停，
-  命令会一直 `queued`，页面恢复后照常执行（不丢、不重复）。插件在冻结/恢复时写
-  `[REMOTE] page_lifecycle status=frozen|resumed frozen_s=N`。要长期挂后台跑 agent，
-  在 `chrome://settings/performance` 把 `www.zhipin.com` 加入「始终保持这些网站的活动状态」。
-  agent 侧判断：心跳 `last_seen` 停止更新 = 插件不在线或被冻结，不要把超时当成工具失败。
+- **时延与后台页**：MV3 后台负责心跳，页面负责 DOM 操作；`connected=true` 不能证明页面定时器正在正常执行。隐藏页的详情读取实测可能超时，保持 BOSS 页在前台后可通过命令完成。旧油猴 0.6.56 的 Worker 心跳不代表原生页面执行机制。
+- **冻结与中断**：Chrome 可能暂停后台页面。查询原 command_id，依据实际阶段与页面结果处理；执行中断返回 `reconciliation_required` 时不可重做副作用。后端仍在线也不能把未返回的动作写成成功。长期运行可在 Chrome 性能设置保留 BOSS 活动状态，但不能据此承诺所有冻结恢复场景已验收。
 
 ## 1. 什么是工具
 
@@ -124,7 +120,7 @@ tool name=delete_thread status=error ms=120 error=not-found
 | `open_search` | `keyword`, `cityCode?`, `page?` | | 打开职位搜索页（保留当前筛选） |
 | `scan_jobs` | `withDetail?`, `offset?`, `limit?` | | 扫描岗位；JD每批最多10条，按 `nextOffset` 继续 |
 | `read_job_detail` | `jobId` | | 读指定岗位 JD 全文（只切详情，不投递） |
-| `apply_job` | `jobId` | ✓ | 对指定岗位点「立即沟通」并记账 |
+| `apply_job` | `jobId`, `greeting?`, `resumeId?`（原生） | ✓ | 点击沟通并回报真实招呼来源；原生不生成话术，简历仅用于记账 |
 | `read_filters` | — | | 读筛选分组/选项/当前选中 |
 | `select_filters` | `filters: [{group, option}]` | ✓ | 点选筛选项 |
 | `list_threads` | — | | 列出会话（HR 名/公司/未读；岗位与薪资列表行没有） |
@@ -160,6 +156,23 @@ tool name=delete_thread status=error ms=120 error=not-found
 | 删会话 | `delete_thread` | 已验证（京北方会话删除成功，重新打开返回 not-found） |
 
 判定「封装完成」的标准：agent 只靠工具 + `/tools/result` 就能完成该环节，不依赖页面手动操作。
+
+### 原生迁移验收口径
+
+21 个工具共用原页面实现，独立扩展负责原生存储、认证、命令收据与回报。工具存在于目录、构建通过和真实平台成功是三种不同证据；必须分别记录。
+
+| 原子能力 | Chrome 原生现场证据（2026-10-25） |
+|---|---|
+| `get_page_state`、`open_search`、`scan_jobs`、`read_job_detail` | 命令读取成功；列表 15 条，offset 分批；隐藏页详情超时后，前台单条 JD 返回 710 字。切换目标的身份核对另行验证，不能只看字数 |
+| `read_filters`、`select_filters` | 读取 8 组，3–5 年选中成功；恢复不限暴露旧全页同名匹配问题，修复后需核对本组选中状态 |
+| `list_threads`、`open_thread`、`read_thread_header`、`read_messages` | 40 条会话；新测试会话头部、岗位、消息读回成功 |
+| `apply_job`、`send_message` | 仅一次授权投递并记账、一次明确测试消息送达且读回恰好一次；投递为 BOSS 默认招呼，没有发送附件 |
+| `list_pending_cards`、`send_resume`、`click_card` | 当前测试会话待卡片 0，发简历按钮被 BOSS 禁用；只读结果成立，附件和卡片执行尚无成功条件 |
+| `delete_thread` | 唯一身份与缺岗位头部确认已修复；真实删除仍需明确测试目标与授权 |
+| `reload_page`、`probe_dom`、工具发现 | 刷新及诊断命令成功；`probe_dom` 只对同源岗位详情链接增加公开 `jobId`，不回传完整 href/query |
+| `probe_overlays`、`probe_row`、`list_tools` | 保留共享实现；工具发现不替代各诊断入口的本轮现场执行 |
+
+原悬浮窗收起、展开、拖动已由用户确认。Edge、批量进度、托管自动回复和冻结恢复的完整回归尚未完成；不要用旧油猴成功记录覆盖这些缺口。
 
 **不可撤回工具超时后一律不自动重发**：先看 `state`，`delivered`/`acked` 时用只读工具（`read_messages` / `list_pending_cards` / `list_threads`）核实页面结果。
 

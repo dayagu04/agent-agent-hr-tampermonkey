@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "谷谷 BOSS 求职 Agent",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "把 BOSS 直聘页面的岗位、投递和会话能力提供给求职 Agent。",
   "minimum_chrome_version": "116",
   "permissions": [

@@ -17,6 +17,8 @@
 
 BOSS 0.7.1 修复扩展面板启动被拒绝及错误提示裁切的问题，需要 Chromium 116 或以上。后台通过 Chrome 的活动扩展上下文验证面板，通过导航接口验证顶层 BOSS 文档；iframe 挂在封闭 shadow root 内隔离页面样式和通用 iframe 扫描。shadow root 只隔离界面，不承担认证。扩展重载后会重新挂载已打开、可用的 BOSS 页，保留登录和配置；冻结页等待恢复，未确认动作仍先核查。
 
+BOSS 0.7.2 继续迁移原子工具：原生 `apply_job` 直接接收上层给定的招呼语与本次记账简历，不再强制请求话术生成。原悬浮窗和批量控制的既有流程保留；原子工具的可用性不依赖面板是否展开。
+
 ## 构建与安装
 
 Node.js 22.15 或以上：
@@ -74,6 +76,8 @@ CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试�
 `open_thread` 指定岗位未匹配时返回 `not-found`，同公司多条匹配返回 `ambiguous`，不会退回首条；只有页面头部的公司、HR和岗位与目标一致才返回 `ok`。跨页调用首先回报 `navigating`，扩展最多尝试5次定位；完成后在同一个 command_id 上回报实际结果。CLI 的 `wait` 会等待过渡结束，`result` 对过渡状态返回 pending/退出码2。歧义立即终止。定位失败后仍可读状态/会话，发送等动作返回 `navigation_recovery_required`；用明确目标再次 `open_thread` 成功后恢复。旧油猴没有最终定位回报时，等待会超时，需通过 `read_thread_header` 另行确认。
 
 搜索/岗位工具返回岗位 ID、公司、名称、地点、薪资、JD 和来源 URL；详情和会话工具使用页面实际值。`send_message` 保留 `delivered/read/sending/failed/none` 回执；`sending` 已上屏，不能因尚无送达回执而重发。
+
+原生 `apply_job` 参数为 `{jobId, greeting?, resumeId?}`。`greeting` 缺省为空，由 Agent 决定内容；平台自动发送默认招呼时不会追加第二条，查看 `greetingSource` / `customGreetingSent` 区分事实。`resumeId` 只用于后端记账，必须属于当前账号；缺省使用面板已选简历，不会发送附件或改变默认配置。后端记账仍沿用简历关联 Agent 的现有约束。校验或页面准备阶段失败返回 `mayHaveExecuted=false`；执行开始后的不确定结果仍需核查。旧油猴缺省话术与原界面编排保持原行为。
 
 结果查询 `200 done` 表示结果已回传；`202 queued/delivered/acked` 表示队列阶段。不可撤回动作在 delivered/acked 或客户端返回 `reconciliation_required` 时，先只读核查，不自动重新入队。扩展重启后对执行中断的动作保留核查状态，页面动作和数据库上报分别处理，不以接口成功伪造平台成功。
 
