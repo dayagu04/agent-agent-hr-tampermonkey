@@ -864,6 +864,53 @@ describe('thread matching', () => {
       expect(await chatPageOperations['chat.current']({})).toMatchObject({ threadId: '' })
       expect(target).toHaveBeenCalledTimes(4)
       expect(wrong).not.toHaveBeenCalled()
+
+      // New conversations can have no job in either DOM or Vue until their header loads.
+      document.body.innerHTML = `<ul class="user-list"><li>
+        <span class="name-box"><span class="name-text">陈女士</span>新会话公司...</span>
+      </li></ul><section id="header"><span class="name-text">其他女士</span><span class="company">其他公司</span><span class="position-name">其他岗位</span></section>`
+      const freshRow = document.querySelector('li')!
+      const freshBoss = { securityId: 'fresh', name: '陈女士', brandName: '新会话公司...', positionName: '' }
+      const allSources = [freshBoss]
+      const freshSelect = vi.fn()
+      Object.assign(freshRow, { __vue__: { handleClick: freshSelect, boss: freshBoss,
+        $parent: { $options: { name: 'virtual-list' }, $props: { dataSources: allSources } },
+      } })
+      vi.spyOn(document.querySelector('#header .company')!, 'getBoundingClientRect').mockReturnValue({
+        x: 100, y: 0, top: 0, left: 100, right: 300, bottom: 40, width: 200, height: 40, toJSON: () => ({}),
+      })
+      expect(openThread('新会话公司', '客服')).toBe('not-found')
+      // An unrendered conversation still makes the company-only candidate ambiguous.
+      allSources.push({ ...freshBoss, securityId: 'unrendered', name: '另一位女士' })
+      expect(await openThreadConfirmed('新会话公司', '客服')).toBe('ambiguous')
+      allSources.pop()
+      freshBoss.name = ''
+      freshRow.querySelector('.name-text')!.textContent = ''
+      expect(await openThreadConfirmed('新会话公司', '客服')).toBe('thread_not_confirmed')
+      freshBoss.name = '陈女士'
+      freshRow.querySelector('.name-text')!.textContent = '陈女士'
+      expect(freshSelect).not.toHaveBeenCalled()
+      freshSelect.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .company')!.textContent = '新会话公司...'
+        document.querySelector('#header .name-text')!.textContent = '陈女士'
+        document.querySelector('#header .position-name')!.textContent = '客服'
+      }, 400) })
+      let freshFinished = false
+      const freshResult = openThreadConfirmed('新会话公司', '客服').then(value => { freshFinished = true; return value })
+      await vi.advanceTimersByTimeAsync(200)
+      expect(freshFinished).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(await freshResult).toBe('ok')
+      expect(freshSelect).toHaveBeenCalledTimes(1)
+      // The same unique target remains an idempotent read once all header fields match.
+      expect(await openThreadConfirmed('新会话公司', '客服')).toBe('ok')
+      expect(freshSelect).toHaveBeenCalledTimes(1)
+      // A known row's longer job title must not replace the explicit requested job during confirmation.
+      freshBoss.positionName = '客服主管'
+      document.querySelector('#header .position-name')!.textContent = '客服主管'
+      const conflictingJob = openThreadConfirmed('新会话公司', '客服')
+      await vi.runAllTimersAsync()
+      expect(await conflictingJob).toBe('thread_not_confirmed')
     } finally { vi.useRealTimers() }
   })
 

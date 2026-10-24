@@ -799,6 +799,29 @@ function findThreadToOpen(company: string, jobTitle: string): ChatThread | 'not-
   return matches[0]
 }
 
+const confirmationCompany = (value: string) => value.replace(/\s+/g, '').toLowerCase().replace(/[.．…]{2,}$/, '')
+
+/** A new row may expose its job only after selection. This candidate is never sufficient for synchronous success. */
+function findUnknownJobThread(company: string): ChatThread | 'not-found' | 'ambiguous' | 'thread_not_confirmed' {
+  const wanted = confirmationCompany(company)
+  if (!wanted) return 'not-found'
+  const matches = listThreadsQuiet().map(thread => ({ thread, info: readRowJobInfo(thread.el) }))
+    .filter(({ thread, info }) => confirmationCompany(info.brandName || thread.company).includes(wanted))
+  if (!matches.length) return 'not-found'
+  if (matches.length > 1) return 'ambiguous'
+  const { thread, info } = matches[0]
+  if (info.title || thread.jobTitle) return 'not-found'
+  const hrName = (info.hrName || thread.name).replace(/\s+/g, '').toLowerCase()
+  if (!hrName) return 'thread_not_confirmed'
+  const sources = readChatSources()
+  if (sources) {
+    const candidates = sources.filter(({ boss }) => confirmationCompany(String(boss.brandName || boss.company || '')).includes(wanted))
+    if (candidates.length > 1) return 'ambiguous'
+    if (candidates.length !== 1 || String(candidates[0].boss.name || candidates[0].boss.bossName || '').replace(/\s+/g, '').toLowerCase() !== hrName) return 'thread_not_confirmed'
+  }
+  return thread
+}
+
 function activateThread(hit: ChatThread): 'ok' | 'failed' {
   try {
     if (!switchThreadViaVue(hit.el)) realClick(hit.el)
@@ -821,7 +844,9 @@ export async function openThreadConfirmed(company: string, jobTitle = ''): Promi
   if (installedChatDriver()) return openChatThread(company, jobTitle)
   assertChatExecutionActive()
   // Resolve uniqueness even when a matching header is already open: company alone cannot identify an HR.
-  const target = findThreadToOpen(company, jobTitle)
+  let target: ReturnType<typeof findUnknownJobThread> = findThreadToOpen(company, jobTitle)
+  const unknownJob = target === 'not-found' && !!jobTitle.trim()
+  if (unknownJob) target = findUnknownJobThread(company)
   if (typeof target === 'string') return target
   return confirmThreadRow(target, company, jobTitle)
 }
@@ -830,15 +855,15 @@ async function confirmThreadRow(target: ChatThread, company = target.company, jo
   const row = readRowJobInfo(target.el)
   const norm = (value: string) => value.replace(/\s+/g, '').toLowerCase()
   const expected = {
-    company: norm(row.brandName || company),
+    company: confirmationCompany(row.brandName || company),
     hrName: norm(row.hrName || target.name),
-    jobTitle: norm(row.title || target.jobTitle || jobTitle),
+    jobTitle: norm(jobTitle || row.title || target.jobTitle),
   }
   // Missing identity is not evidence that the current conversation is the requested one.
   if (!expected.company || !expected.hrName || !expected.jobTitle) return 'thread_not_confirmed'
   const confirmed = () => {
     const header = currentThreadInfo()
-    return norm(header.company) === expected.company && norm(header.hrName) === expected.hrName && norm(header.jobTitle) === expected.jobTitle
+    return confirmationCompany(header.company) === expected.company && norm(header.hrName) === expected.hrName && norm(header.jobTitle) === expected.jobTitle
   }
   if (confirmed()) return 'ok'
   const activated = activateThread(target)
