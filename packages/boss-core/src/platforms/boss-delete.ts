@@ -441,6 +441,7 @@ export async function clickDeleteInHeaderMenu(
 
   for (const n of delNodes) {
     if (isVisible(n)) {
+      if (!verifyIdentity()) return false
       clickDirect(n)
       return true
     }
@@ -452,6 +453,7 @@ export async function clickDeleteInHeaderMenu(
   if (opened) {
     const vis = delNodes.find((n) => isVisible(n))
     if (vis) {
+      if (!verifyIdentity()) return false
       clickDirect(vis)
       return true
     }
@@ -472,9 +474,10 @@ export async function clickDeleteInHeaderMenu(
   const vis = delNodes.find((n) => isVisible(n)) || target
   // 只点一个节点且只点一次：delNodes 里可能有多个「删除」文本节点，
   // 逐个点会让 Vue handler 触发多次，出现多个确认弹窗。
-  clickDirect(vis)
+  const confirmed = verifyIdentity()
+  if (confirmed) clickDirect(vis)
   for (const m of marked) m.classList.remove(MARK_MENU)
-  return true
+  return confirmed
 }
 
 /**

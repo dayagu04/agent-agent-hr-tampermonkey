@@ -4,7 +4,9 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('../platform-bridge', () => ({
   configuration: { get: (_key: string, fallback: string) => fallback, set: vi.fn() },
 }))
+vi.mock('../logger', () => ({ diag: vi.fn() }))
 import { deleteViaRowVue, findBossObject } from './boss-delete'
+import { deleteThread } from './boss-chat'
 
 describe('findBossObject', () => {
   it('只认带 securityId 的 boss 对象', () => {
@@ -34,7 +36,7 @@ describe('findBossObject', () => {
 })
 
 describe('deleteViaRowVue', () => {
-  it('名字核对通过时调用本行 deleteBoss(boss)', () => {
+  it('只删除唯一且身份已确认的本行，并回报该目标而非公司首条', async () => {
     const deleteBoss = vi.fn()
     const row = document.createElement('li')
     row.innerHTML = '<div class="last-msg">张三 测试公司 招聘主管</div>'
@@ -47,6 +49,123 @@ describe('deleteViaRowVue', () => {
     expect(deleteViaRowVue(row)).toBe(true)
     expect(deleteBoss).toHaveBeenCalledTimes(1)
     expect(deleteBoss).toHaveBeenCalledWith(expect.objectContaining({ securityId: 's1' }))
+
+    // Same measured row/header structure as the existing thread-matching contract.
+    document.body.innerHTML = `<ul class="user-list">
+      <li data-user-id="target"><span class="name-box"><span class="name-text">陈女士</span>新会话公司...</span></li>
+      <li data-user-id="other"><span class="name-box"><span class="name-text">另一位女士</span>新会话公司...</span></li>
+    </ul><section id="header"><span class="name-text">其他女士</span><span class="company">其他公司</span><span class="position-name">其他岗位</span></section>`
+    const rows = Array.from(document.querySelectorAll('li'))
+    const targetBoss = { securityId: 'target', uniqueId: 'target', encryptJobId: 'actual-job', name: '陈女士', brandName: '新会话公司...', positionName: '' }
+    const otherBoss = { ...targetBoss, securityId: 'other', uniqueId: 'other', encryptJobId: 'other-job', name: '另一位女士' }
+    const sources = [targetBoss, otherBoss]
+    const listVm = { $options: { name: 'virtual-list' }, $props: { dataSources: sources } }
+    const select = vi.fn()
+    const remove = vi.fn(() => { rows[0].remove(); sources.splice(sources.indexOf(targetBoss), 1) })
+    const wrongRemove = vi.fn()
+    Object.assign(rows[0], { scrollIntoView: vi.fn(), __vue__: { boss: targetBoss, handleClick: select, deleteBoss: remove, $parent: listVm } })
+    Object.assign(rows[1], { scrollIntoView: vi.fn(), __vue__: { boss: otherBoss, deleteBoss: wrongRemove, $parent: listVm } })
+    const afterDeleted = vi.fn(async () => {})
+    const pointDescriptor = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
+    vi.spyOn(document.querySelector('#header .company')!, 'getBoundingClientRect').mockReturnValue({
+      x: 100, y: 0, top: 0, left: 100, right: 300, bottom: 40, width: 200, height: 40, toJSON: () => ({}),
+    })
+    vi.useFakeTimers()
+    try {
+      expect(await deleteThread('新会话公司', '客服', undefined, afterDeleted)).toBe('failed')
+      // Even a second unrendered candidate must prevent a company-only deletion.
+      rows[1].remove()
+      expect(await deleteThread('新会话公司', '', undefined, afterDeleted)).toBe('failed')
+      document.querySelector('.user-list')!.appendChild(rows[1])
+      otherBoss.brandName = '其他公司'
+      rows[1].querySelector('.name-box')!.innerHTML = '<span class="name-text">另一位女士</span>其他公司'
+      for (const identity of [{ bossId: 'missing' }, { encryptJobId: 'missing' }, { bossId: 'other', encryptJobId: 'actual-job' }]) {
+        expect(await deleteThread('新会话公司', '客服', identity, afterDeleted)).toBe('not-found')
+      }
+      expect(remove).not.toHaveBeenCalled()
+      expect(wrongRemove).not.toHaveBeenCalled()
+      expect(afterDeleted).not.toHaveBeenCalled()
+      targetBoss.positionName = '客服主管'
+      expect(await deleteThread('新会话公司', '客服', undefined, afterDeleted)).toBe('not-found')
+      targetBoss.positionName = ''
+
+      // A stale/wrong job header never authorizes deletion of an unknown-job row.
+      const stale = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await stale).toBe('failed')
+      expect(remove).not.toHaveBeenCalled()
+
+      select.mockImplementationOnce(() => { setTimeout(() => {
+        document.querySelector('#header .company')!.textContent = '新会话公司...'
+        document.querySelector('#header .name-text')!.textContent = '陈女士'
+        document.querySelector('#header .position-name')!.textContent = '客服'
+      }, 400) })
+      const recycled = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(remove).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(200)
+      rows[0].setAttribute('data-user-id', 'recycled')
+      await vi.runAllTimersAsync()
+      expect(await recycled).toBe('failed')
+      expect(remove).not.toHaveBeenCalled()
+      rows[0].setAttribute('data-user-id', 'target')
+      // Reusing an already matching header remains valid; no new transition is required.
+      const deletion = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await deletion).toBe('ok')
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(targetBoss)
+      expect(wrongRemove).not.toHaveBeenCalled()
+      expect(afterDeleted).toHaveBeenCalledExactlyOnceWith({
+        company: '新会话公司', jobTitle: '客服', bossId: 'target', encryptJobId: 'actual-job',
+      })
+      expect(document.querySelectorAll('.user-list li')).toHaveLength(1)
+
+      // The header fallback also uses all three identity fields. HR text is
+      // deliberately separate from the company, as on the measured BOSS page.
+      document.querySelector('.user-list')!.prepend(rows[0])
+      sources.unshift(targetBoss)
+      targetBoss.positionName = '客服'
+      Object.assign(rows[0], { __vue__: { boss: targetBoss, handleClick: select, $parent: listVm } })
+      Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
+      rows[0].insertAdjacentHTML('beforeend', '<span class="user-operation"></span>')
+      document.querySelector('#header')!.insertAdjacentHTML('beforeend', '<span id="delete" style="opacity:1">删除</span>')
+      const headerDelete = document.querySelector('#delete')!
+      vi.spyOn(headerDelete, 'getBoundingClientRect').mockReturnValue({
+        x: 100, y: 40, top: 40, left: 100, right: 160, bottom: 60, width: 60, height: 20, toJSON: () => ({}),
+      })
+      headerDelete.addEventListener('click', remove)
+      const fallback = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await fallback).toBe('ok')
+      expect(remove).toHaveBeenCalledTimes(2)
+      expect(afterDeleted).toHaveBeenCalledTimes(2)
+      expect(wrongRemove).not.toHaveBeenCalled()
+
+      document.querySelector('.user-list')!.prepend(rows[0])
+      sources.unshift(targetBoss)
+      ;(headerDelete as HTMLElement).style.visibility = 'hidden'
+      document.querySelector('#header')!.insertAdjacentHTML('beforeend', '<span id="more" style="opacity:1">更多</span>')
+      const more = document.querySelector('#more')!
+      vi.spyOn(more, 'getBoundingClientRect').mockReturnValue({
+        x: 170, y: 40, top: 40, left: 170, right: 190, bottom: 60, width: 20, height: 20, toJSON: () => ({}),
+      })
+      more.addEventListener('click', () => { setTimeout(() => {
+        document.querySelector('#header .position-name')!.textContent = '其他岗位'
+        ;(headerDelete as HTMLElement).style.visibility = 'visible'
+      }, 100) })
+      const changedWhileOpening = deleteThread('新会话公司', '客服', undefined, afterDeleted)
+      await vi.runAllTimersAsync()
+      expect(await changedWhileOpening).toBe('failed')
+      expect(remove).toHaveBeenCalledTimes(2)
+      expect(afterDeleted).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+      if (pointDescriptor) Object.defineProperty(document, 'elementFromPoint', pointDescriptor)
+      else Reflect.deleteProperty(document, 'elementFromPoint')
+      document.body.innerHTML = ''
+    }
   })
 
   it('boss 对象名字不在本行文本里 → 放弃（防删错）', () => {

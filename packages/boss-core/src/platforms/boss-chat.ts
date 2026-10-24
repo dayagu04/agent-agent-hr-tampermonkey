@@ -377,15 +377,15 @@ let dumpedMissingJobTitle = false
  * 删除指定会话。
  *
  * 完整流程：
- *   1. 找到目标会话项：优先按身份精确匹配（encryptJobId / bossId），
- *      身份缺失时才退回公司名子串滚动查找（虚拟列表只渲染约 40 项）
+ *   1. 找到唯一目标会话项：显式身份必须精确匹配，文本候选核对全量来源；
+ *      新会话岗位缺失时先通过头部确认（虚拟列表只渲染约 40 项）
  *   2. 鼠标移到该项 → 右下角出现「···」按钮（Vue 条件渲染，非 CSS 隐藏）
  *   3. 点「···」→ 弹出浮层菜单（只有「置顶」「删除」两项）
  *   4. 点「删除」→ 弹「确认删除吗？」→ 点「确定」
  *   5. 校验该会话确实从列表消失
  *
- * 不走右侧会话头部菜单：那条路要先切换会话（多一次切换 + 身份核对，
- * 且会改变用户当前正在看的会话）。
+ * 优先操作目标列表行；只有尚未发出删除动作时才允许转头部菜单，
+ * 并再次核对同一目标的公司、HR 和岗位。
  *
  * @returns 'ok' 已删除 | 'not-found' 列表里没有匹配项 | 'failed' 找到但删除失败
  */
@@ -401,26 +401,68 @@ async function deleteThreadImpl(
   void norm(jobTitle)
 
   // 步骤 1：找到会话项（含滚动查找）
-  const hit = await findThreadForDelete(company, jobTitle, identity)
-  if (!hit) {
+  const candidate = await findThreadForDelete(company, jobTitle, identity)
+  if (candidate === 'ambiguous') return 'failed'
+  if (!candidate) {
     diag('CHAT', 'deleteThread 未找到会话（含滚动查找）')
     return 'not-found'
   }
+  const { row: hit, pinned } = candidate
+  const info = readRowJobInfo(hit.el)
+  const sameRow = (): boolean => {
+    assertChatExecutionActive()
+    const live = listThreadsQuiet().find(row => row.el === hit.el)
+    if (!live) return false
+    const actual = rowTarget(live)
+    return actual.key === pinned.key && identityText(actual.name) === identityText(pinned.name) &&
+      (!actual.jobTitle || identityText(actual.jobTitle) === identityText(pinned.jobTitle || jobTitle)) &&
+      confirmationCompany(actual.company) === confirmationCompany(pinned.company)
+  }
+  // Pin before awaiting selection: a recycled element must not become a new target.
+  if (!sameRow()) return 'failed'
+  let confirmedHeader: ReturnType<typeof currentThreadInfo> | undefined
+  if (!info.title && !hit.jobTitle) {
+    if (!jobTitle || await confirmThreadRow(hit, company, jobTitle) !== 'ok') return 'failed'
+    confirmedHeader = currentThreadInfo()
+  }
+  if (!sameRow()) return 'failed'
+  const actualInfo = readRowJobInfo(hit.el)
   if (onTarget) {
     // Capture the actual row before BOSS removes it; the background can then reconcile the exact job.
-    const info = readRowJobInfo(hit.el)
     onTarget({
-      company: info.brandName || company || hit.company,
-      jobTitle: info.title || hit.jobTitle || jobTitle,
-      bossId: identity?.bossId || hit.bossId || '',
-      encryptJobId: identity?.encryptJobId || info.jobId || '',
+      company: confirmedHeader?.company || actualInfo.brandName || company || hit.company,
+      jobTitle: confirmedHeader?.jobTitle || actualInfo.title || hit.jobTitle || jobTitle,
+      bossId: hit.bossId || '',
+      encryptJobId: actualInfo.jobId || identity?.encryptJobId || '',
     })
   }
 
   // 删除结果校验按「身份是否还在列表里」判断：虚拟列表节点数恒定，
   // 删一条后下一条补位、长度不变，不能比长度或 isConnected。
   const wantKey = threadKey(hit)
-  const isGone = () => !listThreadsQuiet().some((t) => threadKey(t) === wantKey)
+  const sourceVm = findVirtualListVm()
+  const sourceIdentity = (boss: AnyVm): boolean => {
+    if (info.jobId && String(boss.encryptJobId || boss.jobId || '') !== info.jobId) return false
+    const sourceJob = String(boss.positionName || boss.title || '')
+    const expectedJob = info.title || hit.jobTitle || jobTitle
+    if (!info.jobId && sourceJob && expectedJob && identityText(sourceJob) !== identityText(expectedJob)) return false
+    return confirmationCompany(String(boss.brandName || boss.company || '')) === confirmationCompany(pinned.company) &&
+      identityText(String(boss.name || boss.bossName || '')) === identityText(pinned.name)
+  }
+  const sourceWasPresent = Array.isArray(sourceVm?.$props?.dataSources) && sourceVm.$props.dataSources.some(sourceIdentity)
+  const scrollContainer = findThreadScrollContainer()
+  const virtualWindow = !!sourceVm || !!(scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight)
+  // Without full-source evidence, disappearance from a virtual window is unknowable.
+  if (virtualWindow && !sourceWasPresent) return 'failed'
+  const isGone = () => {
+    if (listThreadsQuiet().some((t) => threadKey(t) === wantKey)) return false
+    // Scrolling a virtual row out of the window is not deletion evidence.
+    if (sourceWasPresent) {
+      const sources = sourceVm?.$props?.dataSources
+      return Array.isArray(sources) && !sources.some(sourceIdentity)
+    }
+    return !virtualWindow
+  }
 
   /**
    * 点确认弹窗 + 校验会话是否真的从列表消失。
@@ -450,10 +492,10 @@ async function deleteThreadImpl(
     // 首选：直接调用该行组件自己的 deleteBoss()。
     // 它就是「删除」菜单项最终调用的方法，跳过全部 DOM 交互，
     // 且作用对象就是这一行，不存在删错会话的可能。
-    assertChatExecutionActive()
+    if (!sameRow()) return 'failed'
     if (deleteViaRowVue(hit.el)) {
-      if (await confirmAndVerify('deleteViaRowVue')) return 'ok'
-      diag('CHAT', 'deleteViaRowVue 调用成功但会话仍在列表，继续尝试点击路径')
+      // Once a deletion was dispatched, uncertainty must not trigger another path.
+      return await confirmAndVerify('deleteViaRowVue') ? 'ok' : 'failed'
     }
 
     // 步骤 2：唤出「···」按钮（注入 CSS 绕过 :hover 闸门，见 boss-delete.ts）
@@ -482,6 +524,7 @@ async function deleteThreadImpl(
 
     // 步骤 3：点「···」展开菜单。判据是「中心点处最上层的节点是不是它自己」，
     // 被其它节点盖住时必须直接派发到目标元素本身。
+    if (!sameRow()) return 'failed'
     if (isTopmostAtCenter(opBtn)) realClick(opBtn)
     else {
       diag('CHAT', '操作按钮被其它节点遮挡，改为直接派发点击')
@@ -505,12 +548,13 @@ async function deleteThreadImpl(
       unmarkOperateRow(hit.el)
       // 降级到头部菜单（常驻 DOM、点击展开）；它作用于当前打开的会话，
       // 必须先切到目标会话并核对身份 —— 由 deleteViaHeaderMenu 内部把关。
-      if (await deleteViaHeaderMenu(hit)) return 'ok'
+      if (await deleteViaHeaderMenu(hit, company, jobTitle, sameRow, isGone)) return 'ok'
       return 'failed'
     }
 
     // 步骤 4：点「删除」→ 确认弹窗
     unmarkOperateRow(hit.el) // 菜单已出，撤掉强制样式，避免留下视觉异常
+    if (!sameRow()) return 'failed'
     realClick(del)
     await delay(300, 450)
     const confirmed = await confirmDeleteDialog({ gone: isGone })
@@ -527,9 +571,7 @@ async function deleteThreadImpl(
       }
       await delay(300, 450)
     }
-    diag('CHAT', 'deleteThread 流程走完但会话仍在列表中，改走头部菜单')
-    // 列表路径走完仍在 → 再试头部菜单（同上，身份由内部核对）
-    if (await deleteViaHeaderMenu(hit)) return 'ok'
+    diag('CHAT', 'deleteThread 删除结果未确认，不重发删除动作')
     return 'failed'
   } catch (e) {
     diag('CHAT', 'deleteThread 异常', { errorType: (e as Error).name || 'Error' })
@@ -541,11 +583,11 @@ async function deleteThreadImpl(
 /**
  * 定位要删除的会话行。
  *
- * 身份优先（encryptJobId / bossId 精确），身份缺失或没命中时退回公司名子串：
+ * 身份存在时必须精确命中；没有身份时才解析唯一文本候选：
  * - encryptJobId：从 virtual-list.dataSources 全量列表精确找（一次拿到全部会话），
  *   命中后只滚动到该行（不切换会话），同公司多岗位也不会删错；
  * - bossId：在已渲染行里按 data-user-id 精确找；
- * - 兜底：公司名子串滚动查找（旧行为）。
+ * - 完整来源不可用时滚动检查唯一性；缺岗位候选还需核对真实头部。
  */
 /**
  * 会话行是否匹配「公司 + 岗位名」。
@@ -568,43 +610,57 @@ export function threadRowMatchesText(
   return norm(`${t.company || ''}${t.jobTitle || ''}${t.name || ''}`).includes(wantJob)
 }
 
+interface DeleteCandidate { row: ChatThread; pinned: ChatThreadTarget }
+function pinDeleteCandidate(row: ChatThread): DeleteCandidate { return { row, pinned: rowTarget(row) } }
+
 async function findThreadForDelete(
   company: string,
   jobTitle: string,
   identity?: { bossId?: string; encryptJobId?: string },
-): Promise<ChatThread | null> {
+): Promise<DeleteCandidate | null | 'ambiguous'> {
   const jobId = (identity?.encryptJobId || '').trim()
-  const bossId = identity?.bossId || ''
-
-  // 1) 全量数据源按岗位 ID 精确定位（最稳）；inbound 虚拟 id 与 BOSS 真实
-  //    jobId 对不上，跳过精确匹配，走公司兜底。
-  if (jobId && !jobId.startsWith('inbound:')) {
-    const sources = readChatSources()
-    if (sources) {
-      const src = sources.find((s) => String(s.boss.encryptJobId || '') === jobId)
-      if (src) {
-        const t = await locateRowByIndex(src.index)
-        if (t) return t
-      }
+  const bossId = (identity?.bossId || '').trim()
+  const matchText = (actualCompany: string, actualJob: string): boolean => {
+    if (!confirmationCompany(actualCompany).includes(confirmationCompany(company))) return false
+    // Unknown jobs remain candidates, not permission to delete. confirmThreadRow
+    // below must observe the explicitly requested job before any deletion.
+    return !jobTitle || !actualJob || identityText(actualJob) === identityText(jobTitle)
+  }
+  const matchRow = (row: ChatThread): boolean => {
+    const actual = readRowJobInfo(row.el)
+    if (jobId || bossId) return (!jobId || actual.jobId === jobId) && (!bossId || row.bossId === bossId)
+    return matchText(actual.brandName || row.company, actual.title || row.jobTitle)
+  }
+  const sources = readChatSources()
+  if (sources) {
+    const sourceMatchesRequest = ({ boss }: ChatSourceItem): boolean => {
+      if (jobId) return String(boss.encryptJobId || boss.jobId || '') === jobId
+      if (bossId) return [boss.uniqueId, boss.friendId].some(id => String(id || '') === bossId)
+      return matchText(String(boss.brandName || boss.company || ''), String(boss.positionName || boss.title || ''))
     }
-  }
-
-  // 2) 已渲染行按 bossId 精确定位
-  if (bossId) {
-    const hit = listThreadsQuiet().find((t) => t.bossId === bossId)
-    if (hit) return hit
-  }
-
-  // 3) 兜底：滚动查找（身份精确命中优先，否则退回公司名子串）
-  const match = (t: ChatThread): boolean => {
-    if (bossId && t.bossId && t.bossId === bossId) return true
-    if (jobId) {
-      const row = readRowJobInfo(t.el)
-      if (row.jobId && row.jobId === jobId) return true
+    const candidates = sources.filter(sourceMatchesRequest)
+    if (candidates.length !== 1) return candidates.length ? 'ambiguous' : null
+    const source = candidates[0]
+    const pinnedSourceKey = sourceKey(source.boss)
+    const sourceStillMatches = (): boolean => {
+      const current = readChatSources()?.filter(sourceMatchesRequest)
+      return current?.length === 1 && sourceKey(current[0].boss) === pinnedSourceKey
     }
-    return threadRowMatchesText(t, company, jobTitle)
+    const matchesSource = (row: ChatThread): boolean => {
+      if (!matchRow(row)) return false
+      const actual = readRowJobInfo(row.el)
+      const expectedJobId = String(source.boss.encryptJobId || source.boss.jobId || '')
+      return (!expectedJobId || actual.jobId === expectedJobId) &&
+        confirmationCompany(actual.brandName || row.company) === confirmationCompany(String(source.boss.brandName || source.boss.company || '')) &&
+        !!(actual.hrName || row.name) && identityText(actual.hrName || row.name) === identityText(String(source.boss.name || source.boss.bossName || ''))
+    }
+    const visible = listThreadsQuiet().filter(matchesSource)
+    if (visible.length > 1) return 'ambiguous'
+    const row = visible[0] || await locateRowByIndex(source.index)
+    return row && sourceStillMatches() && matchesSource(row) ? pinDeleteCandidate(row) : null
   }
-  return findThreadByScrolling(match)
+  // An explicit identity is always mandatory; absence never falls back to text.
+  return findThreadByScrolling(matchRow)
 }
 
 /** 渲染并返回指定下标的会话行（只滚动，不切换会话 —— 删除路径无需打开对话）。 */
@@ -658,51 +714,17 @@ export async function deleteThread(
  * 头部菜单（置顶/备注/不感兴趣/黑名单/删除/举报）常驻 DOM 且靠点击展开，
  * 不依赖列表项按钮的 CSS :hover。它作用于「当前打开的会话」，
  * 切错人就删错会话且不可撤回，故必须核对身份：目标本来已打开（身份对上）
- * 或切换后头部姓名出现在列表项 company 串里，任一不过就放弃。
+ * 或切换后公司、HR、岗位均与目标一致，任一不过就放弃。
  */
-async function deleteViaHeaderMenu(hit: ChatThread): Promise<boolean> {
-  const wantKey = threadKey(hit)
-  const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase()
-
-  // 列表项是「姓名+公司+职务」拼接串，头部只有姓名，
-  // 用「头部姓名 ⊂ 列表串」判定是同一个人。
-  const identityMatches = (): boolean => {
-    const h = findChatHeader()
-    const hName = norm(text(h ? headerNameIn(h) : null))
-    return !!hName && norm(hit.company).includes(hName)
-  }
-
-  // 目标本来就是当前会话时无需切换（身份对得上即可，不能只看 id 变没变）
-  if (!identityMatches()) {
-    const beforeId = currentThreadId()
-    try {
-      if (!switchThreadViaVue(hit.el)) realClick(hit.el)
-    } catch (e) {
-      diag('CHAT', '头部菜单删除：切换会话异常', {
-        errorType: (e as Error).name || 'Error',
-      })
-      return false
-    }
-
-    // 等切换生效：以「身份对上」为准
-    let ok = false
-    for (const d of [300, 400, 500, 700, 900, 1100, 1400]) {
-      await delay(d, d + 150)
-      if (identityMatches()) {
-        ok = true
-        break
-      }
-    }
-    if (!ok) {
-      diag('CHAT', '头部菜单删除已放弃：切换后头部身份仍与目标不一致', {
-        hadBeforeId: !!beforeId,
-        hasCurrentId: !!currentThreadId(),
-      })
-      return false
-    }
-  } else {
-    diag('CHAT', '头部菜单删除：目标会话已是当前会话，无需切换')
-  }
+async function deleteViaHeaderMenu(
+  hit: ChatThread,
+  company: string,
+  jobTitle: string,
+  sameRow: () => boolean,
+  isGone: () => boolean,
+): Promise<boolean> {
+  const expected = threadHeaderIdentity(hit, company, jobTitle)
+  if (!sameRow() || await confirmThreadRow(hit, company, jobTitle) !== 'ok') return false
 
   const header = findChatHeader()
   if (!header) {
@@ -710,10 +732,10 @@ async function deleteViaHeaderMenu(hit: ChatThread): Promise<boolean> {
     return false
   }
   const verify = (): boolean => {
-    const ok = identityMatches()
+    const ok = sameRow() && threadHeaderMatches(expected)
     if (!ok) {
       diag('CHAT', '头部菜单删除已放弃：身份核对不通过', {
-        headerNamePresent: !!norm(text(headerNameIn(header))),
+        headerNamePresent: !!text(headerNameIn(header)),
         listCompanyPresent: !!hit.company,
       })
     }
@@ -724,11 +746,11 @@ async function deleteViaHeaderMenu(hit: ChatThread): Promise<boolean> {
   if (!clicked) return false
 
   await delay(300, 450)
-  const confirmed = await confirmDeleteDialog()
+  const confirmed = await confirmDeleteDialog({ gone: isGone })
   if (!confirmed) diag('CHAT', '头部菜单删除：未点到确认按钮，继续校验实际结果')
 
   for (let i = 0; i < 10; i++) {
-    if (!listThreadsQuiet().some((t) => threadKey(t) === wantKey)) {
+    if (isGone()) {
       diag('CHAT', '头部菜单删除成功')
       return true
     }
@@ -746,30 +768,43 @@ async function deleteViaHeaderMenu(hit: ChatThread): Promise<boolean> {
  */
 async function findThreadByScrolling(
   match: (t: ChatThread) => boolean,
-): Promise<ChatThread | null> {
-  // 先查当前窗口（绝大多数情况命中，不必滚动）
-  const inWindow = listThreadsQuiet().find(match)
-  if (inWindow) return inWindow
-
+): Promise<DeleteCandidate | null | 'ambiguous'> {
+  const visible = listThreadsQuiet().filter(match)
+  if (visible.length > 1) return 'ambiguous'
   const container = findThreadScrollContainer()
-  if (!container) return null
+  if (!container || container.scrollHeight <= container.clientHeight) return visible[0] ? pinDeleteCandidate(visible[0]) : null
 
   const restore = container.scrollTop
   const step = Math.max(1, Math.floor(container.clientHeight * 0.8))
   const maxScroll = container.scrollHeight - container.clientHeight
+  let found: { key: string; top: number } | null = null
+  let selected = false
 
   try {
     for (let top = 0; top <= maxScroll + step; top += step) {
       container.scrollTo({ top: Math.min(top, maxScroll) })
       await delay(400, 550) // 等虚拟列表渲染
-      const found = listThreadsQuiet().find(match)
-      if (found) return found
+      const matches = listThreadsQuiet().filter(match)
+      if (matches.length > 1) return 'ambiguous'
+      if (!matches.length) continue
+      // Without a native row ID, two identical virtual rows cannot be distinguished.
+      if (!matches[0].bossId) return 'ambiguous'
+      const key = rowTarget(matches[0]).key
+      if (found && found.key !== key) return 'ambiguous'
+      found ||= { key, top: Math.min(top, maxScroll) }
     }
-    return null
+    if (!found) return null
+    container.scrollTo({ top: found.top })
+    await delay(400, 550)
+    const selectedKey = found.key
+    const matches = listThreadsQuiet().filter(row => match(row) && rowTarget(row).key === selectedKey)
+    if (matches.length !== 1) return null
+    selected = true
+    return pinDeleteCandidate(matches[0])
   } finally {
     // 命中时不复位：调用方接着要点这个节点，复位会把它滚出窗口、
     // 让虚拟列表回收掉刚拿到的引用。未命中才复位。
-    if (!listThreadsQuiet().find(match)) container.scrollTo({ top: restore })
+    if (!selected) container.scrollTo({ top: restore })
   }
 }
 
@@ -851,20 +886,26 @@ export async function openThreadConfirmed(company: string, jobTitle = ''): Promi
   return confirmThreadRow(target, company, jobTitle)
 }
 
-async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
+function threadHeaderIdentity(target: ChatThread, company: string, jobTitle: string) {
   const row = readRowJobInfo(target.el)
-  const norm = (value: string) => value.replace(/\s+/g, '').toLowerCase()
-  const expected = {
+  return {
     company: confirmationCompany(row.brandName || company),
-    hrName: norm(row.hrName || target.name),
-    jobTitle: norm(jobTitle || row.title || target.jobTitle),
+    hrName: identityText(row.hrName || target.name),
+    jobTitle: identityText(jobTitle || row.title || target.jobTitle),
   }
+}
+
+function threadHeaderMatches(expected: ReturnType<typeof threadHeaderIdentity>): boolean {
+  const header = currentThreadInfo()
+  return !!expected.company && !!expected.hrName && !!expected.jobTitle &&
+    confirmationCompany(header.company) === expected.company && identityText(header.hrName) === expected.hrName && identityText(header.jobTitle) === expected.jobTitle
+}
+
+async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
+  const expected = threadHeaderIdentity(target, company, jobTitle)
   // Missing identity is not evidence that the current conversation is the requested one.
   if (!expected.company || !expected.hrName || !expected.jobTitle) return 'thread_not_confirmed'
-  const confirmed = () => {
-    const header = currentThreadInfo()
-    return confirmationCompany(header.company) === expected.company && norm(header.hrName) === expected.hrName && norm(header.jobTitle) === expected.jobTitle
-  }
+  const confirmed = () => threadHeaderMatches(expected)
   if (confirmed()) return 'ok'
   const activated = activateThread(target)
   assertChatExecutionActive()
