@@ -4,7 +4,7 @@ import { diag } from './logger'
 import {
   clickCardDetailed, currentThreadInfo, deleteThread, listPendingCardsStable, listThreads,
   onChatPage, openThreadConfirmed, readMessages, probeRowObject, readRowJobInfo,
-  sendMessageText, lastDeliveryState, sendResumeDetailed, readResumeState, type ChatCardKind, type DeletedThreadTarget,
+  sendMessageText, lastDeliveryState, sendResumeDetailed, lastResumeSendState, readResumeState, type ChatCardKind, type DeletedThreadTarget,
 } from './platforms/boss-chat'
 import { readSearchFilters, selectSearchFilter } from './search-filters'
 import type { BasePlatform } from './platforms/base'
@@ -200,7 +200,10 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
         if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
         const idx = typeof args.resumeIndex === 'number' ? args.resumeIndex : null
         const r = await sendResumeDetailed(toolString(args, 'resumeName') || null, idx)
-        return { ok: r.ok, error: r.ok ? undefined : (r.reason || 'resume_send_failed') }
+        const state = lastResumeSendState()
+        return { ok: r.ok, data: { confirmed: state.confirmed, mayHaveExecuted: state.attempted, retrySafe: !state.attempted,
+          verifyWith: ['read_resume_state', 'read_messages'] },
+        error: r.ok ? undefined : state.attempted ? 'resume_send_unconfirmed' : (r.reason || 'resume_send_failed') }
       },
     },
     {

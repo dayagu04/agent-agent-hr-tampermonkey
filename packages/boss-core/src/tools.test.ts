@@ -18,6 +18,7 @@ vi.mock('./platforms/boss-chat', () => ({
   lastDeliveryState: vi.fn(() => 'delivered'),
   sendResume: vi.fn(async () => true),
   sendResumeDetailed: vi.fn(async () => ({ ok: true })),
+  lastResumeSendState: vi.fn(() => ({ attempted: true, confirmed: true })),
   deleteThread: vi.fn(async () => 'ok'),
 }))
 vi.mock('./platforms/factory', () => ({ detectPlatform: vi.fn(() => null) }))
@@ -247,7 +248,7 @@ describe('tool results must be JSON-serializable', () => {
 
 describe('send_message preconditions', () => {
   it('refuses with no_open_thread before touching the page', async () => {
-    const { currentThreadInfo, sendMessageText, sendResumeDetailed, clickCardDetailed, readResumeState, listPendingCardsStable } = await import('./platforms/boss-chat')
+    const { currentThreadInfo, sendMessageText, sendResumeDetailed, lastResumeSendState, clickCardDetailed, readResumeState, listPendingCardsStable } = await import('./platforms/boss-chat')
     vi.mocked(sendMessageText).mockClear()
     vi.mocked(sendResumeDetailed).mockClear()
     vi.mocked(clickCardDetailed).mockClear()
@@ -275,6 +276,12 @@ describe('send_message preconditions', () => {
     expect(await callTool('read_resume_state', {})).toEqual({ ok: true, data: { toolbar: 'disabled', dialog: 'none', options: [], sentMarkCount: 0 } })
     expect(await callTool('click_card', { kind: 'resume_request', accept: false, cardKey: 'selected-card' })).toMatchObject({ ok: true, data: { mayHaveExecuted: true, retrySafe: false } })
     expect(clickCardDetailed).toHaveBeenLastCalledWith('resume_request', false, expect.objectContaining({ cardKey: 'selected-card' }))
+    vi.mocked(sendResumeDetailed).mockResolvedValueOnce({ ok: false, reason: 'send_failed' })
+    vi.mocked(lastResumeSendState).mockReturnValueOnce({ attempted: true, confirmed: false })
+    expect(await callTool('send_resume', { resumeIndex: 0 })).toMatchObject({ ok: false, error: 'resume_send_unconfirmed', data: { mayHaveExecuted: true, confirmed: false, retrySafe: false } })
+    vi.mocked(sendResumeDetailed).mockResolvedValueOnce({ ok: false, reason: 'not_allowed' })
+    vi.mocked(lastResumeSendState).mockReturnValueOnce({ attempted: false, confirmed: false })
+    expect(await callTool('send_resume', {})).toMatchObject({ ok: false, error: 'not_allowed', data: { mayHaveExecuted: false, confirmed: false, retrySafe: true } })
   })
 })
 
