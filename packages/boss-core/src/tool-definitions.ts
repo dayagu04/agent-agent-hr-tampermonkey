@@ -2,9 +2,9 @@
 // Runtime dependencies are injected; credentials, storage and backend calls never belong here.
 import { diag } from './logger'
 import {
-  clickCard, currentThreadInfo, deleteThread, listPendingCardsStable, listThreads,
+  clickCardDetailed, currentThreadInfo, deleteThread, listPendingCardsStable, listThreads,
   onChatPage, openThreadConfirmed, readMessages, probeRowObject, readRowJobInfo,
-  sendMessageText, lastDeliveryState, sendResumeDetailed, type ChatCardKind, type DeletedThreadTarget,
+  sendMessageText, lastDeliveryState, sendResumeDetailed, readResumeState, type ChatCardKind, type DeletedThreadTarget,
 } from './platforms/boss-chat'
 import { readSearchFilters, selectSearchFilter } from './search-filters'
 import type { BasePlatform } from './platforms/base'
@@ -56,6 +56,14 @@ function needChatPage(): ToolResult | null {
   return { ok: false, error: 'not_chat_page' }
 }
 
+function validResumeSelection(args: Record<string, unknown>): boolean {
+  if (args.resumeName !== undefined && (typeof args.resumeName !== 'string' || args.resumeName.length > 512)) return false
+  if (args.resumeIndex !== undefined && args.resumeIndex !== null &&
+      (typeof args.resumeIndex !== 'number' || !Number.isSafeInteger(args.resumeIndex) || args.resumeIndex < 0 || args.resumeIndex > 99)) return false
+  // A name and an index may designate different attachments; never silently prefer one.
+  return !(toolString(args, 'resumeName') && args.resumeIndex != null)
+}
+
 export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
   return [
     {
@@ -98,9 +106,11 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'list_pending_cards',
-      description: '列出当前会话里待处理的交互卡片类型（不点击）',
+      description: '列出当前会话待处理卡片及 cardKey（不点击）；多张同类卡片须用 cardKey 指定',
       async run() {
         if (needChatPage()) return needChatPage()!
+        const info = currentThreadInfo()
+        if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
         return { ok: true, data: await listPendingCardsStable() }
       },
     },
@@ -125,20 +135,25 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'click_card',
-      description: '点一张待处理卡片的同意/拒绝（kind=resume_request|location_confirm|contact_exchange，accept=bool；同意索要简历时会走完发简历流程）',
+      description: '处理指定 HR 卡片；kind 和 accept 必填，cardKey 可取自 list_pending_cards；同意索要简历会发送附件，结果不明时不得重发',
       irreversible: true,
       exampleArgs: { kind: 'resume_request', accept: true, resumeName: '', resumeIndex: null },
       async run(args) {
         if (needChatPage()) return needChatPage()!
         const kind = toolString(args, 'kind') as ChatCardKind
-        const accept = args.accept !== false
         if (!kind) return { ok: false, error: 'kind_required' }
+        if (!validResumeSelection(args)) return { ok: false, error: 'invalid_arguments' }
+        if (!['resume_request', 'location_confirm', 'contact_exchange'].includes(kind) || typeof args.accept !== 'boolean' ||
+            (args.cardKey !== undefined && (typeof args.cardKey !== 'string' || args.cardKey.length > 512))) return { ok: false, error: 'invalid_arguments' }
+        const info = currentThreadInfo()
+        if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
         // 同意索要简历时可选指定发哪份；不指定则按配置的默认简历
-        const ok = await clickCard(kind, accept, {
+        const outcome = await clickCardDetailed(kind, args.accept, {
+          cardKey: toolString(args, 'cardKey') || undefined,
           resumeName: toolString(args, 'resumeName') || null,
           resumeIndex: typeof args.resumeIndex === 'number' ? args.resumeIndex : null,
         })
-        return { ok, error: ok ? undefined : 'card_not_found_or_no_button' }
+        return { ok: outcome.ok, data: { mayHaveExecuted: outcome.mayHaveExecuted, retrySafe: !outcome.mayHaveExecuted }, error: outcome.ok ? undefined : outcome.reason || 'card_unconfirmed' }
       },
     },
     {
@@ -164,12 +179,25 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
       },
     },
     {
+      name: 'read_resume_state',
+      description: '只读当前会话附件入口、已打开选择框及候选附件；不打开弹窗、不选择、不发送',
+      async run() {
+        if (needChatPage()) return needChatPage()!
+        const info = currentThreadInfo()
+        if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
+        return { ok: true, data: readResumeState() }
+      },
+    },
+    {
       name: 'send_resume',
       description: '给当前会话发附件简历（resumeName 可选；不可撤回）',
       irreversible: true,
       exampleArgs: { resumeName: '', resumeIndex: null },
       async run(args) {
         if (needChatPage()) return needChatPage()!
+        if (!validResumeSelection(args)) return { ok: false, error: 'invalid_arguments' }
+        const info = currentThreadInfo()
+        if (!info.company && !info.jobTitle) return { ok: false, error: 'no_open_thread' }
         const idx = typeof args.resumeIndex === 'number' ? args.resumeIndex : null
         const r = await sendResumeDetailed(toolString(args, 'resumeName') || null, idx)
         return { ok: r.ok, error: r.ok ? undefined : (r.reason || 'resume_send_failed') }

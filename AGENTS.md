@@ -126,11 +126,12 @@ tool name=delete_thread status=error ms=120 error=not-found
 | `list_threads` | — | | 列出会话（HR、公司、jobId、岗位候选、未读；真实岗位以头部确认） |
 | `read_thread_header` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开会话并读头部：HR 名/公司/岗位名/薪资/城市 |
 | `read_messages` | — | | 读当前会话消息（含卡片类型） |
-| `list_pending_cards` | — | | 列出待处理卡片 |
+| `list_pending_cards` | — | | 列出待处理卡片的问题、cardKey与可选动作 |
 | `open_thread` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开指定会话 |
-| `click_card` | `kind`, `accept`, `resumeName?`, `resumeIndex?` | ✓ | 点卡片同意/拒绝；同意索要简历时走完发送 |
+| `click_card` | `kind`, `accept`, `cardKey?`, `resumeName?`, `resumeIndex?` | ✓ | 明确同意/拒绝；多张同类卡片需key；同意索要简历时走完发送 |
 | `send_message` | `text` | ✓ | 给当前会话发文本；返回 `data.delivery` = delivered/read/sending/failed/none；未打开会话返回 `no_open_thread` |
 | `send_resume` | `resumeName?`, `resumeIndex?` | ✓ | 发附件简历；失败返回具体原因码 |
+| `read_resume_state` | — | | 只读附件入口与现有选择框，不打开或发送；候选名只回结果，不记日志 |
 | `delete_thread` | `company`, `jobTitle?`, `jobId?`（原生） | ✓ | 删除会话 |
 | `reload_page` | `force?` | | 刷新页面以加载最新插件构建；自动投递运行中拒绝（`orchestrator_running`），除非 `force=true` |
 | `probe_overlays` | — | | 读可见浮层结构（排障用） |
@@ -159,7 +160,7 @@ tool name=delete_thread status=error ms=120 error=not-found
 
 ### 原生迁移验收口径
 
-21 个工具共用原页面实现，独立扩展负责原生存储、认证、命令收据与回报。工具存在于目录、构建通过和真实平台成功是三种不同证据；必须分别记录。
+0.8.0 的 22 个工具共用原页面实现，独立扩展负责原生存储、认证、命令收据与回报。工具存在于目录、构建通过和真实平台成功是三种不同证据；必须分别记录。
 
 | 原子能力 | Chrome 原生现场证据（2026-10-25） |
 |---|---|
@@ -216,6 +217,8 @@ MV3 的 `open_thread` 跨页结果 `data=navigating` 是过渡状态，不能据
 | 标题里的薪资残渣 | 薪资数字被字体混淆成私有区字符，标题末尾只剩「-K」「-K·薪」，需剥掉 |
 
 判定卡片状态一律看按钮禁用态；判定发送成功一律看上述系统痕迹，并与发送前基线比较。
+
+0.8.0 卡片按唯一目标执行，`accept` 不再允许缺省同意；同类多卡由 Agent 传 `cardKey`，未知卡不执行。附件名称和序号同时指定会拒绝。发送后弹窗关闭不能单独证明成功；点击后结果不明保留处理标记，不自动重复。原 UI 手动删除由页面返回真实 `DeletedThreadTarget` 后记账，不能回退使用请求侧的候选岗位身份。
 
 ## 10. 筛选点击参考实现（按实测定，不靠猜）
 

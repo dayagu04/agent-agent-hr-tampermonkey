@@ -19,6 +19,8 @@ BOSS 0.7.1 修复扩展面板启动被拒绝及错误提示裁切的问题，需
 
 BOSS 0.7.2 继续迁移原子工具：原生 `apply_job` 直接接收上层给定的招呼语与本次记账简历，不再强制请求话术生成。原悬浮窗和批量控制的既有流程保留；原子工具的可用性不依赖面板是否展开。
 
+BOSS 0.8.0 增加只读附件状态，补齐卡片唯一定位、处理结果确认和原界面删除记账的实际会话身份。附件与卡片工具保留原操作入口，由 Agent 明确指定材料和同意/拒绝；工具只报告页面事实。
+
 ## 构建与安装
 
 Node.js 22.15 或以上：
@@ -80,6 +82,10 @@ CLI 默认连接本地 `127.0.0.1:8010`；用 `AAH_API`、`AAH_TOKEN` 或测试�
 搜索/岗位工具返回岗位 ID、公司、名称、地点、薪资、JD 和来源 URL；详情和会话工具使用页面实际值。`send_message` 保留 `delivered/read/sending/failed/none` 回执；`sending` 已上屏，不能因尚无送达回执而重发。
 
 原生 `apply_job` 参数为 `{jobId, greeting?, resumeId?}`。`greeting` 缺省为空，由 Agent 决定内容；平台自动发送默认招呼时不会追加第二条，查看 `greetingSource` / `customGreetingSent` 区分事实。`resumeId` 只用于后端记账，必须属于当前账号；缺省使用面板已选简历，不会发送附件或改变默认配置。后端记账仍沿用简历关联 Agent 的现有约束。校验或页面准备阶段失败返回 `mayHaveExecuted=false`；执行开始后的不确定结果仍需核查。旧油猴缺省话术与原界面编排保持原行为。
+
+`read_resume_state` 只读当前会话的附件入口、已打开选择框和候选附件，不打开弹窗或发送。`send_resume` 使用显式 `resumeName` 或 `resumeIndex`（二者不可同时指定）；未指定时沿用用户配置，不能猜多份材料中哪份要发。发送成功须观察本次新增的附件消息标记，弹窗消失不等于成功。
+
+`list_pending_cards` 返回问题、可选动作与 `cardKey`。`click_card` 的 `kind` 和布尔 `accept` 必填；多张同类卡片须传 `cardKey`，缺省仅在目标唯一时执行。卡片不会按本地偏好自行同意；非附件卡需确认平台已处理，索要附件卡需确认新附件消息。结果不明保留处理标记并回报 `mayHaveExecuted` / `retrySafe`，不要再点击或用新命令重复发送。会话切换会中止后续点击和回执判断。
 
 结果查询 `200 done` 表示结果已回传；`202 queued/delivered/acked` 表示队列阶段。不可撤回动作在 delivered/acked 或客户端返回 `reconciliation_required` 时，先只读核查，不自动重新入队。扩展重启后对执行中断的动作保留核查状态，页面动作和数据库上报分别处理，不以接口成功伪造平台成功。
 

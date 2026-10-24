@@ -10,6 +10,8 @@ vi.mock('./platforms/boss-chat', () => ({
   onChatPage: vi.fn(() => true),
   openThreadConfirmed: vi.fn(async () => 'ok'),
   clickCard: vi.fn(async () => true),
+  clickCardDetailed: vi.fn(async () => ({ ok: true, mayHaveExecuted: true })),
+  readResumeState: vi.fn(() => ({ toolbar: 'disabled', dialog: 'none', options: [], sentMarkCount: 0 })),
   listPendingCardKinds: vi.fn(() => [{ kind: 'resume_request', questionLength: 10 }]),
   listPendingCardsStable: vi.fn(async () => [{ kind: 'resume_request', questionLength: 10 }]),
   sendMessageText: vi.fn(async () => true),
@@ -44,7 +46,7 @@ describe('agent tools', () => {
     const names = toolCatalog().map((t) => t.name)
     expect(names).toEqual(expect.arrayContaining([
       'read_messages', 'send_message', 'send_resume', 'click_card', 'delete_thread', 'scan_jobs',
-      'read_filters', 'select_filters', 'list_tools',
+      'read_filters', 'select_filters', 'list_tools', 'read_resume_state',
       'get_page_state', 'open_search', 'read_job_detail', 'apply_job', 'probe_overlays', 'probe_dom',
       'read_thread_header', 'probe_row',
     ]))
@@ -244,13 +246,34 @@ describe('tool results must be JSON-serializable', () => {
 
 describe('send_message preconditions', () => {
   it('refuses with no_open_thread before touching the page', async () => {
-    const { currentThreadInfo, sendMessageText } = await import('./platforms/boss-chat')
-    vi.mocked(currentThreadInfo).mockReturnValueOnce({ company: '', hrName: '', jobTitle: '', salary: '', city: '' } as never)
+    const { currentThreadInfo, sendMessageText, sendResumeDetailed, clickCardDetailed, readResumeState, listPendingCardsStable } = await import('./platforms/boss-chat')
     vi.mocked(sendMessageText).mockClear()
-
-    const r = await callTool('send_message', { text: '你好' })
-    expect(r).toEqual({ ok: false, error: 'no_open_thread' })
+    vi.mocked(sendResumeDetailed).mockClear()
+    vi.mocked(clickCardDetailed).mockClear()
+    vi.mocked(readResumeState).mockClear()
+    vi.mocked(listPendingCardsStable).mockClear()
+    for (const [tool, args] of [
+      ['send_message', { text: '你好' }], ['send_resume', {}], ['read_resume_state', {}],
+      ['list_pending_cards', {}], ['click_card', { kind: 'resume_request', accept: false }],
+    ] as const) {
+      vi.mocked(currentThreadInfo).mockReturnValueOnce({ company: '', hrName: '', jobTitle: '', salary: '', city: '' } as never)
+      expect(await callTool(tool, args)).toEqual({ ok: false, error: 'no_open_thread' })
+    }
     expect(sendMessageText).not.toHaveBeenCalled()
+    expect(sendResumeDetailed).not.toHaveBeenCalled()
+    expect(clickCardDetailed).not.toHaveBeenCalled()
+    expect(readResumeState).not.toHaveBeenCalled()
+    expect(listPendingCardsStable).not.toHaveBeenCalled()
+    expect(await callTool('click_card', { kind: 'resume_request' })).toEqual({ ok: false, error: 'invalid_arguments' })
+    expect(await callTool('click_card', { kind: 'unknown', accept: true })).toEqual({ ok: false, error: 'invalid_arguments' })
+    for (const args of [{ resumeName: true }, { resumeIndex: -1 }, { resumeName: 'one.pdf', resumeIndex: 1 }]) {
+      expect(await callTool('send_resume', args)).toEqual({ ok: false, error: 'invalid_arguments' })
+      expect(await callTool('click_card', { kind: 'resume_request', accept: true, ...args })).toEqual({ ok: false, error: 'invalid_arguments' })
+    }
+    expect(clickCardDetailed).not.toHaveBeenCalled()
+    expect(await callTool('read_resume_state', {})).toEqual({ ok: true, data: { toolbar: 'disabled', dialog: 'none', options: [], sentMarkCount: 0 } })
+    expect(await callTool('click_card', { kind: 'resume_request', accept: false, cardKey: 'selected-card' })).toMatchObject({ ok: true, data: { mayHaveExecuted: true, retrySafe: false } })
+    expect(clickCardDetailed).toHaveBeenLastCalledWith('resume_request', false, expect.objectContaining({ cardKey: 'selected-card' }))
   })
 })
 
@@ -271,6 +294,7 @@ describe('MV3 page boundary', () => {
       ['send_message', { text: '  ' }, 'text_required'],
       ['click_card', { kind: 'resume_request' }, 'invalid_arguments'],
       ['click_card', { kind: 'unknown', accept: true }, 'invalid_arguments'],
+      ['click_card', { kind: 'resume_request', accept: false, cardKey: true }, 'invalid_arguments'],
       ['select_filters', { filters: [{ group: '经验' }] }, 'invalid_arguments'],
       ['send_resume', { resumeIndex: -1 }, 'invalid_arguments'],
       ['apply_job', { jobId: 'j1', greeting: true }, 'invalid_arguments'],
@@ -294,6 +318,8 @@ describe('MV3 page boundary', () => {
     expect(validateToolArgs('scan_jobs', { withDetail: true, offset: 10, limit: 5 })).toEqual({ ok: true })
     expect(validateToolArgs('apply_job', { jobId: 'j1' })).toEqual({ ok: true })
     expect(validateToolArgs('apply_job', { jobId: 'j1', greeting: '', resumeId: 11 })).toEqual({ ok: true })
+    expect(validateToolArgs('click_card', { kind: 'resume_request', accept: false, cardKey: 'selected-card' })).toEqual({ ok: true })
+    expect(validateToolArgs('read_resume_state', {})).toEqual({ ok: true })
     const location = { protocol: 'https:', hostname: 'www.zhipin.com' }
     vi.stubGlobal('location', location)
     vi.mocked(sendMessageText).mockClear()

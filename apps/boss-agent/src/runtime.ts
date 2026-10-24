@@ -11,7 +11,7 @@ const MAX_PENDING = 20
 const MAX_RESULT_BYTES = 200_000
 const MAX_STATE_BYTES = 7_000_000
 const PAGE_TIMEOUT_MS = 180_000
-const DIAGNOSTIC_TOOLS = new Set(['open_thread', 'get_page_state', 'scan_jobs', 'read_job_detail', 'read_filters', 'list_threads', 'read_messages', 'list_pending_cards', 'read_thread_header', 'probe_overlays', 'probe_dom', 'probe_row', 'list_tools'])
+const DIAGNOSTIC_TOOLS = new Set(['open_thread', 'get_page_state', 'scan_jobs', 'read_job_detail', 'read_filters', 'list_threads', 'read_messages', 'list_pending_cards', 'read_resume_state', 'read_thread_header', 'probe_overlays', 'probe_dom', 'probe_row', 'list_tools'])
 
 interface Config {
   apiBase: string
