@@ -65,6 +65,18 @@ function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 function fail(error: string): ToolResult { return { ok: false, error } }
+const APPLY_PREFLIGHT_ERRORS = new Set([
+  'invalid_arguments', 'jobId_required', 'resume_required', 'platform_not_supported', 'invalid_invocation',
+  'job_not_found', 'page_busy', 'page_prepare_failed', 'invalid_prepared_job', 'page_execution_cancelled',
+  'session_changed', 'page_runtime_unavailable', 'page_lifecycle_changed', 'page_result_missing',
+  'api_permission_required', 'api_path_forbidden', 'api_header_forbidden',
+  'api_http_400', 'api_http_401', 'api_http_403', 'api_http_404', 'api_http_408', 'api_http_409',
+  'api_http_422', 'api_http_429', 'api_http_500', 'api_http_502', 'api_http_503', 'api_http_504',
+])
+function applyPreflightFailure(error: unknown): ToolResult {
+  const code = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  return { ok: false, error: APPLY_PREFLIGHT_ERRORS.has(code) ? code : 'apply_preflight_failed', data: { tool: 'apply_job', mayHaveExecuted: false, retrySafe: true } }
+}
 function number(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
 }
@@ -975,40 +987,47 @@ export class BossRuntime {
     return this.enqueuePage(() => this.executeTool(session, account, receipt, rawArgs, connection))
   }
   private async executeTool(session: Session, _account: AccountState, receipt: Receipt, rawArgs: unknown, connection: PageConnection): Promise<void> {
+    let runStarted = false
     try {
       const validation = validateToolArgs(receipt.tool, rawArgs)
-      if (!validation.ok) { receipt.result = validation; receipt.state = 'done'; await this.save(); return }
+      if (!validation.ok) { receipt.result = receipt.tool === 'apply_job' ? applyPreflightFailure(validation.error) : validation; receipt.state = 'done'; await this.save(); return }
       const args = rawArgs as Record<string, unknown>
+      let resumeId = number(session.config.resumeId)
       this.phase = 'executing'
       const invocation: PageInvocation = { commandKey: await pageCommandKey(`${session.accountKey}|${receiptKey(receipt.epoch, receipt.commandId)}`), name: receipt.tool, args, context: { defaultResumeName: session.config.defaultResumeName } }
       if (receipt.tool === 'apply_job') {
-        if (!session.config.resumeId) { receipt.result = fail('resume_required'); receipt.state = 'done'; await this.save(); return }
+        const { resumeId: requestedResumeId, ...pageArgs } = args
+        // Accounting identity stays in the trusted worker and belongs only to this invocation.
+        invocation.args = pageArgs
+        if (requestedResumeId !== undefined) {
+          const config = await this.request(session.config, '/api/plugin/config', undefined, session)
+          this.assertActive(session)
+          resumeId = Array.isArray(config.resumes) && config.resumes.some(item => object(item).id === requestedResumeId) ? number(requestedResumeId) : null
+        }
+        if (!resumeId) throw new Error('resume_required')
         const prepared = await this.page(session, connection, 'prepare', invocation) as ToolResult
         this.assertActive(session)
-        if (!prepared.ok) { receipt.result = prepared; receipt.state = 'done'; await this.save(); return }
+        if (!prepared.ok) { receipt.result = applyPreflightFailure(prepared.error); receipt.state = 'done'; await this.save(); return }
         const job = object(object(prepared.data).job)
         if (typeof job.platformJobId !== 'string' || typeof job.title !== 'string') throw new Error('invalid_prepared_job')
-        const greeting = await this.request(session.config, '/api/plugin/greeting', {
-          resume_id: session.config.resumeId, platform: 'zhipin', platform_job_id: job.platformJobId,
-          title: job.title, company: job.company || '', description: job.description || job.jd || '',
-        }, session)
-        this.assertActive(session)
-        if (typeof greeting.greeting !== 'string' || !greeting.greeting.trim()) { receipt.result = fail('greeting_unavailable'); receipt.state = 'done'; await this.save(); return }
-        invocation.context!.greeting = greeting.greeting
+        invocation.context!.greeting = typeof args.greeting === 'string' ? args.greeting : ''
       }
       this.assertActive(session)
+      runStarted = true
       const execution = await this.page(session, connection, 'run', invocation) as PageExecution
       receipt.result = execution.result && typeof execution.result.ok === 'boolean' ? execution.result : this.reconciliation(receipt.tool)
       if (new TextEncoder().encode(JSON.stringify(receipt.result)).length > MAX_RESULT_BYTES) {
         receipt.result = { ok: receipt.result.ok, error: receipt.result.error, data: { truncated: true, reason: 'result_exceeds_extension_budget', retrySafe: !receipt.irreversible } }
       }
-      receipt.effects = pageEffects(receipt.tool, execution.effects, session.config.resumeId).map(effect => ({ effect, done: false }))
+      receipt.effects = pageEffects(receipt.tool, execution.effects, resumeId).map(effect => ({ effect, done: false }))
       receipt.state = 'done'
       await this.save()
     } catch (error) {
       receipt.state = 'done'
       receipt.effects = []
-      receipt.result = this.reconciliation(receipt.tool)
+      receipt.result = receipt.tool === 'apply_job' && !runStarted
+        ? applyPreflightFailure(this.active(session) ? error : 'session_changed')
+        : this.reconciliation(receipt.tool)
       if (error instanceof Error && error.message === 'invalid_page_effect') receipt.result.data = { ...object(receipt.result.data), reason: 'invalid_page_effect' }
       await this.save()
     }

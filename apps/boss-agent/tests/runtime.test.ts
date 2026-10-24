@@ -97,8 +97,8 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     const h = harness()
     let failUpload = true
     h.request(async path => {
-      if (path.endsWith('/heartbeat')) return heartbeat([command(8, 'apply_job', { jobId: 'job-1' })])
-      if (path.endsWith('/greeting')) return { greeting: 'hello' }
+      if (path.endsWith('/heartbeat')) return heartbeat([command(8, 'apply_job', { jobId: 'job-1', greeting: 'upstream greeting', resumeId: 11 })])
+      if (path.endsWith('/config')) return { resumes: [{ id: 11 }] }
       if (path.endsWith('/tools/result') && failUpload) { failUpload = false; throw new Error('offline') }
       return { stored: true, success: true }
     })
@@ -123,13 +123,29 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     pending.resolve({ result: { ok: true, data: { outcome: 'applied' } } })
     h.advance()
     await h.create().handle({ type: 'boss.tick', visibility: 'visible' }, page)
-    expect(h.pageCalls.filter(call => call.context?.greeting)).toHaveLength(1)
+    expect(h.pageCalls.filter(call => Object.hasOwn(call.context || {}, 'greeting'))).toHaveLength(1)
+    expect(h.pageCalls.at(-1)).toMatchObject({ args: { jobId: 'job-1', greeting: 'upstream greeting' }, context: { greeting: 'upstream greeting' } })
+    expect(h.pageCalls.every(call => !Object.hasOwn(call.args, 'resumeId'))).toBe(true)
     expect(h.calls.filter(call => call.path.endsWith('/record'))).toHaveLength(1)
-    expect(h.calls.filter(call => call.path.endsWith('/record'))[0].body.resume_id).toBe(7)
+    expect(h.calls.filter(call => call.path.endsWith('/record'))[0].body.resume_id).toBe(11)
+    expect(h.disk().config).toMatchObject({ resumeId: 7 })
+    expect(h.calls.filter(call => call.path.endsWith('/config'))).toHaveLength(1)
+    expect(h.calls.filter(call => call.path.endsWith('/greeting'))).toHaveLength(0)
     expect(h.calls.filter(call => call.path.endsWith('/tools/result'))).toHaveLength(2)
     expect(h.disk().accounts[ACCOUNT].receipts['db-outbox-v2:8'].uploaded).toBe(true)
     expect(h.accesses).toContainEqual({ accessLevel: 'TRUSTED_CONTEXTS' })
     expect(JSON.stringify(h.pageCalls)).not.toContain(TOKEN)
+
+    // Omitting new arguments uses the selected accounting resume and never asks an Agent for text.
+    const defaults = harness()
+    defaults.request(async path => path.endsWith('/heartbeat') ? heartbeat([command(8, 'apply_job', { jobId: 'job-1' })]) : { stored: true })
+    defaults.page(async (_invocation, method) => method === 'prepare'
+      ? { ok: true, data: { job: { platformJobId: 'job-1', title: 'role' } } }
+      : { result: { ok: true }, effects: [{ kind: 'application', payload: { platform: 'zhipin', platform_job_id: 'job-1', title: 'role', outcome: 'applied' } }] })
+    await defaults.create().handle({ type: 'boss.tick' }, page)
+    expect(defaults.pageCalls.at(-1)).toMatchObject({ args: { jobId: 'job-1' }, context: { greeting: '' } })
+    expect(defaults.calls.find(call => call.path.endsWith('/record'))?.body.resume_id).toBe(7)
+    expect(defaults.calls.some(call => call.path.endsWith('/greeting') || call.path.endsWith('/config'))).toBe(false)
 
     // The new full-panel page entry shares durable receipts, including across worker recovery.
     const core = harness()
@@ -371,15 +387,44 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     await malformed.create().handle({ type: 'boss.tick' }, page)
     expect(malformed.pageCalls).toHaveLength(0)
     expect(malformed.calls.find(call => call.path.endsWith('/tools/result'))?.body).toMatchObject({ ok: false, error: 'invalid_arguments' })
+
+    // A refused or interrupted preparation has not entered the irreversible page action.
+    for (const scenario of [
+      { args: { jobId: 'job-1', resumeId: 11 }, selected: 7, error: 'resume_required' },
+      { args: { jobId: 'job-1' }, selected: null, error: 'resume_required' },
+      { args: { jobId: 'job-1', greeting: false }, selected: 7, error: 'invalid_arguments' },
+      { args: { jobId: 'job-1' }, selected: 7, prepareError: 'job_not_found', error: 'job_not_found' },
+      { args: { jobId: 'job-1', resumeId: 11 }, selected: 7, requestError: 'untrusted server diagnostic', error: 'apply_preflight_failed' },
+    ]) {
+      const refused = harness()
+      Object.assign(refused.disk().config!, { resumeId: scenario.selected })
+      refused.request(async path => {
+        if (path.endsWith('/heartbeat')) return heartbeat([command(8, 'apply_job', scenario.args)])
+        if (path.endsWith('/config')) {
+          if (scenario.requestError) throw new Error(scenario.requestError)
+          return { resumes: [{ id: 7 }] }
+        }
+        return { stored: true }
+      })
+      refused.page(async (_invocation, method) => {
+        expect(method).toBe('prepare')
+        return { ok: false, error: scenario.prepareError }
+      })
+      await refused.create().handle({ type: 'boss.tick' }, page)
+      expect(refused.pageCalls).toHaveLength(scenario.prepareError ? 1 : 0)
+      expect(refused.calls.some(call => call.path.endsWith('/record') || call.path.endsWith('/greeting'))).toBe(false)
+      expect(refused.calls.find(call => call.path.endsWith('/tools/result'))?.body).toMatchObject({ ok: false, error: scenario.error, data: { mayHaveExecuted: false, retrySafe: true } })
+    }
   })
 
   it('invalidates an in-flight apply preparation on logout and never uploads its old-account receipt to a new account', async () => {
     const h = harness()
-    const greeting = deferred<unknown>()
+    const ownership = deferred<unknown>()
     const requested = deferred<void>()
+    let preparing = true
     h.request(async path => {
-      if (path.endsWith('/heartbeat')) return heartbeat([command(8, 'apply_job', { jobId: 'job-1' })])
-      if (path.endsWith('/greeting')) { requested.resolve(); return greeting.promise }
+      if (path.endsWith('/heartbeat')) return heartbeat([command(8, 'apply_job', { jobId: 'job-1', resumeId: 11 })])
+      if (path.endsWith('/config') && preparing) { preparing = false; requested.resolve(); return ownership.promise }
       if (path.endsWith('/auth/token')) return { token: 'new-account-auth-token-long-value', user_id: 2, username: 'user-two' }
       if (path.endsWith('/config')) return { resumes: [] }
       return { stored: true }
@@ -389,10 +434,10 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     const tick = runtime.handle({ type: 'boss.tick' }, page)
     await requested.promise
     const logout = runtime.handle({ type: 'boss.logout' }, popup)
-    greeting.resolve({ greeting: 'hello' })
+    ownership.resolve({ resumes: [{ id: 11 }] })
     await Promise.all([tick, logout])
-    expect(h.pageCalls.filter(call => call.context?.greeting)).toHaveLength(0)
-    expect(h.disk().accounts[ACCOUNT].receipts['db-outbox-v2:8'].result?.error).toBe('reconciliation_required')
+    expect(h.pageCalls).toHaveLength(0)
+    expect(h.disk().accounts[ACCOUNT].receipts['db-outbox-v2:8'].result).toMatchObject({ error: 'session_changed', data: { mayHaveExecuted: false } })
     await runtime.handle({ type: 'boss.token', apiBase: API, token: 'new-account-auth-token-long-value' }, popup)
     await runtime.handle({ type: 'boss.enable', tabId: 12 }, popup)
     h.advance()

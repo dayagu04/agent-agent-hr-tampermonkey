@@ -320,19 +320,21 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
     },
     {
       name: 'apply_job',
-      description: '对指定岗位点「立即沟通」投递（jobId 必填，不可撤回；会记账）',
+      description: '对指定岗位点「立即沟通」投递（jobId 必填；greeting 可选，传入时使用原文；不可撤回，会记账）',
       irreversible: true,
       exampleArgs: { jobId: '' },
       async run(args) {
         const jobId = toolString(args, 'jobId')
         if (!jobId) return { ok: false, error: 'jobId_required' }
+        const greeting = args.greeting
+        if (greeting !== undefined && (typeof greeting !== 'string' || greeting.length > 20000)) return { ok: false, error: 'invalid_arguments' }
         const platform = runtime.detectPlatform()
         if (!platform) return { ok: false, error: 'platform_not_supported' }
         const jobs = await platform.scanJobs()
         const card = findJobCard(jobs, jobId)
         if (!card) return { ok: false, error: 'job_not_found' }
         const raw = await platform.applyJob(card, {
-          getGreeting: () => runtime.getGreeting(platform.code, card),
+          getGreeting: () => typeof greeting === 'string' ? Promise.resolve(greeting) : runtime.getGreeting(platform.code, card),
         })
         const res = typeof raw === 'boolean'
           ? { outcome: (raw ? 'applied' : 'failed') as ApplyOutcome, message: '', greetingSent: false, greetingSource: 'unknown' as const, customGreetingSent: false, alreadyApplied: false }
