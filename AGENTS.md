@@ -1,6 +1,6 @@
-# AGENTS.md — 工具层规范（唯一来源）
+# AGENTS.md — 双扩展边界与 BOSS 工具规范
 
-本仓库的目的是**把 BOSS 直聘页面能力封装成标准工具供上游 agent 调用**（产品形态见 [README](./README.md)）。
+本仓库管理两个独立扩展：`apps/boss-agent/` 把 BOSS 页面能力封装成标准工具供上游 Agent 调用，`apps/application-autofill/` 保留独立网申填写产品（详见 [README](./README.md)）。两个扩展分别维护 manifest、权限、登录、存储、版本、安装包和发布，不共享运行态。网申专属规则见其目录 AGENTS.md；`packages/boss-core/src/` 保留原完整功能，`legacy/userscript/src/` 隔离旧宿主兼容。
 本文件定义：工具是什么、怎么调、怎么新增、返回值怎么判、BOSS 页面的真实标记。
 新增任何面向 agent 的页面能力都按这里做，不另起一套。分支与发布见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
@@ -9,8 +9,12 @@
 插件在 BOSS 页面里保持启用即可，开发者和 agent 都**不需要**在页面上点任何东西。
 
 ```bash
+npm run tool -- status                                  # 连接/版本/协议，只读不入队
+npm run tool -- functions                               # 在线扩展的 function-call 参数定义（配套后端）
 npm run tool -- list                                    # 插件当前上报的工具清单
 npm run tool -- read_thread_header '{"company":"某公司"}'
+npm run tool -- result <command_id>                     # 查询已入队命令，不重发
+npm run tool -- wait <command_id>                       # 继续等待原命令，不重发
 ```
 
 `scripts/tool.mjs` 走的就是 agent 用的两个接口：
@@ -24,12 +28,8 @@ GET  /api/plugin/tools/result/{command_id}   → 200 结果 / 202 阶段（见 �
 - 结果保留 10 分钟、上限 200 条、超过 200KB 截断；`logs/plugin/YYYY-MM-DD.log` 只有摘要。
 - **读页面结构也用工具，不开 DevTools**（BOSS 检测到 F12 会关页）：
   `get_page_state` `read_filters` `scan_jobs` `list_threads` `read_messages` `probe_dom` `probe_overlays` `probe_row`。
-- **时延**：插件约 1 秒一次心跳。标签页在后台时，0.6.56 起由 Worker 驱动心跳避开 Chrome 的定时器节流。
-- **冻结（整页暂停）**：Chrome 的「节省内存」等机制可能把后台标签页整页冻结，Worker 一起停，
-  命令会一直 `queued`，页面恢复后照常执行（不丢、不重复）。插件在冻结/恢复时写
-  `[REMOTE] page_lifecycle status=frozen|resumed frozen_s=N`。要长期挂后台跑 agent，
-  在 `chrome://settings/performance` 把 `www.zhipin.com` 加入「始终保持这些网站的活动状态」。
-  agent 侧判断：心跳 `last_seen` 停止更新 = 插件不在线或被冻结，不要把超时当成工具失败。
+- **时延与后台页**：MV3 后台负责心跳，页面负责 DOM 操作；`connected=true` 不能证明页面定时器正在正常执行。隐藏页的详情读取实测可能超时，保持 BOSS 页在前台后可通过命令完成。旧油猴 0.6.56 的 Worker 心跳不代表原生页面执行机制。
+- **冻结与中断**：Chrome 可能暂停后台页面。查询原 command_id，依据实际阶段与页面结果处理；执行中断返回 `reconciliation_required` 时不可重做副作用。后端仍在线也不能把未返回的动作写成成功。长期运行可在 Chrome 性能设置保留 BOSS 活动状态，但不能据此承诺所有冻结恢复场景已验收。
 
 ## 1. 什么是工具
 
@@ -47,7 +47,7 @@ agent（服务端决策）
 
 ## 2. 工具定义（唯一模板）
 
-在 `src/tools.ts` 的 `TOOLS` 数组里新增一项，字段固定如下：
+页面执行定义统一维护在 `packages/boss-core/src/tool-definitions.ts`，原 `packages/boss-core/src/tools.ts` 与 MV3 的 page-tools 通过不同运行环境适配。function-call 参数目录在 `apps/boss-agent/src/tools-contract.ts`。新增工具同步执行定义、参数 schema 与本文件，不维护两份分叉实现。字段示例：
 
 ```ts
 {
@@ -95,20 +95,22 @@ tool name=delete_thread status=error ms=120 error=not-found
 
 ## 5. 新增工具的做法（照抄即可）
 
-1. 页面动作写到 `src/platforms/<平台>.ts` 或专题模块（如 `search-filters.ts`），导出纯函数；
-2. 在 `src/tools.ts` 的 `TOOLS` 加一项，按第 2 节模板填全字段；
-3. 在 `src/tools.test.ts` 补两条：目录里出现、关键失败分支返回正确原因码；
-4. `npm run typecheck && npm test`；`npm run dev:serve` 自动重建，`npm run tool -- reload_page` 让页面换上新版本；
+1. 页面动作写到 `packages/boss-core/src/platforms/<平台>.ts` 或专题模块（如 `search-filters.ts`），导出纯函数；
+2. 在共享工具工厂及 MV3 参数目录加一项，按第 2 节模板填全字段；
+3. 先检索既有契约，默认测试净增0；将独立失败模式并入最低稳定层级，不按工具数量添加测试；
+4. 只跑修改模块的既有契约及命中类型检查；MV3 用 `npm run build:boss` 并重载扩展和页面，旧油猴的 `dev:serve` 不用于 MV3；
 5. `npm run tool -- <新工具> '<args>'` 在真实页面跑通，再在 §7/§8 补上验证记录，才算完成。
 
-## 6. 面板内调试区（辅助）
+## 6. 原悬浮窗与面板内调试区
 
-- 入口：投递面板标题栏的 🧪 按钮（`src/TestTools.vue`，在面板内展开，不另开窗口）。
+迁移必须保留原悬浮窗、投递控制、进度、会话和设置及使用方式。完整 UI 源码在共享 core，底层通过宿主适配器替换；popup 是扩展连接辅助入口，不能代替原面板。MV3 已通过受信扩展 iframe 挂载原面板，原编排、会话 runner 通过原生后台与窄页面驱动执行。保持唯一后台心跳/ACK；不得直接启动旧 remote 轮询，不得将构建成功写成真实页面验收完成。
+
+- 入口：投递面板标题栏的 🧪 按钮（`packages/boss-core/src/TestTools.vue`，在面板内展开，不另开窗口）。
 - 打开后面板主体只显示测试工具，业务步骤暂时隐藏；点「关闭测试」回到正常投递流程。
 - 工具以两列卡片列出，选中后填 JSON 参数执行，结果就地显示。
 - 不可撤回工具需要点两次（第一次上膛，第二次执行）。
 - 结果同时写入 `logs/plugin/` 的 `[TOOL]` 行。
-- 只用于人工点按排查；验收以 §0 的命令行调用为准。不承载业务逻辑。
+- 保留原人工点按排查入口；功能接通后再用 §0 的命令行调用验收。不在调试 UI 内重复业务逻辑。
 
 ## 7. 现有工具（以此为准）
 
@@ -116,20 +118,21 @@ tool name=delete_thread status=error ms=120 error=not-found
 |---|---|---|---|
 | `get_page_state` | — | | 当前网址、是否聊天页、当前打开会话 |
 | `open_search` | `keyword`, `cityCode?`, `page?` | | 打开职位搜索页（保留当前筛选） |
-| `scan_jobs` | `withDetail?` | | 扫描岗位；`withDetail=true` 连 JD 一起读 |
+| `scan_jobs` | `withDetail?`, `offset?`, `limit?` | | 扫描岗位；JD每批最多10条，按 `nextOffset` 继续 |
 | `read_job_detail` | `jobId` | | 读指定岗位 JD 全文（只切详情，不投递） |
-| `apply_job` | `jobId` | ✓ | 对指定岗位点「立即沟通」并记账 |
+| `apply_job` | `jobId`, `greeting?`, `resumeId?`（原生） | ✓ | 点击沟通并回报真实招呼来源；原生不生成话术，简历仅用于记账 |
 | `read_filters` | — | | 读筛选分组/选项/当前选中 |
 | `select_filters` | `filters: [{group, option}]` | ✓ | 点选筛选项 |
-| `list_threads` | — | | 列出会话（HR 名/公司/未读；岗位与薪资列表行没有） |
-| `read_thread_header` | `company`, `jobTitle?` | | 打开会话并读头部：HR 名/公司/岗位名/薪资/城市 |
+| `list_threads` | — | | 列出会话（HR、公司、jobId、岗位候选、未读；真实岗位以头部确认） |
+| `read_thread_header` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开会话并读头部：HR 名/公司/岗位名/薪资/城市 |
 | `read_messages` | — | | 读当前会话消息（含卡片类型） |
-| `list_pending_cards` | — | | 列出待处理卡片 |
-| `open_thread` | `company`, `jobTitle?` | | 打开指定会话 |
-| `click_card` | `kind`, `accept`, `resumeName?`, `resumeIndex?` | ✓ | 点卡片同意/拒绝；同意索要简历时走完发送 |
+| `list_pending_cards` | — | | 列出待处理卡片的问题、cardKey与可选动作 |
+| `open_thread` | `company`, `jobTitle?`, `jobId?`（原生） | | 打开指定会话 |
+| `click_card` | `kind`, `accept`, `cardKey?`, `resumeName?`, `resumeIndex?` | ✓ | 明确同意/拒绝；多张同类卡片需key；同意索要简历时走完发送 |
 | `send_message` | `text` | ✓ | 给当前会话发文本；返回 `data.delivery` = delivered/read/sending/failed/none；未打开会话返回 `no_open_thread` |
 | `send_resume` | `resumeName?`, `resumeIndex?` | ✓ | 发附件简历；失败返回具体原因码 |
-| `delete_thread` | `company`, `jobTitle?` | ✓ | 删除会话 |
+| `read_resume_state` | — | | 只读附件入口与现有选择框，不打开或发送；候选名只回结果，不记日志 |
+| `delete_thread` | `company`, `jobTitle?`, `jobId?`（原生） | ✓ | 删除会话 |
 | `reload_page` | `force?` | | 刷新页面以加载最新插件构建；自动投递运行中拒绝（`orchestrator_running`），除非 `force=true` |
 | `probe_overlays` | — | | 读可见浮层结构（排障用） |
 | `probe_dom` | `selector`, `depth?` | | 读指定选择器的 DOM 结构（排障用） |
@@ -137,6 +140,8 @@ tool name=delete_thread status=error ms=120 error=not-found
 | `list_tools` | — | | 列出工具清单 |
 
 ## 8. 完整链路的工具覆盖
+
+下表已验证记录来自旧油猴现场，不代表新 MV3 已完成真实页面验收；新扩展的命令、类型和构建验证分别记录在主仓路线文档。
 
 | 链路环节 | 工具 | 状态 |
 |---|---|---|
@@ -153,6 +158,23 @@ tool name=delete_thread status=error ms=120 error=not-found
 
 判定「封装完成」的标准：agent 只靠工具 + `/tools/result` 就能完成该环节，不依赖页面手动操作。
 
+### 原生迁移验收口径
+
+0.8.0 的 22 个工具共用原页面实现，独立扩展负责原生存储、认证、命令收据与回报。工具存在于目录、构建通过和真实平台成功是三种不同证据；必须分别记录。
+
+| 原子能力 | Chrome 原生现场证据（2026-10-25） |
+|---|---|
+| `get_page_state`、`open_search`、`scan_jobs`、`read_job_detail` | 命令读取成功；列表 15 条、offset 分批；0.7.2 两个不同岗位 JD 为 710/26 字，指定读取与公开详情链接 ID 一致；隐藏页仍可能超时 |
+| `read_filters`、`select_filters` | 读取 8 组；修复同名误选及隐藏页过渡后，命令 83–86 选择 3–5 年、读回选中、恢复不限并读回清空，其他分组未误选 |
+| `list_threads`、`open_thread`、`read_thread_header`、`read_messages` | 40 条会话、消息读回成功；稳定 jobId 定位后，88 跨页打开、89 再读真实头部成功，兼容列表岗位别名差异 |
+| `apply_job`、`send_message` | 仅一次授权投递并记账、一次明确测试消息送达且读回恰好一次；投递为 BOSS 默认招呼，没有发送附件 |
+| `list_pending_cards`、`send_resume`、`click_card` | 当前测试会话待卡片 0，发简历按钮被 BOSS 禁用；只读结果成立，附件和卡片执行尚无成功条件 |
+| `delete_thread` | 90 仅删除用户授权的测试会话一次；91 读回目标 ID 消失且其他原列表行保留，92 同 ID 打开返回 not-found |
+| `reload_page`、`probe_dom`、工具发现 | 刷新及诊断命令成功；`probe_dom` 只对同源岗位详情链接增加公开 `jobId`，不回传完整 href/query |
+| `probe_overlays`、`probe_row`、`list_tools` | 保留共享实现；命令 79 的 overlays 读取成功；工具发现不替代 probe_row/list_tools 入口的本轮现场执行 |
+
+原悬浮窗收起、展开、拖动已由用户确认。Edge、批量进度、托管自动回复和冻结恢复的完整回归尚未完成；不要用旧油猴成功记录覆盖这些缺口。
+
 **不可撤回工具超时后一律不自动重发**：先看 `state`，`delivered`/`acked` 时用只读工具（`read_messages` / `list_pending_cards` / `list_threads`）核实页面结果。
 
 ### 结果判定协议（agent 必读）
@@ -166,6 +188,8 @@ tool name=delete_thread status=error ms=120 error=not-found
 | 202 | `delivered` | 插件已取走、正在执行 | **继续等，绝不重发** |
 | 202 | `acked` | 插件执行完但结果没传回 | **不重发**，用 `read_messages` 核实 |
 | 404 | — | 命令不存在（或不属于当前用户） | 重新下发 |
+
+MV3 的 `open_thread` 跨页结果 `data=navigating` 是过渡状态，不能据此认定目标已打开；CLI `wait` 会继续查询原 command_id，`result` 返回 pending。最终只有目标头部确认后才成功，失败保留只读诊断能力。
 
 `send_message` 的 `data.delivery`：
 
@@ -193,6 +217,8 @@ tool name=delete_thread status=error ms=120 error=not-found
 | 标题里的薪资残渣 | 薪资数字被字体混淆成私有区字符，标题末尾只剩「-K」「-K·薪」，需剥掉 |
 
 判定卡片状态一律看按钮禁用态；判定发送成功一律看上述系统痕迹，并与发送前基线比较。
+
+0.8.0 卡片按唯一目标执行，`accept` 不再允许缺省同意；同类多卡由 Agent 传 `cardKey`，未知卡不执行。附件名称和序号同时指定会拒绝。发送后弹窗关闭不能单独证明成功；点击后结果不明保留处理标记，不自动重复。原 UI 手动删除由页面返回真实 `DeletedThreadTarget` 后记账，不能回退使用请求侧的候选岗位身份。
 
 ## 10. 筛选点击参考实现（按实测定，不靠猜）
 

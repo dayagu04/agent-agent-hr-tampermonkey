@@ -19,18 +19,21 @@ const matchUrls = [
 ]
 
 export default defineConfig({
+  define: { __AAH_BOSS_VERSION__: JSON.stringify(pkg.version) },
+  // Preserve the two extension directories and any locally loaded artifacts.
+  build: { emptyOutDir: false },
   plugins: [
     vue(),
     monkey({
-      entry: 'src/main.ts',
+      entry: 'legacy/userscript/src/main.ts',
       userscript: {
         name: '智能求职助手 - 社招自动投递',
         namespace: 'agent-agent-hr',
-        // 从 package.json 读，避免与 src/version.ts、App.vue 显示值漂移
+        // 历史 userscript 版本保持原有发布渠道，不影响独立扩展。
         version: pkg.version,
         // 打 tag 后 CI 把产物挂到 GitHub Release，Tampermonkey 按 @version 自动更新
-        updateURL: 'https://github.com/dayagu04/agent-agent-hr-tampermonkey/releases/latest/download/agent-agent-hr-tampermonkey.user.js',
-        downloadURL: 'https://github.com/dayagu04/agent-agent-hr-tampermonkey/releases/latest/download/agent-agent-hr-tampermonkey.user.js',
+        updateURL: 'https://github.com/dayagu04/agent-agent-hr-extension/releases/latest/download/agent-agent-hr-tampermonkey.user.js',
+        downloadURL: 'https://github.com/dayagu04/agent-agent-hr-extension/releases/latest/download/agent-agent-hr-tampermonkey.user.js',
         description: '社招平台自动投递 + 会话托管油猴插件（BOSS 直聘主支持）',
         author: 'agent-agent-hr',
         match: matchUrls,
@@ -46,6 +49,7 @@ export default defineConfig({
         ],
       },
       build: {
+        fileName: 'agent-agent-hr-tampermonkey.user.js',
         // Vue 走 CDN，减小脚本体积
         externalGlobals: {
           vue: cdn.jsdelivr('Vue', 'dist/vue.global.prod.js'),
