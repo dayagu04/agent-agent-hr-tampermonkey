@@ -66,12 +66,23 @@ describe('agent tools', () => {
     expect(sendMessageText).not.toHaveBeenCalled()
   })
 
-  it('summarizes results by counts, not content', async () => {
+  it('summarizes results by counts and limits DOM links to public job identities', async () => {
     await callTool('read_messages', {})
     const line = String((diag as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)?.[1])
     expect(line).toContain('name=read_messages status=ok')
     expect(line).toContain('messages=1')
     expect(line).not.toContain('hi')
+    const container = document.createElement('div')
+    container.innerHTML = `<a class="probe-job" href="https://www.zhipin.com/job_detail/public-job.html?securityId=private">详情</a>
+      <a class="probe-job" href="https://example.com/job_detail/other.html?token=private">其他</a>`
+    document.body.append(container)
+    try {
+      const result = await callTool('probe_dom', { selector: '.probe-job', depth: 0 })
+      const nodes = (result.data as { nodes: Record<string, unknown>[] }).nodes
+      expect(nodes[0].jobId).toBe('public-job')
+      expect(nodes[1]).not.toHaveProperty('jobId')
+      expect(JSON.stringify(result)).not.toMatch(/private|https:|securityId|token/)
+    } finally { container.remove() }
   })
 })
 

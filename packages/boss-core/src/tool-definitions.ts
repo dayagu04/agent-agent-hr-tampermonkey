@@ -414,6 +414,14 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
           }
           const role = el.getAttribute('role')
           if (role) node.role = role
+          // Expose only a public job ID; never return full links, query tokens or arbitrary attributes.
+          if (el.tagName === 'A') {
+            try {
+              const url = new URL(el.getAttribute('href') || '', location.href)
+              const jobId = url.pathname.match(/^\/job_detail\/([A-Za-z0-9_~-]+)\.html$/)?.[1]
+              if (url.origin === 'https://www.zhipin.com' && jobId) node.jobId = jobId
+            } catch { /* A malformed link has no inspectable job identity. */ }
+          }
           const aria = el.getAttribute('aria-disabled')
           if (aria) node.ariaDisabled = aria
           let disabled = false
@@ -427,6 +435,8 @@ export function createToolDefinitions(runtime: ToolRuntime): ToolSpec[] {
           }
           const rect = el.getBoundingClientRect()
           node.rect = [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)]
+          const style = getComputedStyle(el)
+          node.visibility = { display: style.display, visibility: style.visibility, opacity: style.opacity, pointerEvents: style.pointerEvents }
           node.textLen = (el.textContent || '').replace(/\s/g, '').length
           const t = shortText(el)
           if (t) node.text = t
