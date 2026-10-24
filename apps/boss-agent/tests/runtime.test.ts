@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
-import { BossHeartbeatScheduler, RECOVERY_ALARM } from '../src/background-scheduler'
+import { attachExistingBossPages, BossHeartbeatScheduler, RECOVERY_ALARM } from '../src/background-scheduler'
 import { BossContentHeartbeat } from '../src/runtime-content'
 import { BossRuntime, STORAGE_KEY } from '../src/runtime'
 import { PAGE_RUNTIME_KEY, type PageExecution, type PageInvocation } from '../src/contracts'
@@ -160,6 +160,11 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     controls.request(async path => path.endsWith('/heartbeat') ? heartbeat([work]) : { stored: true })
     await controller.handle({ type: 'boss.tick' }, page)
     expect(channel.messages.filter(message => message.type === 'command')).toHaveLength(1)
+    const queuedActions = [
+      { operation: 'chat.send', args: { text: 'reply', expectedThread: 'thread-1' } },
+      { operation: 'chat.resume', args: { resumeName: null, expectedThread: 'thread-1' } },
+      { operation: 'chat.card', args: { card: { key: 'card-1', kind: 'resume_request', question: '', canAccept: true, canReject: true }, accept: true, expectedThread: 'thread-1', resumeName: null } },
+    ].map(action => controller.handle({ type: 'boss.panel.page', account: ACCOUNT, ...action, stableKey: action.operation }, panel).then(() => '', error => error.message))
     const stop = { id: 9, action: 'orchestrator.stop', payload: {} }
     controls.request(async path => path.endsWith('/heartbeat') ? heartbeat([work, stop]) : { stored: true })
     controls.advance()
@@ -167,6 +172,9 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     expect(channel.messages.filter(message => message.type === 'command').map(message => (message.command as { id: number }).id)).toEqual([8, 9])
     expect(controls.disk().accounts[ACCOUNT].ack).toBe(0)
     expect(await pendingAction).toBe('reconciliation_required')
+    expect(await Promise.all(queuedActions)).toEqual(Array(3).fill('page_execution_cancelled'))
+    expect(controls.pageCalls).toHaveLength(1)
+    expect(await controller.handle({ type: 'boss.panel.network', account: ACCOUNT, options: { method: 'POST', url: `${API}/api/plugin/orchestrator/event`, data: JSON.stringify({ event: 'stopped', event_id: 'stop-9' }) } }, panel)).toMatchObject({ status: 200 })
     releasePage({ result: { ok: true } })
     channel.send({ type: 'command.result', key: 'db-outbox-v2:8', accepted: false })
     channel.send({ type: 'command.result', key: 'db-outbox-v2:9', accepted: true })
@@ -175,6 +183,43 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     controls.advance()
     await controller.handle({ type: 'boss.tick' }, page)
     expect(controls.disk().accounts[ACCOUNT].ack).toBe(9)
+
+    // Calls already received before stop must also be fenced while validating the frame or saving a receipt.
+    for (const payload of [
+      { type: 'boss.panel.page', operation: 'chat.send', args: { text: 'reply', expectedThread: 'thread-1' }, stableKey: 'late-send' },
+      { type: 'boss.panel.navigate', url: 'https://www.zhipin.com/web/geek/job' },
+    ]) {
+      const late = harness()
+      const runtime = late.create()
+      await runtime.handle({ type: 'boss.panel.bootstrap' }, panel)
+      const checkingFrame = deferred<void>(), releaseFrame = deferred<void>()
+      const getFrame = late.chrome.webNavigation.getFrame
+      let holdFrame = true
+      late.chrome.webNavigation.getFrame = (async (details: Parameters<typeof getFrame>[0]) => {
+        if (holdFrame) { holdFrame = false; checkingFrame.resolve(); await releaseFrame.promise }
+        return getFrame(details)
+      }) as typeof getFrame
+      const beforeQueue = runtime.handle({ ...payload, account: ACCOUNT }, panel).then(() => '', error => error.message)
+      await checkingFrame.promise
+      await runtime.handle({ type: 'boss.panel.cancel', account: ACCOUNT }, panel)
+      releaseFrame.resolve()
+      expect(await beforeQueue).toBe('page_execution_cancelled')
+
+      const savingReceipt = deferred<void>(), releaseSave = deferred<void>()
+      const set = late.chrome.storage.local.set
+      let holdSave = true
+      late.chrome.storage.local.set = (async (value: Record<string, unknown>) => {
+        if (holdSave) { holdSave = false; savingReceipt.resolve(); await releaseSave.promise }
+        return set(value)
+      }) as typeof set
+      const beforeLease = runtime.handle({ ...payload, account: ACCOUNT }, panel).then(() => '', error => error.message)
+      await savingReceipt.promise
+      await runtime.handle({ type: 'boss.panel.cancel', account: ACCOUNT }, panel)
+      releaseSave.resolve()
+      expect(await beforeLease).toBe(payload.type === 'boss.panel.page' ? 'reconciliation_required' : 'page_execution_cancelled')
+      expect(late.pageCalls).toHaveLength(0)
+      expect(late.navigations).toHaveLength(0)
+    }
   })
 
   it('turns a persisted started command into reconciliation evidence and leaves an unknown action unacknowledged', async () => {
@@ -274,6 +319,31 @@ describe('MV3 production message dispatcher persistence and trust', () => {
     await expect(host.handle({ ...request, options: { method: 'GET', url: `${API}/api/conversations/list?limit=1000&token=bad` } }, panel)).rejects.toThrow('api_path_forbidden')
     await expect(host.handle({ ...request, options: { method: 'POST', url: `${API}/api/plugin/heartbeat` } }, panel)).rejects.toThrow('api_path_forbidden')
 
+    // Reattach only when the previous selected tab is gone or has left BOSS, using the verified top document.
+    for (const type of ['boss.panel.bootstrap', 'boss.panel.config']) {
+      for (const selection of [
+        { url: null, disabled: false, expectedTab: 12 },
+        { url: 'https://example.com', disabled: false, expectedTab: 12 },
+        { url: page.url, disabled: false, expectedTab: 13 },
+        { url: undefined, disabled: false, expectedTab: 13 },
+        { url: null, disabled: true, expectedTab: 13 },
+      ]) {
+        const reconnect = harness()
+        Object.assign(reconnect.disk().config!, { tabId: 13, enabled: !selection.disabled, panelDisabled: selection.disabled })
+        reconnect.chrome.tabs.get = (async (tabId: number) => {
+          if (tabId === 13 && selection.url === null) throw new Error('No tab with id: 13')
+          return { id: tabId, url: tabId === 13 ? selection.url : page.url }
+        }) as typeof reconnect.chrome.tabs.get
+        const current = reconnect.create()
+        await current.handle({ type, account: ACCOUNT, config: { apiBase: API, token: TOKEN, resumeId: 7 } }, panel)
+        expect(await current.schedulerTarget()).toMatchObject({
+          enabled: !selection.disabled, tabId: selection.expectedTab,
+          documentId: selection.expectedTab === 12 ? 'doc-1' : null,
+        })
+        expect(reconnect.disk().config).toMatchObject({ tabId: selection.expectedTab, panelDisabled: selection.disabled })
+      }
+    }
+
     // MAIN-world page output cannot grant a read tool write access, smuggle API fields, or navigate arbitrary BOSS paths.
     const attacks = [
       { name: 'get_page_state', args: {}, effects: [{ kind: 'application', payload: { platform: 'zhipin', platform_job_id: 'fake', title: 'fake', outcome: 'applied' } }] },
@@ -331,6 +401,17 @@ describe('MV3 production message dispatcher persistence and trust', () => {
   })
 
   it('drives actual hidden-page heartbeats through the production scheduler, stops on freeze/timeout, and fences a late session wake', async () => {
+    const query = vi.fn(async () => [
+      { id: 12 }, { id: 13, discarded: true }, { id: 14, frozen: true }, {}, { id: 15 },
+    ])
+    const inject = vi.fn(async (details: { target: { tabId: number } }) => {
+      if (details.target.tabId === 12) throw new Error('tab closed during attachment')
+      return []
+    })
+    await attachExistingBossPages({ tabs: { query }, scripting: { executeScript: inject } } as unknown as Pick<typeof chrome, 'tabs' | 'scripting'>)
+    expect(query).toHaveBeenCalledWith({ url: 'https://www.zhipin.com/*' })
+    expect(inject.mock.calls.map(([details]) => details)).toEqual([12, 15].map(tabId => ({ target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['content.js'] })))
+
     vi.useFakeTimers()
     try {
       const h = harness()

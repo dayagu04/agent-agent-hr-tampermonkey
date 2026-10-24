@@ -160,6 +160,7 @@ export class BossRuntime {
   private pageQueue: Promise<unknown> = Promise.resolve()
   private saving: Promise<void> = Promise.resolve()
   private revision = 0
+  private pageGeneration = 0
   private readonly schedulerEpoch = crypto.randomUUID()
   private requestController: AbortController | null = null
   private cancellation: Promise<void> = Promise.resolve()
@@ -293,6 +294,7 @@ export class BossRuntime {
     }
   }
   private cancelCoreExecution(): void {
+    this.pageGeneration += 1
     for (const controller of this.coreRequests) controller.abort()
     const active = this.activePageCall
     if (active) {
@@ -405,7 +407,23 @@ export class BossRuntime {
     const preferences = this.state.accounts[accountKey(config)]?.preferences || {}
     return { ...preferences, apiBase: config.apiBase, token: config.token, resumeId: config.resumeId }
   }
+  private async bindAvailablePanel(config: Config, panel: { tabId: number; topDocumentId: string }): Promise<boolean> {
+    if (config.panelDisabled) return false
+    if (config.tabId && config.tabId !== panel.tabId) {
+      let selected: chrome.tabs.Tab | undefined
+      try { selected = await this.api.tabs.get(config.tabId) } catch { /* The selected tab was closed. */ }
+      // A live BOSS selection (or a tab whose URL is unavailable) retains ownership.
+      if (selected && (!selected.url || bossUrl(selected.url))) return false
+    }
+    config.enabled = true; config.tabId = panel.tabId
+    this.connection = { tabId: panel.tabId, documentId: panel.topDocumentId, visibility: 'visible', seenAt: this.now() }
+    return true
+  }
+  private assertPageGeneration(generation: number): void {
+    if (generation !== this.pageGeneration) throw new Error('page_execution_cancelled')
+  }
   private async handlePanel(payload: Record<string, unknown>, sender: chrome.runtime.MessageSender): Promise<unknown> {
+    const pageGeneration = this.pageGeneration
     await this.loaded
     const panel = await this.trustedPanel(sender)
     const type = String(payload.type)
@@ -422,11 +440,7 @@ export class BossRuntime {
     }
     if (type === 'boss.panel.bootstrap') return this.enqueue(async () => {
       const cfg = this.state.config
-      if (cfg && !cfg.panelDisabled && (!cfg.tabId || cfg.tabId === panel.tabId)) {
-        cfg.enabled = true; cfg.tabId = panel.tabId
-        this.connection = { tabId: panel.tabId, documentId: panel.topDocumentId, visibility: 'visible', seenAt: this.now() }
-        await this.save()
-      }
+      if (cfg && await this.bindAvailablePanel(cfg, panel)) await this.save()
       const tab = await this.api.tabs.get(panel.tabId)
       const account = cfg ? this.account(this.session()) : undefined
       const interrupted = !!account?.interrupted
@@ -460,10 +474,7 @@ export class BossRuntime {
       this.account(this.session()).preferences = preferences
       cfg.resumeId = number(next.resumeId)
       cfg.defaultResumeName = next.resumeNames?.[String(next.defaultSendResumeId || next.resumeId)] || ''
-      if (!cfg.panelDisabled && (!cfg.tabId || cfg.tabId === panel.tabId)) {
-        cfg.enabled = true; cfg.tabId = panel.tabId
-        this.connection = { tabId: panel.tabId, documentId: panel.topDocumentId, visibility: 'visible', seenAt: this.now() }
-      }
+      await this.bindAvailablePanel(cfg, panel)
       await this.save()
       if (changesIdentity) this.reloadPanels(panel.documentId)
       return { account: this.coreScope(), config: this.panelConfiguration() }
@@ -520,6 +531,7 @@ export class BossRuntime {
     if (!session.config.enabled || session.config.tabId !== panel.tabId || this.connection?.documentId !== panel.topDocumentId) throw new Error('inactive_panel')
     if (type === 'boss.panel.navigate') return this.enqueue(async () => {
       this.assertActive(session)
+      this.assertPageGeneration(pageGeneration)
       if (!bossUrl(payload.url)) throw new Error('navigation_forbidden')
       const account = this.account(session)
       // Core persists pendingAction before requesting navigation. ACK acceptance survives its iframe unload.
@@ -527,11 +539,14 @@ export class BossRuntime {
         if (command.owner === panel.documentId && command.state === 'started') { command.state = 'done'; command.accepted = true }
       }
       await this.save()
+      this.assertPageGeneration(pageGeneration)
       await this.api.tabs.update(panel.tabId, { url: String(payload.url) })
+      this.assertPageGeneration(pageGeneration)
       return { ok: true }
     })
     if (type === 'boss.panel.page') return this.enqueuePage(async () => {
       this.assertActive(session)
+      this.assertPageGeneration(pageGeneration)
       if (this.connection?.documentId !== panel.topDocumentId) throw new Error('page_changed')
       const name = String(payload.operation)
       const args = object(payload.args)
@@ -541,6 +556,7 @@ export class BossRuntime {
       if (!stable || stable.length > 100_000) throw new Error('operation_key_required')
       const key = await pageCommandKey(`${session.accountKey}|core|${isCoreSideEffect(name) ? stable : crypto.randomUUID()}`)
       const fingerprint = await pageCommandKey(JSON.stringify([name, args]))
+      this.assertPageGeneration(pageGeneration)
       const account = this.account(session)
       const receipts = account.coreReceipts ||= {}
       const irreversible = isCoreSideEffect(name)
@@ -557,12 +573,15 @@ export class BossRuntime {
       }
       let result: ToolResult
       try {
+        this.assertPageGeneration(pageGeneration)
         const execution = await this.page(session, this.connection!, 'run', { name: `core:${name}`, args, commandKey: key, context: { defaultResumeName: session.config.defaultResumeName } }) as PageExecution
         this.assertActive(session)
+        this.assertPageGeneration(pageGeneration)
         result = execution.result
       } catch { result = this.reconciliation(name) }
       if (receipt) { receipt.state = 'done'; receipt.result = result; await this.save() }
       if (!result?.ok) throw new Error(result?.error || 'page_operation_failed')
+      this.assertPageGeneration(pageGeneration)
       return result.data
     })
     if (type === 'boss.panel.tool') {
@@ -595,6 +614,7 @@ export class BossRuntime {
   }
   private interrupt(): void {
     this.revision += 1
+    this.pageGeneration += 1
     for (const controller of this.coreRequests) controller.abort()
     for (const panel of this.panels.values()) panel.port?.postMessage({ type: 'suspend', reason: '执行端或账号已切换，请确认后恢复' })
     this.requestController?.abort()
