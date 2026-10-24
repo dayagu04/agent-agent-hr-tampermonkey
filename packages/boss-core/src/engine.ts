@@ -2,7 +2,8 @@
 //
 // 设计：决策复用后端主项目模块（规则/匹配/招呼语/决策日志），
 // 插件只做浏览器执行 + 如实上报，不在前端另造一套算法。
-import type { ApplyResult, BasePlatform } from './platforms/base'
+import type { ApplyResult } from './platforms/base'
+import { executionPageUrl, type ExecutionPlatform } from './execution-host'
 import type { ApplyOutcome, ApplyRule, JobCard, PluginConfig, ApplyProgress } from './types'
 import {
   fetchGreeting,
@@ -27,7 +28,7 @@ export class ApplyEngine {
   readonly attemptedIds: string[] = []
 
   constructor(
-    private platform: BasePlatform,
+    private platform: ExecutionPlatform,
     private config: PluginConfig,
     private onProgress: (p: ApplyProgress) => void,
     /** 本次运行要跳过的岗位 id（已尝试过，防同页续跑重复投） */
@@ -142,7 +143,9 @@ export class ApplyEngine {
 
       if (page < maxPages) {
         log('尝试翻到下一页...')
-        const ok = await this.platform.nextPage()
+        const ok = await this.platform.nextPage({
+          idempotencyKey: `${this.orchestratorRunId || this.runId}:next:${page}`,
+        })
         if (!ok) {
           log('没有下一页了，结束')
           break
@@ -178,7 +181,7 @@ export class ApplyEngine {
       if (jobs.length === 0) {
         // 区分「不在列表页」与「在列表页但选择器失效」，避免用户误判
         const onSearchPage = /sou\.zhaopin\.com|we\.51job\.com\/pc\/search|search\.51job\.com/.test(
-          location.href,
+          executionPageUrl().href,
         )
         if (!onSearchPage) {
           log('当前不是搜索结果页。插件只处理当前页面已有的岗位，')
@@ -429,6 +432,7 @@ export class ApplyEngine {
         try {
           // 注入招呼语获取器：BOSS 建立会话需发首条消息，复用后端主项目话术
           const raw = await this.platform.applyJob(job, {
+            idempotencyKey: `${this.orchestratorRunId || this.runId}:apply:${this.platform.code}:${job.platformJobId}`,
             getGreeting: () => isAgentActionAllowed(this.config.agentPolicy, 'send_greeting')
               ? fetchGreeting(this.config, this.platform.code, job)
               : Promise.resolve(''),
@@ -466,7 +470,7 @@ export class ApplyEngine {
             await recordApplication(
               this.config, this.platform.code, job, score,
               'applied', message, false, this.orchestratorRunId,
-              new URLSearchParams(location.search).get('query') || '',
+              executionPageUrl().searchParams.get('query') || '',
             )
           } catch (e) {
             log(`  ↳ 记账失败（${(e as Error).name || 'Error'}）`)
@@ -497,7 +501,7 @@ export class ApplyEngine {
           const rec = await recordApplication(
             this.config, this.platform.code, job, score, outcome, message, greetingSent,
             this.orchestratorRunId,
-            new URLSearchParams(location.search).get('query') || '',
+            executionPageUrl().searchParams.get('query') || '',
           )
           // 新服务端会把历史 failed/unknown 行升级成真实成功。该响应为了兼容
           // 旧客户端仍可能带 duplicate=true，必须先看 upgraded，避免误报“已投过”。
@@ -510,7 +514,7 @@ export class ApplyEngine {
 
         // 投递间隔：用户设置的单值（秒），内置 ±10% 随机抖动模拟真人节奏，
         // 是「投完一个岗位 → 投下一个」之间唯一的等待来源。
-        const testMode = /[?&]testmode=1/.test(location.href)
+        const testMode = /[?&]testmode=1/.test(executionPageUrl().href)
         let waitMs = this.config.applyIntervalSeconds * 1000 * (0.9 + Math.random() * 0.2)
         if (this.platform.code === 'zhipin' && progress.applied < this.effectiveMaxApply) {
           if (testMode && waitMs > 10_000) waitMs = 10_000

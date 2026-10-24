@@ -16,10 +16,11 @@ import { diag, flushLogs, setLogRunId } from './logger'
 import { saveConfig } from './config'
 import { ApplyEngine } from './engine'
 import { detectPlatform } from './platforms/factory'
+import { detectExecutionRisk, executionPageUrl, navigateExecutionPage } from './execution-host'
 import { onChatPage, requestStopChatRound, runChatRound } from './platforms/boss-chat'
 import { reportOrchestratorEvent } from './api'
 
-/** 执行器状态（持久化到 GM 存储） */
+/** 执行器状态（持久化到宿主存储） */
 export interface OrchestratorState {
   /** 当前执行阶段（供 UI 展示；不再参与决策） */
   phase: 'idle' | 'search' | 'apply' | 'chat' | 'paused' | 'stopped'
@@ -94,7 +95,7 @@ interface QueuedOrchestratorEvent {
   }
 }
 
-/** 只串行化 GM 存储读改写，网络请求不占用这个锁。 */
+/** 只串行化宿主存储读改写，网络请求不占用这个锁。 */
 let eventQueueOps: Promise<unknown> = Promise.resolve()
 function withEventQueueLock<T>(fn: () => Promise<T>): Promise<T> {
   const run = eventQueueOps.then(fn, fn)
@@ -169,17 +170,17 @@ const CHAT_URL = 'https://www.zhipin.com/web/geek/chat'
  * 页面判定必须单一来源，禁止各处各写一套，否则会互相打架造成死循环。
  */
 export function onJobListPage(): boolean {
-  return /\/web\/geek\/jobs?\b/.test(window.location.pathname)
+  return /\/web\/geek\/jobs?\b/.test(executionPageUrl().pathname)
 }
 
 /** 职位列表页且带搜索条件（query 参数），说明是搜索结果而非空白推荐页 */
 function onSearchResultPage(): boolean {
-  return onJobListPage() && new URLSearchParams(window.location.search).has('query')
+  return onJobListPage() && new URLSearchParams(executionPageUrl().search).has('query')
 }
 
 /** 捕获当前页已生效的搜索筛选参数（排除 query/page），供翻页/换词时复用 */
 function captureSearchFilterQuery(): string {
-  const p = new URLSearchParams(window.location.search)
+  const p = new URLSearchParams(executionPageUrl().search)
   p.delete('query')
   p.delete('page')
   return p.toString()
@@ -203,7 +204,7 @@ function buildSearchUrl(keyword: string, cityCode: string, page: number, filterQ
 /** 当前页面是否就是目标搜索结果页（关键词/页码/城市都对得上） */
 function onTargetSearchPage(keyword: string, cityCode: string, page: number): boolean {
   if (!onSearchResultPage()) return false
-  const sp = new URLSearchParams(window.location.search)
+  const sp = new URLSearchParams(executionPageUrl().search)
   if (sp.get('query') !== keyword) return false
   if (Number(sp.get('page') || 1) !== page) return false
   if (cityCode && sp.get('city') && sp.get('city') !== cityCode) return false
@@ -560,7 +561,7 @@ export class Orchestrator {
     // BOSS 搜索列表是滚动加载（?page=N 无效，实测单组合上限 300 张）：
     // 始终停留在第 1 页，每次 apply_batch 由 ApplyEngine.scanJobs 滚动加载全量岗位。
     // 组合是否完成由插件上报 scanned/skipped/count，后端据此切下一个关键词/城市。
-    const isZhipin = /zhipin\.com/.test(window.location.hostname)
+    const isZhipin = /zhipin\.com/.test(executionPageUrl().hostname)
     const page = isZhipin
       ? 1
       : typeof action.page === 'number' && action.page > 0
@@ -591,14 +592,14 @@ export class Orchestrator {
       })
       this.state.phase = 'search'
       await storage.set(STATE_KEY, this.state)
-      window.location.href = wantUrl
+      await navigateExecutionPage(wantUrl)
       return
     }
 
     diag('ORCH', '执行 apply_batch', { keywordLength: keyword.length, page, limit })
     this.busy = true
     try {
-      if (this.detectRiskControl()) {
+      if (await detectExecutionRisk()) {
         // 风控页面属于异常事件：先写入插件 outbox，让后端把它转成
         // 飞书通知；随后仍暂停当前页面，避免在验证码/滑块上盲目重试。
         await this.reportEvent('captcha', {
@@ -693,13 +694,13 @@ export class Orchestrator {
 
     if (!onChatPage()) {
       diag('ORCH', `执行 ${actionKind}：跳转聊天页`)
-      window.location.href = CHAT_URL
+      await navigateExecutionPage(CHAT_URL)
       return
     }
 
     this.busy = true
     try {
-      if (this.detectRiskControl()) {
+      if (await detectExecutionRisk()) {
         await this.reportEvent('captcha', {
           action: 'chat_reply',
           reason: '检测到 BOSS 风控页面，需要完成页面验证',
@@ -772,26 +773,6 @@ export class Orchestrator {
     } finally {
       this.busy = false
     }
-  }
-
-  /**
-   * 检测风控页面。
-   *
-   * 只认两件事：① 可见的安全校验/验证码容器；② URL 明确指向安全校验页。
-   * 正文里零散出现的「安全验证/请稍后再试」等关键词不算（避免误判暂停）。
-   */
-  private detectRiskControl(): boolean {
-    const el = document.querySelector(
-      '.security-check, .captcha, .geetest_panel, [class*="security-check"]',
-    ) as HTMLElement | null
-    if (el) {
-      // 必须是可见的（有实际尺寸），隐藏的模板节点不算
-      const r = el.getBoundingClientRect()
-      if (r.width > 4 && r.height > 4) return true
-    }
-    return /security-check|captcha|verify/.test(
-      window.location.pathname + window.location.search,
-    )
   }
 
   /** 将事件先写入本地 outbox，再异步上报；网络失败不能丢状态推进。 */
@@ -868,7 +849,7 @@ export class Orchestrator {
     if (state.pendingAction) {
       diag('ORCH', `恢复未完成指令: ${state.pendingAction.action}`)
       // 页面刚加载完 DOM 可能还没渲染稳，延迟执行
-      window.setTimeout(() => {
+      setTimeout(() => {
         void this.applyBackendAction(state.pendingAction?.payload || {})
       }, 2000)
     } else {
@@ -898,7 +879,7 @@ export function resumeOrchestrator(config: PluginConfig): Promise<void> {
  * 读取持久化的编排状态快照（不依赖单例是否已恢复）。
  *
  * 远程心跳/网页状态上报用：执行器导航跳转后新页面单例恢复前
- * getState() 为 null，直接读 GM 存储里的 state 才能报出真实阶段。
+ * getState() 为 null，直接读宿主存储里的 state 才能报出真实阶段。
  */
 export async function getOrchestratorSnapshot(): Promise<{
   phase: OrchestratorState['phase'] | null

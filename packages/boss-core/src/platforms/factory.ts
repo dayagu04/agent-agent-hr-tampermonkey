@@ -6,12 +6,15 @@
 // - qiancheng (51前程无忧) / liepin (猎聘)：适配器存在但未在真实页面验证，
 //   @match 未启用，仅作扩展预留
 import { BasePlatform } from './base'
+import { drivenPlatform, executionPageUrl } from '../execution-host'
 import { BossPlatform } from './boss'
 import { ZhaopinPlatform } from './zhaopin'
 import { LiepinPlatform } from './liepin'
 import { QianchengPlatform } from './qiancheng'
 
-export function detectPlatform(url: string = location.href): BasePlatform | null {
+export function detectPlatform(url: string = executionPageUrl().href): BasePlatform | null {
+  const driven = drivenPlatform(url)
+  if (driven !== undefined) return driven
   if (url.includes('zhipin.com')) return new BossPlatform()
   if (url.includes('zhaopin.com')) return new ZhaopinPlatform()
   if (url.includes('51job.com')) return new QianchengPlatform()
