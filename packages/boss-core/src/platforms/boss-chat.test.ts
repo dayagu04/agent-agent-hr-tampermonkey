@@ -822,6 +822,22 @@ describe('card handling confirmation', () => {
       const previousDispatch = clickCardDetailed('resume_request', true)
       await vi.runAllTimersAsync()
       expect(await previousDispatch).toEqual({ ok: false, reason: 'card_action_unconfirmed', mayHaveExecuted: true })
+      const alreadyAttemptedResume = sendResumeDetailed()
+      await vi.runAllTimersAsync()
+      expect(await alreadyAttemptedResume).toEqual({ ok: false, reason: 'send_failed' })
+      expect(lastResumeSendState()).toEqual({ attempted: true, confirmed: false })
+      expect(clicks).toHaveBeenCalledTimes(1)
+      for (const toolbar of ['', '<button class="unable">发简历</button>']) {
+        mount(resume + toolbar)
+        const fallbackClick = vi.fn()
+        document.querySelector('#resume button:last-child')!.addEventListener('click', fallbackClick)
+        const fallback = sendResumeDetailed()
+        await vi.runAllTimersAsync()
+        expect(await fallback).toEqual({ ok: false, reason: 'send_failed' })
+        expect(fallbackClick).toHaveBeenCalledTimes(1)
+        expect(lastResumeSendState()).toEqual({ attempted: true, confirmed: false })
+      }
+
 
       mount(resume + contact)
       const wrongReject = vi.fn()

@@ -2632,21 +2632,27 @@ async function sendResumeDetailedInThread(
   }
   const btn = findResumeToolbarButton()
   // 有未处理的「索要简历」卡片时，工具栏「发简历」是灰的：必须走卡片上的同意
-  const cardFallback = async (reason: string): Promise<boolean> => {
-    const cards = listPendingCardKinds().filter((c) => c.kind === 'resume_request')
-    if (!cards.length) return false
-    diag('CHAT', `resume_send step=fallback_card reason=${reason}`)
-    return clickCard('resume_request', true, { resumeName: targetName || null, resumeIndex: targetIndex ?? null })
+  const cardFallback = async (reason: string): Promise<ResumeSendOutcome | null> => {
+    const result = await clickCardDetailed('resume_request', true, { resumeName: targetName || null, resumeIndex: targetIndex ?? null })
+    // completeResumeSend starts its own receipt baseline; retain the preceding
+    // card dispatch even when the picker never appears or no sent mark arrives.
+    resumeSendState.attempted ||= result.mayHaveExecuted
+    resumeSendState.confirmed ||= result.ok
+    if (result.reason === 'card_not_found') return null
+    diag('CHAT', `resume_send step=fallback_card reason=${reason} confirmed=${result.ok} attempted=${result.mayHaveExecuted}`)
+    return { ok: result.ok, reason: result.ok ? undefined : 'send_failed' }
   }
   if (!btn) {
-    if (await cardFallback('no_toolbar_button')) return { ok: true }
+    const fallback = await cardFallback('no_toolbar_button')
+    if (fallback) return fallback
     diag('CHAT', '未找到「发送简历」按钮')
     return { ok: false, reason: 'no_button' }
   }
   if (isDialogButtonDisabled(btn)) {
     diag('CHAT', '「发简历」按钮处于禁用态，尝试卡片路径', { cls: String(btn.className || '').slice(0, 60) })
-    if (await cardFallback('toolbar_disabled')) return { ok: true }
-    // 工具栏禁用且没有索要简历卡片 = BOSS 当前不允许给这个会话发简历
+    const fallback = await cardFallback('toolbar_disabled')
+    if (fallback) return fallback
+    // No card was dispatched; only this path is a known platform refusal.
     diag('CHAT', 'resume_send status=not_allowed reason=toolbar_disabled_no_card')
     return { ok: false, reason: 'not_allowed' }
   }
