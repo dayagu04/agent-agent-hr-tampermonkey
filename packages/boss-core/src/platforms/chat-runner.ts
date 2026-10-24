@@ -338,9 +338,9 @@ async function forEachThreadScrolling(
 }
 async function maybeCleanupThread(
   cfg: PluginConfig, t: ChatThreadTarget, log: (message: string) => void,
-  dbLastMessageAt: number | null, _opened = false, planJobId = '', reason = 'aged_no_reply',
+  dbLastMessageAt: number | null, planJobId = '', reason = 'aged_no_reply',
 ): Promise<number> {
-  const current = await page.open(t)
+  const current = await page.open(t, (cfg.cleanupGuardSeconds ?? 3) * 1000)
   if (!current) return 0
   const messages = await page.messages(current.threadId)
   logChatHistory(t, messages)
@@ -718,11 +718,6 @@ async function runChatRoundInner(
         continue
       }
       const t = sourceThread(live)
-      const opened = await page.open(t)
-      if (!opened) {
-        diag('CHAT', `索引跳转失败 idx=${live.index}`)
-        continue
-      }
       // 对账删除：优先级最高（reconcile 返回的是精确时间戳判定后的结果）
       const key = chatTargetKey({ company: t.company, job_title: t.jobTitle, encrypt_job_id: boss.encryptJobId || '' })
       if (keysToDelete.includes(key)) {
@@ -731,7 +726,7 @@ async function runChatRoundInner(
           continue
         }
         cleaned += await maybeCleanupThread(
-          cfg, t, log, target?.last_message_at ?? null, true, boss.encryptJobId || '',
+          cfg, t, log, target?.last_message_at ?? null, boss.encryptJobId || '',
           'reconcile_timeout',
         )
         continue
@@ -743,9 +738,14 @@ async function runChatRoundInner(
           continue
         }
         cleaned += await maybeCleanupThread(
-          cfg, t, log, target.last_message_at, true, target.encrypt_job_id,
+          cfg, t, log, target.last_message_at, target.encrypt_job_id,
           target.reason || 'aged_no_reply',
         )
+        continue
+      }
+      const opened = await page.open(t)
+      if (!opened) {
+        diag('CHAT', `索引跳转失败 idx=${live.index}`)
         continue
       }
       const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId, expectedThread: opened.threadId }, replyScope)
@@ -798,7 +798,7 @@ async function runChatRoundInner(
         return 'ok'
       }
       cleaned += await maybeCleanupThread(
-        cfg, t, log, target?.last_message_at ?? null, false, row.jobId || '',
+        cfg, t, log, target?.last_message_at ?? null, row.jobId || '',
         'reconcile_timeout',
       )
       return 'ok'
@@ -811,7 +811,7 @@ async function runChatRoundInner(
         return 'ok'
       }
       cleaned += await maybeCleanupThread(
-        cfg, t, log, target.last_message_at, false, target.encrypt_job_id,
+        cfg, t, log, target.last_message_at, target.encrypt_job_id,
         target.reason || 'aged_no_reply',
       )
       return 'ok'

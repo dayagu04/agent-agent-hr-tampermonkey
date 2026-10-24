@@ -2421,9 +2421,9 @@ export async function sendResumeDetailed(
     const ok = await completeResumeSend(targetName || null, false, baseline, targetIndex ?? null)
     return { ok, reason: ok ? undefined : 'send_failed' }
   }
-  const cfg = targetName === null ? null : loadConfig()
+  const cfg = loadConfig()
   const configured =
-    cfg?.defaultSendResumeId && cfg.resumeNames
+    cfg.defaultSendResumeId && cfg.resumeNames
       ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
       : null
   const ok = await completeResumeSend(configured, false, baseline)
@@ -2835,8 +2835,10 @@ async function resolveDriverTarget(target: ChatThreadTarget): Promise<ChatThread
   const matches = listThreadsQuiet().filter(row => rowMatchesTarget(row, target))
   return matches.length === 1 ? matches[0] : null
 }
-async function pageOpen(target: ChatThreadTarget): Promise<ChatCurrent | null> {
+async function pageOpen(target: ChatThreadTarget, guardMs?: number): Promise<ChatCurrent | null> {
+  if (guardMs !== undefined && userRecentlyActive(guardMs)) return null
   const row = await resolveDriverTarget(target)
+  if (guardMs !== undefined && userRecentlyActive(guardMs)) return null
   if (!row || await confirmThreadRow(row) !== 'ok') return null
   const current = documentCurrent()
   return current.threadId ? current : null
@@ -2904,7 +2906,7 @@ export const chatPageOperations: Record<string, (args: Record<string, unknown>) 
     }
     return { threads: listThreadsQuiet().map(rowTarget), scrollable: !!container, atEnd }
   },
-  'chat.open': async ({ target }) => pageOpen(target as ChatThreadTarget),
+  'chat.open': async ({ target, guardMs }) => pageOpen(target as ChatThreadTarget, typeof guardMs === 'number' ? guardMs : undefined),
   'chat.current': async () => documentCurrent(),
   'chat.messages': async ({ expectedThread }) => withinThread(String(expectedThread || ''), () => readMessages(), []),
   'chat.cards': async ({ expectedThread }) => pageCards(String(expectedThread || '')),
@@ -2917,7 +2919,7 @@ const localCall = <T>(operation: string, args: Record<string, unknown> = {}): Pr
 const legacyChatDriver: ChatDriver = {
   onChatPage,
   snapshot: () => localCall('chat.snapshot'), sources: () => localCall('chat.sources'),
-  window: (screen) => localCall('chat.window', { screen }), open: (target) => localCall('chat.open', { target }),
+  window: (screen) => localCall('chat.window', { screen }), open: (target, guardMs) => localCall('chat.open', { target, guardMs }),
   current: () => localCall('chat.current'), messages: (expectedThread) => localCall('chat.messages', { expectedThread }),
   cards: (expectedThread) => localCall('chat.cards', { expectedThread }), card: (action) => localCall('chat.card', { ...action }),
   send: (content, expectedThread) => localCall('chat.send', { text: content, expectedThread }),

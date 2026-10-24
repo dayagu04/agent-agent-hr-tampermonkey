@@ -38,7 +38,7 @@ export interface ChatDriver {
   snapshot(): Promise<ChatSnapshotRow[]>
   sources(): Promise<ChatSourceItem[] | null>
   window(screen?: number): Promise<ChatWindow>
-  open(target: ChatThreadTarget): Promise<ChatCurrent | null>
+  open(target: ChatThreadTarget, guardMs?: number): Promise<ChatCurrent | null>
   current(): Promise<ChatCurrent>
   messages(expectedThread: string): Promise<ChatMessage[]>
   cards(expectedThread: string): Promise<ChatCardTarget[]>

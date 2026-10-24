@@ -27,9 +27,9 @@ export function installNativeChatDriver(): void {
     snapshot: () => nativePageCall('chat.snapshot'),
     sources: async () => { sources = await nativePageCall('chat.sources'); return sources },
     window: (screen) => nativePageCall('chat.window', screen === undefined ? {} : { screen }),
-    open: async (target) => {
+    open: async (target, guardMs) => {
       current = emptyCurrent()
-      const opened = await nativePageCall<ChatCurrent | null>('chat.open', { target })
+      const opened = await nativePageCall<ChatCurrent | null>('chat.open', { target, ...(guardMs === undefined ? {} : { guardMs }) })
       if (opened) current = opened
       return opened
     },
