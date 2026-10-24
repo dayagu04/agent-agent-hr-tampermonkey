@@ -7,36 +7,15 @@
 // 全过程由后端 conversation_* 三表留痕（意图/回复/发送结果）供事后评判。
 import { diag } from '../logger'
 import { assertToolExecutionActive } from '../tool-execution-guard'
-import type { AgentPolicy, ContactChannel, PluginConfig } from '../types'
-import {
-  markChatSent,
-  reportChatOutcome,
-  syncChatOne,
-  reconcileThreads,
-} from '../api'
-import type { SyncChatResponse } from '../api'
-import { chatTargetKey, findPlanTarget, loadChatPlan } from '../chat-plan'
-import type { ChatPlanTarget } from '../chat-plan'
-import { selectChatActionId, shouldReportContactOnly } from '../chat-action-report'
-import {
-  actionForCard,
-  cardActionAllowed,
-  normalizeChatActionPlan,
-} from '../chat-action-plan'
-import type { ChatActionPlan } from '../chat-action-plan'
+import type { PluginConfig } from '../types'
 import { collectThreadSnapshot } from '../thread-snapshot'
-import {
-  flushConversationDeletedMarks,
-  queueConversationDeletedMark,
-  removeMirrorByKey,
-} from '../ledger'
 import { loadConfig } from '../config'
-import {
-  contactChannelFromQuestion,
-  isAgentActionAllowed,
-  isContactExchangeAllowed,
-  normalizeContactChannel,
-} from '../contact-policy'
+import { installedChatDriver, chatActionKey } from './chat-driver'
+import type { ChatDriver, ChatCurrent, ChatThreadTarget, ChatSourceItem as DriverSourceItem, ChatCardTarget, ChatCardAction, ChatDeleteAction } from './chat-driver'
+import { runChatRoundWithDriver, recordConversationDeleted } from './chat-runner'
+import type { ChatRoundOptions } from './chat-runner'
+export { isActionCardAllowed, isContactCardAllowed } from './chat-driver'
+export type { ContactDecision } from './chat-driver'
 import { findByText, findChatPanel, findEditable } from '../domprobe'
 import { clickDirect, realClick } from '../dom-events'
 import {
@@ -50,6 +29,18 @@ import {
   revealOperateBtn,
   unmarkOperateRow,
 } from './boss-delete'
+
+let pageExpectedThread: string | null = null
+function assertChatExecutionActive(): void {
+  assertToolExecutionActive()
+  if (pageExpectedThread && documentCurrent().threadId !== pageExpectedThread) throw new Error('chat_thread_changed')
+}
+async function withinThread<T>(expected: string, action: () => Promise<T>, fallback: T): Promise<T> {
+  if (!expected || documentCurrent().threadId !== expected) return fallback
+  if (pageExpectedThread) throw new Error('chat_page_action_busy')
+  pageExpectedThread = expected
+  try { assertChatExecutionActive(); return await action() } finally { pageExpectedThread = null }
+}
 
 /** 聊天页单个会话条目 */
 export interface ChatThread {
@@ -106,9 +97,9 @@ function allMatch(selectors: string[], root: ParentNode = document): HTMLElement
 
 const text = (el: Element | null | undefined) => (el?.textContent || '').trim()
 const delay = async (min: number, max: number) => {
-  assertToolExecutionActive()
+  assertChatExecutionActive()
   await new Promise((r) => setTimeout(r, min + Math.random() * (max - min)))
-  assertToolExecutionActive()
+  assertChatExecutionActive()
 }
 
 /** 从会话行 DOM 提取 BOSS 原生唯一标识（threadKey 与删除定位共用同一来源）。 */
@@ -125,28 +116,10 @@ function readBossId(el: HTMLElement): string {
   )
 }
 
-/** 只记录不可逆还原的会话统计；消息、姓名、公司和岗位原文不得进入普通日志。 */
-function logChatHistory(
-  _t: ChatThread,
-  messages: Array<{ sender: 'hr' | 'me' | 'system'; content: string }>,
-): void {
-  const counts = { hr: 0, me: 0, system: 0 }
-  let totalChars = 0
-  for (const message of messages) {
-    counts[message.sender]++
-    totalChars += (message.content || '').length
-  }
-  diag('HIST', '会话历史摘要', {
-    messageCount: messages.length,
-    senderCounts: counts,
-    totalChars,
-    lastSender: messages.at(-1)?.sender || 'none',
-  })
-}
-
 /** 是否在 BOSS 聊天页 */
 export function onChatPage(): boolean {
-  return /\/web\/geek\/chat/.test(location.pathname)
+  const driver = installedChatDriver()
+  return driver ? driver.onChatPage() : /\/web\/geek\/chat/.test(location.pathname)
 }
 
 /**
@@ -158,7 +131,7 @@ export function onChatPage(): boolean {
  * @returns 是否成功触发切换
  */
 function switchThreadViaVue(el: HTMLElement): boolean {
-  assertToolExecutionActive()
+  assertChatExecutionActive()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const vm = (el as any).__vue__
   if (!vm) return false
@@ -477,7 +450,7 @@ async function deleteThreadImpl(
     // 首选：直接调用该行组件自己的 deleteBoss()。
     // 它就是「删除」菜单项最终调用的方法，跳过全部 DOM 交互，
     // 且作用对象就是这一行，不存在删错会话的可能。
-    assertToolExecutionActive()
+    assertChatExecutionActive()
     if (deleteViaRowVue(hit.el)) {
       if (await confirmAndVerify('deleteViaRowVue')) return 'ok'
       diag('CHAT', 'deleteViaRowVue 调用成功但会话仍在列表，继续尝试点击路径')
@@ -838,16 +811,22 @@ function activateThread(hit: ChatThread): 'ok' | 'failed' {
 }
 
 export function openThread(company: string, jobTitle = ''): 'ok' | 'not-found' | 'ambiguous' | 'failed' {
+  if (installedChatDriver()) throw new Error('native_chat_requires_async_openChatThread')
   const target = findThreadToOpen(company, jobTitle)
   return typeof target === 'string' ? target : activateThread(target)
 }
 
 /** Tool calls must observe the intended header before a subsequent send is allowed. */
 export async function openThreadConfirmed(company: string, jobTitle = ''): Promise<'ok' | 'not-found' | 'ambiguous' | 'failed' | 'thread_not_confirmed'> {
-  assertToolExecutionActive()
+  if (installedChatDriver()) return openChatThread(company, jobTitle)
+  assertChatExecutionActive()
   // Resolve uniqueness even when a matching header is already open: company alone cannot identify an HR.
   const target = findThreadToOpen(company, jobTitle)
   if (typeof target === 'string') return target
+  return confirmThreadRow(target, company, jobTitle)
+}
+
+async function confirmThreadRow(target: ChatThread, company = target.company, jobTitle = target.jobTitle): Promise<'ok' | 'failed' | 'thread_not_confirmed'> {
   const row = readRowJobInfo(target.el)
   const norm = (value: string) => value.replace(/\s+/g, '').toLowerCase()
   const expected = {
@@ -863,10 +842,10 @@ export async function openThreadConfirmed(company: string, jobTitle = ''): Promi
   }
   if (confirmed()) return 'ok'
   const activated = activateThread(target)
-  assertToolExecutionActive()
+  assertChatExecutionActive()
   if (activated !== 'ok') return activated
   for (let attempt = 0; attempt <= 15; attempt++) {
-    assertToolExecutionActive()
+    assertChatExecutionActive()
     if (confirmed()) return 'ok'
     if (attempt < 15) await delay(200, 200)
   }
@@ -885,27 +864,8 @@ const SYSTEM_MSG_RE = /^(对方已(查看|同意|接受|拒绝)|附件简历已(
  * 不再 fire-and-forget 静默丢失（丢失的后果是后端死会话残留、每轮重试）。
  * identity.encryptJobId 是后端 Job.platform_job_id，供精确标记。
  */
-async function afterConversationDeleted(
-  company: string,
-  jobTitle: string,
-  reason: string,
-  identity?: { encryptJobId?: string },
-): Promise<void> {
-  const cfg = loadConfig()
-  await queueConversationDeletedMark({
-    company,
-    job_title: jobTitle,
-    reason,
-    encrypt_job_id: identity?.encryptJobId || '',
-  })
-  await flushConversationDeletedMarks(cfg)
-  await removeMirrorByKey(company, jobTitle, identity)
-  // 通知面板：自动删除后镜像已变，立即重渲染，不再等 60s 轮询
-  try {
-    window.dispatchEvent(new CustomEvent('aah:chat-mirror-changed'))
-  } catch {
-    /* 事件派发失败不影响删除结果 */
-  }
+async function afterConversationDeleted(company: string, jobTitle: string, reason: string, identity?: { encryptJobId?: string }): Promise<void> {
+  await recordConversationDeleted(loadConfig(), company, jobTitle, reason, identity)
 }
 
 export interface ChatMessage {
@@ -936,6 +896,8 @@ function cardText(bubble: HTMLElement): string {
 export async function readMessages(
   opts: { verbose?: boolean } = {},
 ): Promise<ChatMessage[]> {
+  const driver = installedChatDriver()
+  if (driver) return driver.messages((await driver.current()).threadId)
   // 滚到消息区底部，确保读到最后一条。findChatPanel() 返回的容器不一定是
   // 可滚动节点，需从消息节点往上找真正可滚动的祖先。
   const panel = findChatPanel()
@@ -1145,6 +1107,8 @@ function headerNameIn(root: HTMLElement): HTMLElement | null {
 }
 
 export function currentThreadId(): string {
+  const cached = installedChatDriver()?.cachedCurrent?.()
+  if (cached) return cached.threadId
   const header = findChatHeader()
   // 必须排掉列表项里的 .name-text，否则拿到的恒是列表第一项的姓名，
   // 会话指纹就永远不变 —— 切换检测（sendText 的 expectThread 核对）随之失效
@@ -1166,6 +1130,8 @@ export function currentThreadInfo(): {
   salary: string
   city: string
 } {
+  const cached = installedChatDriver()?.cachedCurrent?.()
+  if (cached) return cached.info
   const header = findChatHeader()
   const jobTitle = text(header ? headerPositionIn(header) : null)
   // 薪资/城市取头部的，且排掉列表项里的同名 class（否则按文档顺序会
@@ -1266,6 +1232,7 @@ async function sendText(content: string, expectThread?: string): Promise<boolean
   try {
     input.focus()
     await delay(150, 300)
+    if (expectThread && currentThreadId() !== expectThread) return false
     if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
       const ta = input as HTMLTextAreaElement
       ta.value = content
@@ -1287,10 +1254,11 @@ async function sendText(content: string, expectThread?: string): Promise<boolean
 
     // 发送前记下我方气泡数：新气泡是「这次发的」唯一可靠标识（文本匹配会被
     // 历史同文消息、输入框残留文字误判）。
+    if (expectThread && currentThreadId() !== expectThread) return false
     const baseline = countMyBubbles()
 
     // 发送：Enter 键盘事件（keydown+keyup，补 keyCode/which 兼容旧 handler）
-    assertToolExecutionActive()
+    assertChatExecutionActive()
     for (const type of ['keydown', 'keyup'] as const) {
       input.dispatchEvent(new KeyboardEvent(type, {
         key: 'Enter',
@@ -1310,7 +1278,8 @@ async function sendText(content: string, expectThread?: string): Promise<boolean
       // 兜底：找「发送」按钮（文本/aria/title/图标型，限定输入框附近，避免误点）
       const sendBtn = findSendButton(input)
       if (sendBtn) {
-        assertToolExecutionActive()
+        if (expectThread && currentThreadId() !== expectThread) return false
+        assertChatExecutionActive()
         sendBtn.click()
         await delay(300, 600)
         if (countMyBubbles() > baseline) via = 'button'
@@ -1511,111 +1480,6 @@ function findPendingCards(): ChatCard[] {
   return cards
 }
 
-export interface ContactDecision {
-  /** 字段存在即表示后端已给出联系方式动作。 */
-  provided: boolean
-  allowed: boolean | null
-  channel: ReturnType<typeof normalizeContactChannel>
-  /** 若后端返回此字段，必须按每张卡片的渠道逐一匹配。 */
-  channels?: ContactChannel[]
-  actionId: number | null
-  idempotencyKey?: string
-}
-
-/**
- * 计算单张联系方式卡片是否可点击。
- * 后端返回 channels 时它是权限边界，不能只看 allowed=true；没有渠道信息
- * 时才回落到旧协议的单渠道字段或插件本地策略。
- */
-export function isContactCardAllowed(
-  decision: ContactDecision | null | undefined,
-  channel: ContactChannel | null,
-  policy: AgentPolicy | null | undefined,
-): boolean {
-  if (!channel) return false
-  if (decision?.provided) {
-    if (decision.allowed !== true) return false
-    if (decision.channels) return decision.channels.includes(channel)
-    if (decision.channel) return decision.channel === channel
-  }
-  return isContactExchangeAllowed(policy, channel)
-}
-
-/** 卡片副作用使用与后端相同的动作键，防止卡片路径绕过 Agent 策略。 */
-export function isActionCardAllowed(
-  policy: AgentPolicy | null | undefined,
-  kind: ChatCard['kind'],
-): boolean {
-  if (kind === 'resume_request') return isAgentActionAllowed(policy, 'send_resume')
-  if (kind === 'location_confirm') {
-    // 地点卡片既会回答城市，也可能推进面试地点协商；两项都必须允许。
-    return isAgentActionAllowed(policy, 'answer_city') &&
-      isAgentActionAllowed(policy, 'negotiate_interview')
-  }
-  return true
-}
-
-/**
- * 兼容后端策略演进期的三个字段：contact_exchange / send_contact / contact，
- * 以及 actions[] 中的同名动作。字段不存在时返回 null，交给本地策略判定。
- */
-function extractContactDecision(
-  res: SyncChatResponse,
-  actionPlan: ChatActionPlan = normalizeChatActionPlan(res),
-): ContactDecision | null {
-  const planned = actionPlan.contactAction
-  if (planned) {
-    return {
-      provided: true,
-      allowed: planned.allowed,
-      channel: planned.channels?.length === 1 ? planned.channels[0] : null,
-      channels: planned.channels,
-      actionId: planned.actionId,
-      idempotencyKey: planned.idempotencyKey,
-    }
-  }
-  const record = (value: unknown): Record<string, unknown> | null =>
-    value && typeof value === 'object' ? value as Record<string, unknown> : null
-  const candidates: unknown[] = [res.contact_exchange, res.send_contact, res.contact]
-  if (Array.isArray(res.actions)) {
-    const action = res.actions.find((item) => {
-      const type = String(item.type || item.action_type || '').toLowerCase()
-      return type === 'contact_exchange' || type === 'send_contact' || type === 'exchange_contact'
-    })
-    if (action) candidates.push(action.payload || action)
-  }
-  const raw = candidates.find((value) => value !== undefined && value !== null)
-  if (raw === undefined) return null
-  if (typeof raw === 'boolean') {
-    return { provided: true, allowed: raw, channel: null, actionId: null }
-  }
-  const obj = record(raw)
-  if (!obj) return { provided: true, allowed: null, channel: null, actionId: null }
-  const mode = String(obj.action || obj.decision || '').toLowerCase()
-  const explicit = typeof obj.allowed === 'boolean'
-    ? obj.allowed
-    : typeof obj.allow === 'boolean'
-      ? obj.allow
-      : mode === 'allow'
-        ? true
-        : false
-  const idRaw = obj.contact_action_id ?? obj.contactActionId ?? obj.action_id ?? obj.actionId
-  const actionId = typeof idRaw === 'number' && Number.isFinite(idRaw) ? idRaw : null
-  const channels = Array.isArray(obj.channels)
-    ? Array.from(new Set(obj.channels.map(normalizeContactChannel).filter((v): v is ContactChannel => !!v)))
-    : undefined
-  return {
-    provided: true,
-    allowed: explicit,
-    channel: normalizeContactChannel(obj.channel ?? obj.method ?? obj.type),
-    channels,
-    actionId,
-    idempotencyKey: typeof (obj.idempotency_key ?? obj.idempotencyKey) === 'string'
-      ? String(obj.idempotency_key ?? obj.idempotencyKey)
-      : undefined,
-  }
-}
-
 function markCardHandled(card: ChatCard, handled = true): void {
   if (!card.element) return
   if (handled) card.element.setAttribute('data-aah-card-handled', '1')
@@ -1706,175 +1570,6 @@ export function lastDeliveryState(): DeliveryState {
  * 联系方式卡片按后端 Agent 策略或本地已配置渠道自动处理。没有明确策略时
  * 保持跳过；未知卡片仍然不自动点击。
  */
-async function handleCard(
-  card: ChatCard,
-  cfg: PluginConfig,
-  expectThread: string,
-  log: (m: string) => void,
-  contactDecision?: ContactDecision | null,
-  actionPlan: ChatActionPlan = normalizeChatActionPlan({}),
-): Promise<boolean> {
-  // 点按钮前同样校验会话身份，防止中途切换点错人
-  if (currentThreadId() !== expectThread) {
-    diag('CHAT', '已中止卡片操作：会话已切换')
-    return false
-  }
-
-  // A versioned backend plan is the authority for external side effects.  A
-  // fact such as an interview time or city is never enough to click a card;
-  // the corresponding action must be present and allowed.  Legacy responses
-  // return null and continue through the v0.6.8 local-policy fallback below.
-  const cardKind = card.kind === 'unknown' ? null : card.kind
-  const backendPermission = cardKind ? cardActionAllowed(actionPlan, cardKind) : null
-  const backendAction = cardKind ? actionForCard(actionPlan, cardKind) : null
-  if (backendPermission === false) {
-    log(`  ↳ ${card.kind} 未获后端动作授权 → 跳过`)
-    diag('CHAT', '跳过未获后端授权的卡片动作', { kind: card.kind })
-    return false
-  }
-
-  if (card.kind === 'contact_exchange') {
-    const channel = contactChannelFromQuestion(card.question)
-    // 后端给了动作时，以后端显式决策为准；没有动作才回落到本地策略。
-    if (contactDecision?.channel && channel && contactDecision.channel !== channel) {
-      log(`  ↳ HR 索要${channel}，后端动作渠道为${contactDecision.channel} → 按策略跳过`)
-      diag('CHAT', '跳过联系方式交换卡片（渠道不匹配）', {
-        channel,
-        backendChannel: contactDecision.channel,
-      })
-      return false
-    }
-    if (!channel) {
-      log('  ↳ HR 索要未识别联系方式 → 按策略跳过')
-      diag('CHAT', '跳过联系方式交换卡片（未知渠道）', {
-        backendDecision: contactDecision?.allowed ?? null,
-        questionLength: card.question.length,
-      })
-      return false
-    }
-    const allowed = isContactCardAllowed(contactDecision, channel, cfg.agentPolicy)
-    if (!allowed || !card.acceptBtn) {
-      log(`  ↳ HR 索要${channel || '联系方式'} → 按策略跳过`)
-      diag('CHAT', '跳过联系方式交换卡片', {
-        channel,
-        backendDecision: contactDecision?.allowed ?? null,
-        questionLength: card.question.length,
-      })
-      return false
-    }
-    // 先写本地幂等标记，再派发点击；页面异步更新期间再次扫描也不会重复交换。
-    markCardHandled(card)
-    log(`  ↳ HR 索要${channel || '联系方式'} → 点「同意」`)
-    realClick(card.acceptBtn)
-    await delay(1200, 2000)
-    diag('CHAT', '已同意交换联系方式', {
-      channel,
-      idempotencyKeyPresent: !!contactDecision?.idempotencyKey,
-    })
-    return true
-  }
-
-  // 认不出的卡片一律不点：盲点等于把未知授权交给对方
-  if (card.kind === 'unknown') {
-    log('  ⚠ 未识别的交互卡片 → 不自动处理，请手动查看')
-    diag('CHAT', '⚠ 跳过未识别卡片（未知类型不自动点击）', {
-      questionLength: card.question.length,
-    })
-    return false
-  }
-
-  if (card.kind === 'resume_request') {
-    if (!isActionCardAllowed(cfg.agentPolicy, card.kind)) {
-      log('  ↳ HR 索要附件简历 → 按 Agent 策略跳过')
-      diag('CHAT', '跳过简历卡片（策略未允许发送简历）')
-      return false
-    }
-    if (!card.acceptBtn) return false
-    markCardHandled(card)
-    log(`  ↳ HR 索要附件简历 → 点「同意」`)
-    // The card is also handled by BOSS's delegated Vue listener. The old
-    // bare click() could leave the follow-up resume picker unopened.
-    const sentBaseline = countResumeSentMarks()
-    realClick(card.acceptBtn)
-    await delay(1200, 2000)
-    diag('CHAT', '已同意发送附件简历')
-    // 同意后 BOSS 弹简历选择框（多简历时）：选默认简历并发送；
-    // 只有一份时直接发出，靠消息区新出现的「已发送给Boss」确认
-    const resumeCfg = loadConfig()
-    const targetName =
-      resumeCfg.defaultSendResumeId && resumeCfg.resumeNames
-        ? resumeCfg.resumeNames[String(resumeCfg.defaultSendResumeId)] || null
-        : null
-    const sent = await completeResumeSend(targetName, false, sentBaseline)
-    if (!sent) markCardHandled(card, false)
-    return sent
-  }
-
-  if (card.kind === 'location_confirm') {
-    if (!isActionCardAllowed(cfg.agentPolicy, card.kind)) {
-      log('  ↳ 工作地点确认 → 按 Agent 策略跳过')
-      diag('CHAT', '跳过地点卡片（策略未允许城市回答或面试协商）')
-      return false
-    }
-
-    // A modern plan may explicitly reject or accept the proposed location.
-    // Respect that decision after the local policy gate; do not infer a click
-    // from facts alone.  If no decision is supplied, retain the legacy city
-    // preference behavior below.
-    if (backendAction?.decision === 'reject') {
-      if (!card.rejectBtn) return false
-      markCardHandled(card)
-      log('  ↳ 后端事实/策略判定地点不接受 → 点「暂不考虑」')
-      realClick(card.rejectBtn)
-      await delay(1200, 2000)
-      return true
-    }
-    if (backendAction?.decision === 'allow') {
-      if (!card.acceptBtn) return false
-      markCardHandled(card)
-      log('  ↳ 后端事实/策略判定地点可接受 → 点「可以接受」')
-      realClick(card.acceptBtn)
-      await delay(1200, 2000)
-      return true
-    }
-
-    const prefCity = (cfg.prefCity || '').trim()
-    const offCity = !!prefCity && !card.question.includes(prefCity)
-
-    // 城市不符默认「接受并标记」而非拒绝：地点不该成为自动放弃机会的理由，
-    // 用户可能愿意考虑。只有在设置里显式开启 rejectOffCityLocation 才拒绝。
-    if (offCity && cfg.rejectOffCityLocation) {
-      if (!card.rejectBtn) return false
-      log('  ↳ 地点与期望城市不符，按设置拒绝')
-      card.rejectBtn.click()
-      await delay(1200, 2000)
-      diag('CHAT', '按设置拒绝工作地点', {
-        preferredCityConfigured: !!prefCity,
-        questionLength: card.question.length,
-      })
-      return true
-    }
-
-    if (!card.acceptBtn) return false
-    if (offCity) {
-      // 标记：接受了但地点与期望不一致，留痕供用户复核
-      log('  ↳ 工作地点确认 → 已接受（注意：与期望城市不一致）')
-      diag('CHAT', '⚠ 地点与期望城市不符但已接受（未开启严格模式）', {
-        preferredCityConfigured: !!prefCity,
-        questionLength: card.question.length,
-      })
-    } else {
-      log('  ↳ 工作地点确认 → 点「可以接受」')
-    }
-    markCardHandled(card)
-    realClick(card.acceptBtn)
-    await delay(1200, 2000)
-    return true
-  }
-
-  return false
-}
-
 /** 按钮禁用判定（unable/disabled/aria/pointer-events） */
 function isDialogButtonDisabled(el: HTMLElement): boolean {
   const cls = String(el.className || '').toLowerCase()
@@ -2726,9 +2421,9 @@ export async function sendResumeDetailed(
     const ok = await completeResumeSend(targetName || null, false, baseline, targetIndex ?? null)
     return { ok, reason: ok ? undefined : 'send_failed' }
   }
-  const cfg = loadConfig()
+  const cfg = targetName === null ? null : loadConfig()
   const configured =
-    cfg.defaultSendResumeId && cfg.resumeNames
+    cfg?.defaultSendResumeId && cfg.resumeNames
       ? cfg.resumeNames[String(cfg.defaultSendResumeId)] || null
       : null
   const ok = await completeResumeSend(configured, false, baseline)
@@ -2756,88 +2451,9 @@ export async function sendResume(
  * 结果重复发消息给 HR（不可撤回）。锁在这里而不只在 UI 隐藏按钮，
  * 是因为 UI 只能防误点，防不住状态竞争。
  */
-let chatRoundRunning = false
-
-/**
- * 停止标志。会话托管一轮要跑几十秒到几分钟，中途必须能停下来
- * ——否则用户看着它往下发消息却只能刷新页面（刷新会丢掉本轮判重记录）。
- * 只在会话之间与发送之前检查，不打断已经发出的单次动作。
- */
-let chatRoundAbort = false
-
-/** 请求停止当前轮会话托管（下一个检查点生效，不会打断正在发送的那一条） */
-export function requestStopChatRound(): void {
-  if (!chatRoundRunning) return
-  chatRoundAbort = true
-  diag('CHAT', '已收到停止请求，将在当前会话处理完后结束')
-}
-
-function shouldAbortChatRound(): boolean {
-  return chatRoundAbort
-}
-
-/**
- * 按「索引 + 身份文本」重新定位会话节点。
- *
- * 缓存的引用可能已因列表重建而失效（见调用处注释）。重新定位时优先用
- * 身份文本匹配而非纯索引：BOSS 会把有新消息的会话上浮，纯索引会张冠李戴，
- * 把 A 的回复发给 B。文本对不上就宁可跳过 —— 发错不可撤回。
- */
-function resolveThread(cached: ChatThread): ChatThread | null {
-  if (cached.el.isConnected) return cached
-
-  const idKey = (t: ChatThread) => `${t.company}|${t.jobTitle}`
-  const want = idKey(cached)
-  const byText = listThreadsQuiet().filter((t) => idKey(t) === want)
-
-  // 只认唯一命中。
-  //
-  // 不做「索引兜底」：targets 已按未读排序，下标与 DOM 顺序不再对应，
-  // 拿排序后的下标去索引实时列表必然错位 —— 把 A 的回复发给 B，不可撤回。
-  // 身份文本重复（同公司同岗位两个 HR）时也一样宁可跳过：无从分辨谁是谁。
-  if (byText.length === 1) return byText[0]
-
-  diag('CHAT', '会话节点重新定位失败', {
-    identityPresent: !!want,
-    sameTextCount: byText.length,
-  })
-  return null
-}
-
-export async function runChatRound(
-  cfg: PluginConfig,
-  maxThreads = 5,
-  log: (m: string) => void = () => {},
-  opts: {
-    mode?: 'full' | 'snapshot'
-    runId?: string
-    replyScope?: 'this_round' | 'all'
-  } = {},
-): Promise<{
-  handled: number
-  replied: number
-  resumes_sent?: number
-  pending?: number
-  synced?: number
-  cleaned?: number
-}> {
-  if (chatRoundRunning) {
-    log('已有会话托管在运行，本次跳过（防止重复发消息给 HR）')
-    diag('CHAT', '拒绝并发的会话托管请求')
-    return { handled: 0, replied: 0 }
-  }
-  chatRoundRunning = true
-  // 必须在这里复位而不是在 stop 里：上一轮若因 abort 结束，标志还是 true，
-  // 不复位则下一轮启动即刻自杀（表现为「点了开始，一条没处理就完成了」）。
-  chatRoundAbort = false
-  try {
-    return await runChatRoundInner(cfg, maxThreads, log, opts)
-  } finally {
-    chatRoundRunning = false
-    chatRoundAbort = false
-  }
-}
-
+export { requestStopChatRound } from './chat-runner'
+export const runChatRound = (cfg: PluginConfig, maxThreads = 5, log: (message: string) => void = () => {}, opts: ChatRoundOptions = {}) =>
+  runChatRoundWithDriver(installedChatDriver() || legacyChatDriver, cfg, maxThreads, log, opts)
 
 /** 找输入框附近的「发送」按钮（文本/aria/title/图标 class，可见才算） */
 function findSendButton(input: HTMLElement): HTMLElement | null {
@@ -3019,7 +2635,8 @@ export function threadUnreadFromSources(): {
   unreadThreads: number
   unreadMessages: number
 } | null {
-  const sources = readChatSources()
+  const driver = installedChatDriver()
+  const sources = driver ? driver.cachedSources?.() : readChatSources()
   if (!sources) return null
   let unreadThreads = 0
   let unreadMessages = 0
@@ -3053,217 +2670,6 @@ async function scrollToSourceIndex(vl: AnyVm, index: number): Promise<void> {
   }
 }
 
-/** 渲染目标行并点击切换，返回该行（失败返回 null）。 */
-async function openThreadByIndex(index: number): Promise<ChatThread | null> {
-  const vl = findVirtualListVm()
-  if (!vl) return null
-  await scrollToSourceIndex(vl, index)
-  const threads = listThreadsQuiet()
-  let hit = threads.find(
-    (t) => (t.el as AnyVm).__vue__?.$props?.index === index,
-  )
-  if (!hit) {
-    hit = threads.find(
-      (t) => (t.el as AnyVm).__vue__?.$parent?.$props?.index === index,
-    )
-  }
-  if (!hit) return null
-  try {
-    if (!switchThreadViaVue(hit.el)) realClick(hit.el)
-    await delay(250, 450)
-    return hit
-  } catch (e) {
-    diag('CHAT', `索引切换异常 idx=${index}`, { errorType: (e as Error).name || 'Error' })
-    return null
-  }
-}
-
-/** boss 数据源对象 → 行匹配信息（键候选：encryptJobId / 公司 / 岗位）。 */
-function bossRowInfo(boss: AnyVm): { encryptJobId: string; company: string; jobTitle: string } {
-  return {
-    encryptJobId: boss.encryptJobId || '',
-    company: boss.brandName || boss.company || '',
-    jobTitle: boss.positionName || boss.title || '',
-  }
-}
-
-const normText = (s: string) => (s || '').replace(/\s+/g, '').toLowerCase()
-
-/**
- * 计划目标是否存在于 BOSS 全量会话列表（virtual-list.dataSources）。
- *
- * 真实岗位按 encryptJobId 精确比对；inbound 会话（HR 主动打招呼建档）的
- * platform_job_id 是后端虚构的 `inbound:公司:岗位`，与 BOSS 真实 jobId 对不上，
- * 只能按公司名模糊判定存在性（与 chat-plan.findPlanTarget 同容忍度）。
- */
-function planTargetInSources(p: ChatPlanTarget, sources: ChatSourceItem[]): boolean {
-  const jobId = (p.encrypt_job_id || '').trim()
-  if (jobId && !jobId.startsWith('inbound:')) {
-    return sources.some((s) => String(s.boss.encryptJobId || '') === jobId)
-  }
-  const cc = normText(p.company || '')
-  if (!cc) return false
-  return sources.some((s) => {
-    const bc = normText(String(s.boss.brandName || s.boss.company || ''))
-    return !!bc && (bc.includes(cc) || cc.includes(bc))
-  })
-}
-
-/**
- * 滚动会话列表并回调新出现的会话（增量遍历）。
- *
- * BOSS 会话列表是虚拟列表：DOM 恒定只有约 40 个节点，向下滚时节点被复用、
- * 只换数据，「数量稳定」和底部占位符都不能当作到底判据。把「加载」和
- * 「遍历」合成一件事：每滚一屏处理当前窗口里没见过的会话（按身份键去重），
- * 处理完再滚；终止条件是「连续 N 屏没有新身份出现」。
- *
- * @param onThread 处理单个会话，返回 'stop' 可提前终止整轮滚动
- */
-async function forEachThreadScrolling(
-  log: (m: string) => void,
-  onThread: (t: ChatThread, seq: number) => Promise<'ok' | 'stop'>,
-): Promise<void> {
-  // 容器每屏重新定位：切换会话会让 BOSS 重建左侧列表，孤儿节点设
-  // scrollTop 不会有任何效果。
-  let container = findThreadScrollContainer()
-  if (!container) {
-    log('未找到会话列表滚动容器，仅处理当前已渲染的会话')
-    diag('CHAT', '滚动容器查找失败，退化为单屏处理')
-  } else {
-    diag('CHAT', '会话列表滚动容器', {
-      el: `${container.tagName.toLowerCase()}.${String(container.className || '').slice(0, 40)}`,
-      scrollH: container.scrollHeight,
-      clientH: container.clientHeight,
-      windowCount: allMatch(SEL.thread).length,
-    })
-  }
-
-  // 从列表顶部开始：scrollTop 可能被上一轮或用户操作留在中间，
-  // 不显式复位会导致第 0 屏从中段开始、后续又往回滚。
-  if (container) {
-    container.scrollTo({ top: 0 })
-    await delay(250, 400)
-  }
-
-  const seen = new Set<string>()
-  let seq = 0
-  // 连续 3 屏无新身份即认定到底：BOSS 偶发一屏内全是已处理会话
-  // （未读上浮导致顺序变动），单屏无新增不足以判定结束。
-  const EMPTY_SCREENS_TO_END = 3
-  let emptyScreens = 0
-  // 兜底上限，防止 BOSS 改版导致的死循环
-  const MAX_SCREENS = 300
-
-  for (let screen = 0; screen < MAX_SCREENS; screen++) {
-    if (shouldAbortChatRound()) {
-      diag('CHAT', '滚动遍历时收到停止指令')
-      return
-    }
-
-    // 当前窗口内的会话，未读优先（同屏内调顺序，不跨屏排序 —— 跨屏排序需要
-    // 先全量加载，而虚拟列表下那是做不到的）
-    const windowThreads = listThreadsQuiet()
-      .map((t, i) => ({ t, i }))
-      .sort((a, b) => Number(b.t.unread) - Number(a.t.unread) || a.i - b.i)
-      .map((x) => x.t)
-
-    let fresh = 0
-    let skippedThisScreen = 0
-    for (const t of windowThreads) {
-      const key = threadKey(t)
-      if (!key || key === '|') {
-        diag('CHAT', '跳过无效键的会话项', {
-          companyPresent: !!t.company,
-          jobTitlePresent: !!t.jobTitle,
-        })
-        continue // 身份不可辨的项跳过，避免污染去重集
-      }
-      if (seen.has(key)) {
-        // 已处理会话只计数不逐条打日志：数百个会话的逐条日志会挤掉
-        // 发送失败等更关键的诊断行（历史问题：日志被刷掉看不全）。
-        skippedThisScreen++
-        continue
-      }
-
-      diag('CHAT', `准备处理新会话 #${seq + 1}`, {
-        keyKind: key.startsWith('boss:') ? 'native' : 'fallback',
-        seenSize: seen.size,
-        screen,
-      })
-      seen.add(key)
-      fresh++
-      seq++
-
-      // 处理前重新确认节点仍在文档里：同屏内处理上一条会话
-      // （切换会话）就可能让 BOSS 重建列表
-      const live = t.el.isConnected ? t : resolveThread(t)
-      if (!live) {
-        diag('CHAT', '会话节点在处理前已失效', {
-          keyKind: key.startsWith('boss:') ? 'native' : 'fallback',
-        })
-        continue
-      }
-
-      const r = await onThread(live, seq)
-      if (r === 'stop') return
-      if (shouldAbortChatRound()) return
-    }
-
-    if (fresh > 0) {
-      emptyScreens = 0
-      log(`已处理 ${seen.size} 个会话，继续下翻...`)
-    } else {
-      emptyScreens++
-      if (emptyScreens >= EMPTY_SCREENS_TO_END) {
-        diag('CHAT', `会话列表遍历结束：连续 ${EMPTY_SCREENS_TO_END} 屏无新会话`, {
-          total: seen.size,
-          screens: screen + 1,
-        })
-        log(`会话列表已遍历完毕（共 ${seen.size} 个）`)
-        return
-      }
-    }
-    if (skippedThisScreen > 0) {
-      diag('CHAT', `本屏跳过已处理会话 ${skippedThisScreen} 个（共已见 ${seen.size}）`)
-    }
-
-    // 容器可能已被重建（处理会话时切换过），重新定位后再滚
-    if (!container?.isConnected) container = findThreadScrollContainer()
-    if (!container) {
-      diag('CHAT', '滚动容器已失效且无法重新定位，结束遍历', { total: seen.size })
-      return
-    }
-
-    // 目标位置按「已滚过的屏数」算而非「当前 scrollTop + 一屏」：
-    // 切换会话后 BOSS 可能把列表 scrollTop 复位为 0，按当前值递增会
-    // 从头再滚一遍，误判遍历完毕。
-    const step = Math.max(1, Math.floor(container.clientHeight * 0.8)) // 留 20% 重叠防漏
-    const target = step * (screen + 1)
-    const maxScroll = container.scrollHeight - container.clientHeight
-    if (target > maxScroll + step) {
-      // 已经越过底部：不再有新内容可加载，交给 emptyScreens 收尾
-      emptyScreens++
-      if (emptyScreens >= EMPTY_SCREENS_TO_END) {
-        diag('CHAT', '已滚过列表底部且无新会话，遍历结束', { total: seen.size, maxScroll })
-        log(`会话列表已遍历完毕（共 ${seen.size} 个）`)
-        return
-      }
-    }
-    container.scrollTo({ top: Math.min(target, maxScroll) })
-    await delay(350, 550) // 等虚拟列表渲染新窗口
-  }
-
-  diag('CHAT', `滚动屏数达上限 ${MAX_SCREENS}，已处理 ${seen.size} 个会话`)
-  log(`⚠ 会话过多（已处理 ${seen.size} 个），剩余下轮继续`)
-}
-
-/**
- * 找会话列表的滚动容器。
- *
- * 按「实际可滚动」判定（scrollHeight 明显大于 clientHeight）：
- * BOSS 的滚动容器可能用 overlay，也可能滚动发生在更外层的祖先上，
- * 只认 overflowY 样式会找不到。
- */
 function findThreadScrollContainer(): HTMLElement | null {
   const first = firstMatch(SEL.thread)
   if (!first) return null
@@ -3306,11 +2712,6 @@ async function deleteCurrentThread(): Promise<boolean> {
 // ---------- 用户活跃检测：自动删除不打扰正在手动操作的用户 ----------
 let lastUserActivityAt = 0
 let userActivityTracked = false
-
-// ---------- 对账节流：collectThreadSnapshot 会滚动整份会话列表（最多 80 屏 × 500ms），
-// 每轮都对账会拖慢轮询。5 分钟节流一次，既修复 DB 记账失真，又不每轮全量滚动。 ----------
-const RECONCILE_INTERVAL_MS = 5 * 60_000
-let lastReconcileAt = 0
 
 function trackUserActivity(e: Event): void {
   // 只认浏览器派发的真实用户事件。
@@ -3367,574 +2768,162 @@ export function readRowLastTS(li: HTMLElement): number | null {
   return null
 }
 
-/**
- * 执行后端下发的清理目标。
- *
- * 职责边界（2026-08-14 解耦）：**业务判断全部在后端**，本函数只做两件
- * 后端无法做的执行前校验 ——
- *
- *   1. 数据新鲜度：后端的判断基于 DB（插件上一轮同步的快照）。从下发计划
- *      到此刻执行之间，HR 可能又发了新消息，后端无从得知。这里比对列表行
- *      的真实时间戳与 target.last_message_at：行时间更新则说明快照已过时，
- *      本轮跳过，等下一轮后端拿到新消息重新决策。
- *   2. 用户活跃：用户正在手动操作时不抢他正在看的会话。
- *
- * 这两条都不含业务语义（不判断 HR 说了什么、该不该删）。
- *
- * 此前这里有一道「最后一条必须是我方」的校验 —— 那是业务判断，放在插件端
- * 会推翻后端结论：HR 说完「好的，我这边先筛选一下」就没下文时最后一条是 HR，
- * 于是这类会话永远删不掉（实测 285 个会话 279 个卡在该规则，后端明明已判
- * status=ended 并下发 cleanup）。它已被上面的新鲜度校验取代 —— 后者能覆盖
- * 原本要防的「HR 刚回了新消息」，且不会误伤 HR 收尾的会话。
- */
-async function maybeCleanupThread(
-  cfg: PluginConfig,
-  t: ChatThread,
-  log: (m: string) => void,
-  dbLastMessageAt: number | null,
-  opened = false,
-  planJobId = '',
-  reason = 'aged_no_reply',
-): Promise<number> {
-  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
-    diag('CHAT', '清理跳过：用户正在手动操作')
-    log('  ↳ 检测到用户正在操作，本轮不删除目标会话')
-    return 0
-  }
 
-  // 数据新鲜度校验：行时间戳晚于后端决策依据 → DB 快照已过时，本轮不删。
-  // 容差 60s：BOSS 行时间与 DB 落库时间本身有秒级偏差，不算「新消息」。
-  const rowTs = readRowLastTS(t.el)
-  if (rowTs && dbLastMessageAt) {
-    const driftMs = rowTs - dbLastMessageAt * 1000
-    if (driftMs > 60_000) {
-      diag('CHAT', `清理跳过：列表行有更新的消息（后端快照已过时）`, {
-        driftSeconds: Math.round(driftMs / 1000),
-      })
-      log('  ↳ 目标会话有新消息，本轮不删除（等后端重新判定）')
-      return 0
-    }
-  }
-
-  if (!opened) {
-    // 切「本行」而非按公司名文本匹配：文本匹配可能打开同公司的另一条会话
-    let ok = false
-    try {
-      if (!switchThreadViaVue(t.el)) realClick(t.el)
-      ok = true
-    } catch (e) {
-      diag('CHAT', '清理打开会话异常', { errorType: (e as Error).name || 'Error' })
-    }
-    await delay(250, 450)
-    if (!ok) return 0
-  }
-  // 删除前仅保留不可逆还原的统计摘要；原始消息只走受控业务接口。
-  logChatHistory(t, await readMessages())
-  diag('CHAT', '清理会话', { reasonLength: reason.length })
-  log('  ↳ 删除目标会话（后端策略）')
-  if (await deleteCurrentThread()) {
-    await afterConversationDeleted(t.company, t.jobTitle, reason, {
-      encryptJobId: planJobId,
-    })
-    return 1
-  }
-  return 0
-}
-
-// processFollowUpThread 已删除（2026-08-14）：主动跟进整体移除。
-// HR 已读不回本身就是答案，追问「岗位还在招吗」拿不到信息且构成骚扰；
-// 后端不再下发 follow_up 目标，此函数无调用方。
-
-/** 策略删除当前已打开的会话：用户活跃守卫 + 删除 + 后端对账 + 面板刷新。
- *
- * 守卫窗口取 cfg.cleanupGuardSeconds（默认 3s），与 maybeCleanupThread /
- * processFollowUpThread 一致。此前这里漏传参数、退化成默认 10s，
- * 是删除被过度拦截的次要原因（主因见 trackUserActivity 的合成事件过滤）。
- */
-async function strategyDeleteCurrent(
-  cfg: PluginConfig,
-  company: string,
-  jobTitle: string,
-  reason: string,
-  log: (m: string) => void,
-): Promise<boolean> {
-  if (userRecentlyActive((cfg.cleanupGuardSeconds ?? 3) * 1000)) {
-    diag('CHAT', '策略删除跳过：用户正在手动操作')
-    log('  ↳ 检测到用户正在操作，本轮不删除目标会话')
-    return false
-  }
-  if (!(await deleteCurrentThread())) {
-    log('  ↳ 会话删除未确认（BOSS 端可能已无此会话）')
-    return false
-  }
-  await afterConversationDeleted(company, jobTitle, reason)
-  return true
-}
-
-/**
- * 回复流程：打开目标会话 → 读消息 → 记录对话历史 → 后端 sync 判定并生成回复 → 发送。
- * 只被「计划命中 reply / 行未读」的会话调用；其余会话一律跳过（不打开、不等待）。
- */
-async function processReplyThread(
-  cfg: PluginConfig,
-  t: ChatThread,
-  seq: number,
-  log: (m: string) => void,
-  opts: { runId?: string },
-  replyScope: 'this_round' | 'all',
-): Promise<{ synced: number; replied: number; resumesSent: number; cleaned: number }> {
-  const opened = await openThread(t.company, t.jobTitle)
-  await delay(250, 450)
-  if (opened !== 'ok') {
-    diag('CHAT', `跳过会话：无法打开（${opened}）`)
-    return { synced: 0, replied: 0, resumesSent: 0, cleaned: 0 }
-  }
-  return processOpenedThread(cfg, t, seq, log, opts, replyScope)
-}
-
-/** 会话已打开后的完整回复流程（滚动方案与零滚动方案共用，避免重复 open）。 */
-async function processOpenedThread(
-  cfg: PluginConfig,
-  t: ChatThread,
-  seq: number,
-  log: (m: string) => void,
-  opts: { runId?: string },
-  replyScope: 'this_round' | 'all',
-): Promise<{ synced: number; replied: number; resumesSent: number; cleaned: number }> {
-  // 目标会话指纹：必须在切换完成后捕获，作为发送前「仍是同一会话」的校验基准。
-  // 历史 bug：在 openThread 之前捕获，expectThread 恒为上一会话，切到目标后
-  // 必然失配 → 所有回复「未发送（会话已切换或发送失败）」（2026-08-05 现场）。
-  const threadId = currentThreadId()
-
-  // 读取消息：不只依赖未读标记 —— 已读未回（最后一条是 HR）同样需要回复。
-  // 只以「最后一条消息是否为 HR」判定，避免漏掉用户手动读过的消息。
-  const messages = await readMessages()
-  // 普通日志只记录统计摘要，禁止写入会话正文。
-  logChatHistory(t, messages)
-  const last = messages[messages.length - 1]
-  const needsReply = !!last && last.sender === 'hr'
-  const hrCount = messages.filter((m) => m.sender === 'hr').length
-  diag(
-    'CHAT',
-    `消息读取 mid=${seq}：${messages.length} 条（HR ${hrCount} / 我方 ${messages.length - hrCount}）` +
-      ` needsReply=${needsReply}`,
-  )
-
-  if (!needsReply) {
-    return { synced: 0, replied: 0, resumesSent: 0, cleaned: 0 }
-  }
-
-  // 读取会话信息
+const identityText = (value: string) => value.replace(/\s+/g, '').toLowerCase()
+function documentCurrent(): ChatCurrent {
   const info = currentThreadInfo()
-  const { company, jobTitle, salary, city } = info
-  diag('CHAT', '会话归属信息已读取', {
-    companyPresent: !!company,
-    jobTitlePresent: !!jobTitle,
-    salaryPresent: !!salary,
-    cityPresent: !!city,
-  })
-
-  // 单条同步后端（完整版 sync_chat：去重/已回复判定/评分/建档）
-  const res = await syncChatOne(cfg, {
-    platform: 'zhipin',
-    platform_job_id: '',
-    company,
-    job_title: jobTitle,
-    // 系统通知（对方已查看简历/撤回消息等）不进后端：不是对话内容，
-    // 混进去会污染意图分类与「最后一条 HR 消息」判定。
-    messages: messages
-      .filter((m) => m.sender !== 'system')
-      .map((m) => ({
-        sender: m.sender === 'hr' ? 'hr' : 'me',
-        content: m.content,
-        timestamp: '',
-      })),
-    auto_reply: true,
-    // 透传用户设置的最低回复匹配分；0 或未设置时后端不过滤
-    min_reply_score: cfg.minReplyScore || 0,
-    salary: salary || '',
-    city: city || '',
-    run_id: opts.runId || '',
-    reply_scope: replyScope,
-  })
-  if (!res) {
-    log('  后端处理失败，跳过当前会话')
-    return { synced: 0, replied: 0, resumesSent: 0, cleaned: 0 }
+  const identity = [info.company, info.hrName, info.jobTitle].map(identityText)
+  return { info, threadId: identity.every(Boolean) ? `chat:${JSON.stringify(identity)}` : '' }
+}
+function rowTarget(row: ChatThread): ChatThreadTarget {
+  const info = readRowJobInfo(row.el)
+  const company = info.brandName || row.company
+  const name = info.hrName || row.name
+  const jobTitle = info.title || row.jobTitle
+  return { key: row.bossId ? `boss:${row.bossId}:${info.jobId}` : `text:${[company, jobTitle, name].map(identityText).join('|')}`,
+    name, company, jobTitle, unread: row.unread, bossId: row.bossId, jobId: info.jobId, lastTS: readRowLastTS(row.el) }
+}
+function sourceKey(boss: AnyVm): string {
+  const id = String(boss.uniqueId || boss.friendId || '')
+  return id ? `source:${id}:${String(boss.encryptJobId || '')}` :
+    `source-text:${[boss.brandName || boss.company || '', boss.positionName || boss.title || '', boss.name || boss.bossName || ''].map((value) => identityText(String(value))).join('|')}`
+}
+function sourceItems(): DriverSourceItem[] | null {
+  const items = readChatSources()
+  if (!items) return null
+  return items.map(({ boss, index }) => ({ index, key: sourceKey(boss), boss: {
+    uniqueId: String(boss.uniqueId || ''), friendId: String(boss.friendId || ''), encryptJobId: String(boss.encryptJobId || ''),
+    brandName: String(boss.brandName || boss.company || ''), positionName: String(boss.positionName || boss.title || ''),
+    name: String(boss.name || boss.bossName || ''), unreadCount: Number(boss.unreadCount || 0),
+  } }))
+}
+function rowMatchesTarget(row: ChatThread, target: ChatThreadTarget): boolean {
+  const actual = rowTarget(row)
+  if (target.jobId && actual.jobId !== target.jobId) return false
+  if (target.company && identityText(actual.company) !== identityText(target.company)) return false
+  if (target.jobTitle && identityText(actual.jobTitle) !== identityText(target.jobTitle)) return false
+  if (target.name && identityText(actual.name) !== identityText(target.name)) return false
+  if (!target.sourceId && target.bossId && actual.bossId !== target.bossId) return false
+  return !!(target.company && target.jobTitle && (target.name || target.bossId))
+}
+async function resolveDriverTarget(target: ChatThreadTarget): Promise<ChatThread | null> {
+  assertChatExecutionActive()
+  if (target.sourceId) {
+    const sources = readChatSources()
+    const matches = sources?.filter(item => sourceKey(item.boss) === target.sourceId) || []
+    if (matches.length !== 1) return null
+    const row = await locateRowByIndex(matches[0].index)
+    // Index can shift while BOSS renders. Re-read both the source and row identity before activation.
+    const live = readChatSources()?.find(item => item.index === matches[0].index)
+    return row && live && sourceKey(live.boss) === target.sourceId && rowMatchesTarget(row, target) ? row : null
   }
-
-  const actionPlan = normalizeChatActionPlan(res)
-  diag('CHAT', '后端返回会话处理计划', {
-    intent: res.intent,
-    newMessages: res.new_messages,
-    hasReply: !!actionPlan.replyText,
-    contactAction: !!actionPlan.contactAction,
-    actionTypes: actionPlan.actions.map((item) => item.type),
-    factKeys: Object.keys(actionPlan.facts),
-    messagePresent: !!res.message,
-  })
-
-  // 结果回填（Phase 1）：意图明确时把 HR 侧动作回传后端（面试邀约 / 被拒），
-  // 供行为学习与推荐融合使用；失败静默，不影响主流程。
-  if (res.intent === 'interview_invite' || res.intent === 'rejection') {
-    await reportChatOutcome(cfg, {
-      run_id: opts.runId || '',
-      items: [{
-        encrypt_job_id: '',
-        company: company || t.company,
-        job_title: jobTitle || t.jobTitle,
-        outcome: res.intent === 'interview_invite' ? 'interview_invite' : 'rejected',
-        detail: res.intent,
-      }],
-    })
-  }
-
-  let replied = 0
-  let resumesSent = 0
-  let cleaned = 0
-
-  // 联系方式卡片不依赖文本回复：后端给出 contact action 时按其决策执行，
-  // 没有该字段则按本地 agentPolicy 的已配置渠道执行。先于「无回复」分支处理，
-  // 否则 HR 只索要联系方式时会被提前 return 遗漏。
-  const contactDecision = extractContactDecision(res, actionPlan)
-  let contactSucceeded = false
-  for (const card of findPendingCards().filter((c) => c.kind === 'contact_exchange')) {
-    const contactOk = await handleCard(card, cfg, threadId, log, contactDecision, actionPlan)
-    if (contactOk) contactSucceeded = true
-  }
-
-  const actionId = selectChatActionId(actionPlan.replyActionId, contactDecision?.actionId)
-
-  if (!actionPlan.replyText) {
-    log('  当前会话无需回复')
-    // 策略删除：低质量公司不回复删除 / 拒绝原因已采集删除（delete_after_send 且无回复）
-    if (res.delete_after_send) {
-      log('  ↳ 策略删除当前会话')
-      if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'low_quality', log)) cleaned++
+  const matches = listThreadsQuiet().filter(row => rowMatchesTarget(row, target))
+  return matches.length === 1 ? matches[0] : null
+}
+async function pageOpen(target: ChatThreadTarget): Promise<ChatCurrent | null> {
+  const row = await resolveDriverTarget(target)
+  if (!row || await confirmThreadRow(row) !== 'ok') return null
+  return documentCurrent()
+}
+async function pageCards(expectedThread: string): Promise<ChatCardTarget[]> {
+  if (!expectedThread || documentCurrent().threadId !== expectedThread) return []
+  return Promise.all(findPendingCards().map(async (card) => ({
+    key: await chatActionKey(expectedThread, card.kind, card.question), kind: card.kind,
+    question: card.question, canAccept: !!card.acceptBtn, canReject: !!card.rejectBtn,
+  })))
+}
+async function pageCard(action: ChatCardAction): Promise<boolean> {
+  return withinThread(action.expectedThread, async () => {
+    const cards = findPendingCards()
+    const entries = await Promise.all(cards.map(async (card) => ({ card,
+      key: await chatActionKey(action.expectedThread, card.kind, card.question) })))
+    const match = entries.filter(entry => entry.key === action.card.key && entry.card.kind === action.card.kind)
+    if (match.length !== 1 || action.card.kind === 'unknown') return false
+    const card = match[0].card
+    const button = action.accept ? card.acceptBtn : card.rejectBtn
+    if (!button) return false
+    assertChatExecutionActive()
+    const baseline = card.kind === 'resume_request' && action.accept ? countResumeSentMarks() : 0
+    markCardHandled(card)
+    realClick(button)
+    await delay(1200, 2000)
+    if (card.kind !== 'resume_request' || !action.accept) return true
+    const sent = await completeResumeSend(action.resumeName, false, baseline)
+    if (!sent) markCardHandled(card, false)
+    return sent
+  }, false)
+}
+async function pageDelete(action: ChatDeleteAction): Promise<boolean> {
+  return withinThread(action.expectedThread, async () => {
+    if (userRecentlyActive(action.guardMs)) return false
+    if (action.target) {
+      const row = await resolveDriverTarget(action.target)
+      if (!row) return false
+      const actual = rowTarget(row)
+      const identity = [actual.company, actual.name, actual.jobTitle].map(identityText)
+      if (identity.some(value => !value) || `chat:${JSON.stringify(identity)}` !== action.expectedThread) return false
+      const rowTs = readRowLastTS(row.el)
+      if (rowTs && action.dbLastMessageAt && rowTs - action.dbLastMessageAt * 1000 > 60_000) return false
     }
-    if (shouldReportContactOnly(false, contactSucceeded) && actionId !== null) {
-      await markChatSent(cfg, actionId, true, '')
-    }
-    return { synced: 1, replied: 0, resumesSent: 0, cleaned }
-  }
-
-  // 简历卡优先处理（2026-08-11 实测修复）：
-  // BOSS 索要简历用「同意/拒绝」卡片。若先发文字，卡片下方出现我方消息，
-  // isCardAnswered 会把卡片误判为「已答过」而跳过 → 简历永远发不出去。
-  // 因此先点卡片发简历，再发文字回复。
-  let resumeCardHandled = false
-  const resumePolicyAllowed = isActionCardAllowed(cfg.agentPolicy, 'resume_request') &&
-    cardActionAllowed(actionPlan, 'resume_request') !== false
-  if (actionPlan.sendResume && resumePolicyAllowed) {
-    const resumeCard = findPendingCards().find((c) => c.kind === 'resume_request')
-    if (resumeCard) {
-      resumeCardHandled = await handleCard(resumeCard, cfg, threadId, log, null, actionPlan)
-    }
-  } else if (actionPlan.sendResume && !resumePolicyAllowed) {
-    log('  ↳ 后端建议发送简历，但当前 Agent 策略未允许，跳过简历副作用')
-  }
-
-  // 发送回复（当前会话已打开，直接发，无需重开）
-  log(`  准备发送回复（长度 ${actionPlan.replyText.length}）`)
-  const ok = await sendText(actionPlan.replyText, threadId)
-  if (ok) {
-    replied++
-    if (actionPlan.sendResume) {
-      // 卡片路径已发简历则跳过；否则退回输入区「发简历」按钮路径
-      let resumeOk = resumePolicyAllowed && resumeCardHandled
-      if (resumePolicyAllowed && !resumeOk) resumeOk = await sendResume()
-      if (!resumeOk) log('  ↳ 简历未发出，需手动处理')
-      else resumesSent++
-      // 简历未发出时不得标记 sent：否则后端统计会把「文本已发、简历没发」
-      // 的动作也计成已发简历（历史计数虚高根因之一）。
-      if (actionId !== null) {
-        await markChatSent(cfg, actionId, resumeOk, resumeOk ? '' : '简历未发出')
-      }
-    } else if (actionId !== null) {
-      await markChatSent(cfg, actionId, true, '')
-    }
-    // 明确被拒：后端已换成「拿信息」话术；会话保留等原因（不再发完即删），
-    // 原因到达后由 rejection_reason 分支采集并删除；HR 一直不回由超时清理兜底。
-    if (res.delete_after_send) {
-      log('  策略删除当前会话')
-      if (await strategyDeleteCurrent(cfg, company || t.company, jobTitle, 'rejection', log)) cleaned++
-    }
-  } else {
-    log('  当前会话未发送（会话已切换或发送失败）')
-    if (actionId !== null) {
-      await markChatSent(cfg, actionId, false, '页面发送未确认')
-    }
-  }
-
-  // 处理当前会话的交互卡片（重新检测，避免跨轮引用失效）。
-  // 简历卡已在上方优先处理，这里只处理其余卡片；联系方式卡片由后端动作/策略分支处理。
-  for (const card of findPendingCards()) {
-    if (card.kind === 'resume_request' || card.kind === 'contact_exchange') continue
-    await handleCard(card, cfg, threadId, log, null, actionPlan)
-  }
-
-  await delay(800, 1600) // 会话间间隔
-  return { synced: 1, replied, resumesSent, cleaned }
+    assertChatExecutionActive()
+    return deleteCurrentThread()
+  }, false)
 }
 
-
-async function runChatRoundInner(
-  cfg: PluginConfig,
-  maxThreads: number,
-  log: (m: string) => void,
-  opts: {
-    mode?: 'full' | 'snapshot'
-    runId?: string
-    replyScope?: 'this_round' | 'all'
+/** Only DTOs cross the extension bridge. No backend policy, credentials, API or ledger call is accepted here. */
+export const chatPageOperations: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+  'chat.snapshot': async () => (await collectThreadSnapshot()).map(({ key, company, jobTitle, unread, lastTS, lastMsgPreview }) =>
+    ({ key, company, jobTitle, unread, lastTS, lastMsgPreview })),
+  'chat.sources': async () => sourceItems(),
+  'chat.window': async ({ screen }) => {
+    const container = findThreadScrollContainer()
+    let atEnd = !container
+    if (container && typeof screen === 'number') {
+      const step = Math.max(1, Math.floor(container.clientHeight * 0.8))
+      const target = Math.max(0, Math.floor(screen)) * step
+      const max = Math.max(0, container.scrollHeight - container.clientHeight)
+      atEnd = target > max + step
+      container.scrollTo({ top: Math.min(target, max) })
+      await delay(screen === 0 ? 250 : 350, screen === 0 ? 400 : 550)
+    }
+    return { threads: listThreadsQuiet().map(rowTarget), scrollable: !!container, atEnd }
   },
-): Promise<{
-  handled: number
-  replied: number
-  resumes_sent?: number
-  pending?: number
-  synced?: number
-  cleaned?: number
-}> {
-  let handled = 0
-  let replied = 0
-  let resumesSent = 0
-  let cleaned = 0
-  let skipped = 0
-  const mode = opts.mode || 'full'
-
-  // 回复范围：只有编排器运行时才有「本轮」概念（runId 存在）；手动开启会话托管
-  // 没有本轮，一律按 all 处理，否则后端 this_round 缺 run_id 会全部拒回。
-  const replyScope: 'this_round' | 'all' = opts.runId
-    ? (opts.replyScope || cfg.replyScope || 'this_round')
-    : 'all'
-
-  log(
-    mode === 'snapshot'
-      ? `开始消息快照（后端决策待回复数，不发送）。运行中请勿手动点击会话列表。`
-      : `开始处理会话（后端计划 + 未读行兜底）。运行中请勿手动点击会话列表。`,
-  )
-  diag('CHAT', `本轮开始 ${mode}，replyScope=${replyScope} 预算 ${maxThreads}`)
-
-  // 0) 对账：采集当前实际列表，上报后端对账并拿到该删除的 key。
-  //    采集会滚动整份列表（慢），按 RECONCILE_INTERVAL_MS 节流，避免每轮全量滚动。
-  let keysToDelete: string[] = []
-  const now = Date.now()
-  if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
-    try {
-      const snapshot = await collectThreadSnapshot()
-      if (snapshot.length > 0) {
-        const reconcilePayload = snapshot.map((s) => ({
-          key: s.key,
-          company: s.company,
-          job_title: s.jobTitle,
-          unread: s.unread,
-          last_ts: s.lastTS,
-          last_msg_preview: s.lastMsgPreview,
-        }))
-        const reconcileResult = await reconcileThreads(cfg, { threads: reconcilePayload })
-        keysToDelete = reconcileResult.to_delete
-        diag('CHAT', `对账完成：to_delete=${keysToDelete.length} created=${reconcileResult.created} marked_deleted=${reconcileResult.marked_deleted}`)
-      }
-    } catch (e) {
-      diag('CHAT', '对账失败，继续执行', { errorType: (e as Error).name || 'Error' })
-    }
-    lastReconcileAt = Date.now()
-  }
-
-  // 1) 拿后端计划：哪些会话要回复 / 要清理。失败时降级为只处理未读行，
-  //    绝不回退到「逐个打开全部会话」（2026-08-06 卡聊天页 14 分钟的根因）。
-  const { pending: planPending, targets: planTargets } = await loadChatPlan(cfg, { replyScope })
-  // 补发上次网络失败遗留的「BOSS 端已删除」标记（自愈，避免死会话跨轮残留）
-  await flushConversationDeletedMarks(cfg)
-  let planReply = 0
-  let planCleanup = 0
-  for (const t of planTargets) {
-    if (t.action === 'reply') planReply++
-    else if (t.action === 'cleanup') planCleanup++
-  }
-  diag('CHAT', `后端计划 pending=${planPending} reply=${planReply} cleanup=${planCleanup}`)
-
-  if (mode === 'snapshot') {
-    // 快照不再滚动整个列表数未读：待回复数以后端 DB 决策为准（DOM 未读兜底
-    // 由 chat_snapshot_done 事件取 max 时补上）。需要 DOM 结构时用「开始调试」按钮。
-    log(`消息快照完成：待回复 ${planPending} 个（后端决策）`)
-    diag('CHAT', `消息快照完成 pending=${planPending}`)
-    return { handled: 0, replied: 0, pending: planPending }
-  }
-
-  log(`开始单遍处理会话（后端计划 reply=${planReply} cleanup=${planCleanup}，回复预算 ${maxThreads}）...`)
-  let synced = 0
-  let storeMode = false
-
-  // 2a) 零滚动快路径（方案 C）：virtual-list.dataSources 一次拿到全部会话。
-  //     全量打开核对：以「前端实际读到的最后一条消息 + 意图」为准决定回不回，
-  //     不复用 DB 计划做打开过滤——DB 滞后会漏掉真实待回复（HR 在我方上次同步后
-  //     又发消息）；全量打开同时把「我方已发的回复」回写 DB，让数据库自我校准。
-  //     回复预算 maxThreads 只限制实际发送条数，不限制扫描。
-  const sources = readChatSources()
-  if (sources && sources.length > 0) {
-    storeMode = true
-    diag('CHAT', `零滚动数据源命中：${sources.length} 条（全量打开核对，前端实测为准）`)
-
-    // 全量列表在手：后端计划里有、BOSS 全量列表里完全没有的目标 → BOSS 端已删，
-    // 直接补标记（防止死会话残留 + 每轮重复寻找）。inbound 虚拟 jobId 用公司兜底。
-    const current0 = readChatSources()
-    if (current0) {
-      for (const p of planTargets) {
-        if (planTargetInSources(p, current0)) continue
-        diag('CHAT', '计划目标在 BOSS 全量列表中不存在，按已删除补标记', {
-          action: p.action,
-          hasNativeJobId: !!p.encrypt_job_id && !p.encrypt_job_id.startsWith('inbound:'),
-        })
-        await afterConversationDeleted(p.company, p.job_title, 'boss_side_deleted', {
-          encryptJobId: p.encrypt_job_id,
-        })
-        cleaned++
-      }
-    }
-
-    for (const item of sources) {
-      if (replied >= maxThreads) break   // 回复预算：限制实际发送条数
-      if (shouldAbortChatRound()) break
-      handled++
-      // 每次处理前按会话身份（friendId/uniqueId/encryptJobId）在最新列表里重新定位：
-      // 清理删除会让虚拟列表下标前移，缓存下标会点错会话（把回复发给错误的 HR）。
-      const current = readChatSources()
-      if (!current) break
-      const live = current.find(
-        (s) =>
-          s.boss.uniqueId === item.boss.uniqueId ||
-          s.boss.friendId === item.boss.friendId ||
-          s.boss.encryptJobId === item.boss.encryptJobId,
-      )
-      if (!live) continue // 已被删除/未加载
-      const boss = live.boss
-      const unread = Number(boss.unreadCount || 0) > 0
-      let target = findPlanTarget(planTargets, bossRowInfo(boss), { lenient: false })
-      if (!target) {
-        const loose = findPlanTarget(planTargets, bossRowInfo(boss), { lenient: true })
-        if (loose?.action === 'reply') target = loose
-      }
-      // 计划未命中且行无未读 → 跳过，且**不打开**会话。
-      //
-      // 修复（2026-08-14）：此前这个判断写在 openThreadByIndex 之后，
-      // 于是每轮把全部会话逐个打开、再跳过绝大多数（实测 handled=100
-      // / skipped=79，一轮几分钟且常中途结束）。判断只依赖列表数据源里的
-      // unreadCount 与后端计划，无需打开会话即可完成 —— 移到打开之前。
-      // HR 新消息会置未读、计划也覆盖已回复目标，跳过不会漏真实待回复。
-      if (!target && !unread) {
-        skipped++
-        continue
-      }
-      const t = await openThreadByIndex(live.index)
-      if (!t) {
-        diag('CHAT', `索引跳转失败 idx=${live.index}`)
-        continue
-      }
-      // 对账删除：优先级最高（reconcile 返回的是精确时间戳判定后的结果）
-      const key = chatTargetKey({ company: t.company, job_title: t.jobTitle, encrypt_job_id: boss.encryptJobId || '' })
-      if (keysToDelete.includes(key)) {
-        if (!cfg.cleanReadConversations) {
-          skipped++
-          continue
-        }
-        cleaned += await maybeCleanupThread(
-          cfg, t, log, target?.last_message_at ?? null, true, boss.encryptJobId || '',
-          'reconcile_timeout',
-        )
-        continue
-      }
-      // 后端计划清理（保留原有逻辑，reconcile 未覆盖的场景）
-      if (target?.action === 'cleanup' && !unread) {
-        if (!cfg.cleanReadConversations) {
-          skipped++
-          continue
-        }
-        cleaned += await maybeCleanupThread(
-          cfg, t, log, target.last_message_at, true, target.encrypt_job_id,
-          target.reason || 'aged_no_reply',
-        )
-        continue
-      }
-      const r = await processOpenedThread(cfg, t, handled, log, { runId: opts.runId }, replyScope)
-      synced += r.synced
-      replied += r.replied
-      resumesSent += r.resumesSent
-      cleaned += r.cleaned
-    }
-  }
-
-  // 2b) 滚动兜底：零滚动数据源不可用（组件改名/字段变动）时，单遍滚动照旧，
-  //     行 → 键 → 查计划，只打开目标行。
-  if (!storeMode) await forEachThreadScrolling(log, async (t, seq) => {
-    if (synced >= maxThreads) return 'stop'   // 预算用完，提前结束
-    if (shouldAbortChatRound()) return 'stop'
-    handled++
-
-    // 行 → 键：优先平台岗位 ID（行内 Vue 数据，无需打开），退化为 公司|岗位 文本
-    const row = readRowJobInfo(t.el)
-    // 先严格匹配（jobId 精确 / 公司+岗位都命中），再宽松匹配（仅公司，只对 reply 生效）
-    let target = findPlanTarget(planTargets, {
-      encryptJobId: row.jobId,
-      company: row.brandName || t.company,
-      jobTitle: row.title || t.jobTitle,
-    }, { lenient: false })
-    if (!target) {
-      const loose = findPlanTarget(planTargets, {
-        encryptJobId: row.jobId,
-        company: row.brandName || t.company,
-        jobTitle: row.title || t.jobTitle,
-      }, { lenient: true })
-      if (loose?.action === 'reply') target = loose
-    }
-
-    // 计划未命中且行无未读 → 跳过（既不打开也不等待）
-    if (!target && !t.unread) {
-      skipped++
-      return 'ok'
-    }
-
-    // 对账删除：优先级最高（reconcile 返回的是精确时间戳判定后的结果）
-    const key = chatTargetKey({
-      company: row.brandName || t.company,
-      job_title: row.title || t.jobTitle,
-      encrypt_job_id: row.jobId || '',
-    })
-    if (keysToDelete.includes(key)) {
-      if (!cfg.cleanReadConversations) {
-        skipped++
-        return 'ok'
-      }
-      cleaned += await maybeCleanupThread(
-        cfg, t, log, target?.last_message_at ?? null, false, row.jobId || '',
-        'reconcile_timeout',
-      )
-      return 'ok'
-    }
-
-    // 计划命中清理：行时间校验 + 打开确认最后一条是我方 → 删除（保留原有逻辑）
-    if (target?.action === 'cleanup' && !t.unread) {
-      if (!cfg.cleanReadConversations) {
-        skipped++
-        return 'ok'
-      }
-      cleaned += await maybeCleanupThread(
-        cfg, t, log, target.last_message_at, false, target.encrypt_job_id,
-        target.reason || 'aged_no_reply',
-      )
-      return 'ok'
-    }
-    // 计划命中 reply 或未读兜底 → 打开并走完整回复流程
-    const r = await processReplyThread(cfg, t, seq, log, { runId: opts.runId }, replyScope)
-    synced += r.synced
-    replied += r.replied
-    resumesSent += r.resumesSent
-    cleaned += r.cleaned
-    return 'ok'
-  })
-
-  log(`单遍处理完成${storeMode ? '（零滚动）' : ''}：扫描 ${handled} 个会话（跳过 ${skipped}），同步 ${synced}，发送 ${replied} 条回复，简历 ${resumesSent} 次，清理 ${cleaned}`)
-  diag('CHAT', `单遍处理完成 mode=${storeMode ? 'store' : 'scroll'} handled=${handled} skipped=${skipped} synced=${synced} replied=${replied} resumes_sent=${resumesSent} cleaned=${cleaned}`)
-
-  return { handled, replied, resumes_sent: resumesSent, synced, cleaned }
+  'chat.open': async ({ target }) => pageOpen(target as ChatThreadTarget),
+  'chat.current': async () => documentCurrent(),
+  'chat.messages': async ({ expectedThread }) => withinThread(String(expectedThread || ''), () => readMessages(), []),
+  'chat.cards': async ({ expectedThread }) => pageCards(String(expectedThread || '')),
+  'chat.card': async (args) => pageCard(args as unknown as ChatCardAction),
+  'chat.send': async ({ text: content, expectedThread }) => withinThread(String(expectedThread || ''), () => sendText(String(content || ''), currentThreadId()), false),
+  'chat.resume': async ({ resumeName: name, expectedThread }) => withinThread(String(expectedThread || ''), () => sendResume(typeof name === 'string' ? name : null), false),
+  'chat.delete': async (args) => pageDelete(args as unknown as ChatDeleteAction),
+}
+const localCall = <T>(operation: string, args: Record<string, unknown> = {}): Promise<T> => chatPageOperations[operation](args) as Promise<T>
+const legacyChatDriver: ChatDriver = {
+  onChatPage,
+  snapshot: () => localCall('chat.snapshot'), sources: () => localCall('chat.sources'),
+  window: (screen) => localCall('chat.window', { screen }), open: (target) => localCall('chat.open', { target }),
+  current: () => localCall('chat.current'), messages: (expectedThread) => localCall('chat.messages', { expectedThread }),
+  cards: (expectedThread) => localCall('chat.cards', { expectedThread }), card: (action) => localCall('chat.card', { ...action }),
+  send: (content, expectedThread) => localCall('chat.send', { text: content, expectedThread }),
+  resume: (name, expectedThread) => localCall('chat.resume', { resumeName: name, expectedThread }),
+  delete: (action) => localCall('chat.delete', { ...action }),
 }
 
+/** Async panel facades never expose a synthetic HTMLElement. */
+export async function listChatThreads(): Promise<ChatThreadTarget[]> {
+  const driver = installedChatDriver() || legacyChatDriver
+  return (await driver.window()).threads
+}
+export async function readChatCurrent(): Promise<ChatCurrent> {
+  return (installedChatDriver() || legacyChatDriver).current()
+}
+export async function openChatThread(company: string, jobTitle = ''): Promise<'ok' | 'not-found' | 'ambiguous' | 'thread_not_confirmed'> {
+  const driver = installedChatDriver() || legacyChatDriver
+  const targets = (await driver.window()).threads.filter(target => {
+    const companyMatches = identityText(target.company).includes(identityText(company))
+    return companyMatches && (!jobTitle || identityText(target.jobTitle).includes(identityText(jobTitle)))
+  })
+  if (!targets.length) return 'not-found'
+  if (targets.length !== 1) return 'ambiguous'
+  return await driver.open(targets[0]) ? 'ok' : 'thread_not_confirmed'
+}
